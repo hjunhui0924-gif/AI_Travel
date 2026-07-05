@@ -1,62 +1,107 @@
-# AI Agent
+# AI Travel Agent
 
-一个基于 `FastAPI + LangChain + LangGraph` 的通用 AI 助手项目，提供接近 ChatGPT 的网页工作台体验，支持多轮对话、文件问答、图片理解、可选联网搜索、本地 Chroma RAG 检索，以及 MCP 工具复用。
+一个基于 `FastAPI + LangChain + LangGraph` 的旅行与出行规划助手项目。  
+当前产品形态已经不是“通用 AI 助手”，而是围绕出行场景做了定向能力编排，重点覆盖机票、高铁、路线、天气、周边推荐、文件辅助问答，以及多用户会话隔离。
 
-## 主要功能
+## 当前定位
 
-- 通用对话：适合办公问答、学习辅导、内容生成、总结归纳、数据解释等场景。
-- 多会话管理：支持新建会话、历史恢复、会话切换与删除。
-- 文件问答：支持上传 `pdf / txt / md / csv / docx / doc / xlsx / xls`，自动解析文本并按问题召回相关片段。
-- 本地 Chroma RAG：文本附件会优先走 Chroma 向量检索，检索失败时自动回退到关键词召回，增强长文档与语义检索能力。
-- 图片理解：支持上传 `png / jpg / jpeg / webp / gif`，可用于 OCR、截图理解、图像分析。
-- 联网搜索：前端可显式开启，后端按需调用搜索与时效校验，不默认强制联网。
-- 可见处理过程：在回答过程中展示文件读取、工具调用、联网搜索等可见步骤，不暴露私有推理。
-- 来源摘要：当使用搜索时，展示来源卡片并支持查看外部结果列表。
-- MCP Server：可将部分能力通过 MCP 暴露给其他支持 MCP 的客户端。
+这个项目适合以下场景：
 
-## 界面与体验
+- 查询航班、比对出发时间与价格区间
+- 查询高铁与出行衔接方案
+- 生成城市内路线、通勤建议、到达后周边推荐
+- 结合天气、地点和行程背景生成更可执行的旅行计划
+- 让不同账号分别保留自己的聊天记录，避免多人共用时串记录
 
-- 聊天工作台式前端，支持流式输出。
-- 用户消息、AI 回复、来源摘要、过程面板统一在一个对话界面中完成。
-- 处理过程区域做了紧凑化展示，步骤过多时支持内部滚动，减少页面占用。
+## 主要能力
+
+- 旅行问答工作台：围绕“从哪里出发、什么时候走、到哪里、怎么去”来组织回答
+- 机票查询链路：支持通过 Flight MCP Bridge / Ctrip 适配层接入航班数据
+- 高铁查询链路：支持 12306 方向的高铁信息整理
+- 路线规划：支持地点解析、城市内路径建议与周边推荐
+- 天气辅助：支持高德天气查询，为出行建议补充天气上下文
+- 文件问答：支持上传 PDF、Word、Excel、Markdown、文本、图片等作为补充上下文
+- 搜索补充：前端可手动开启联网搜索，用于时效性信息补充
+- 可视化回答：对出行类问题优先渲染更结构化的结果面板，而不是纯文本长回复
+- 多会话管理：支持新建、切换、删除历史会话
+- 登录与会话隔离：不同账号只能看到自己的聊天记录
+- 游客模式：未登录时可临时使用，关闭网页后自动清理游客会话
+
+## 登录与历史记录隔离
+
+当前版本已经支持账号体系：
+
+- 注册 / 登录 / 退出登录
+- 游客模式临时会话
+- 历史记录迁移到管理员账户
+- 不同用户之间的会话完全隔离
+
+隔离规则如下：
+
+- 已登录用户只能访问自己创建的会话
+- A 用户不能读取或删除 B 用户的会话
+- 游客只能访问 `guest_...` 临时会话
+- 游客关闭网页后，临时会话会自动删除
+
+登录信息和会话数据目前保存在本地 SQLite：
+
+- 用户、登录态、会话归属数据库：`resources/ai_agent_threads.db`
+
+## 界面特点
+
+- 左侧会话列表 + 右侧聊天工作台
+- 左下角账户模块，点击后弹出登录 / 注册 / 退出菜单
+- 旅行类问题优先展示路线、时间轴、天气、周边推荐等结构化卡片
+- 切换历史会话时自动定位到底部
+- 支持滚动查看历史、回到底部按钮、搜索结果侧抽屉
 
 ## 技术栈
 
 - Backend: `FastAPI`
-- Agent: `LangChain`, `LangGraph`
+- Agent orchestration: `LangChain`, `LangGraph`
 - Frontend: 原生 `HTML + CSS + JavaScript`
-- Search: `Tavily`（可选）
-- Weather / Stock: 高德、聚合数据等外部接口（可选）
-- File Parsing: `pypdf`, `python-docx`, `openpyxl`, `xlrd`
-- RAG / Vector Retrieval: `ChromaDB`
+- Vector retrieval: `ChromaDB`
+- Web search: `Tavily`（可选）
+- Map / Weather: `AMap Web API`（可选）
+- Flight bridge: 本地 bridge / MCP / HTTP 适配（可选）
+- File parsing: `pypdf`, `python-docx`, `openpyxl`, `xlrd`
 
 ## 项目结构
 
 ```text
 AI_Agent/
-├─ app.py
-├─ requirements.txt
-├─ .env.example
-├─ agents/
-│  ├─ __init__.py
-│  └─ agent.py
-├─ utils/
-│  ├─ __init__.py
-│  ├─ file_utils.py
-│  ├─ weather_utils.py
-│  ├─ stock_utils.py
-│  └─ oss_utils.py
-├─ static/
-│  ├─ index.html
-│  ├─ main.js
-│  ├─ style.css
-│  ├─ gpt.png
-│  └─ assistant-mark.png
-├─ mcp_server/
-│  └─ server.py
-├─ resources/
-├─ uploads/
-└─ skills/
+├── app.py
+├── README.md
+├── requirements.txt
+├── .env.example
+├── agents/
+│   ├── agent.py
+│   ├── schemas.py
+│   └── travel_agent.py
+├── adapters/
+│   ├── amap_adapter.py
+│   ├── ctrip_flight_adapter.py
+│   ├── flight_mcp_adapter.py
+│   └── rail_12306_adapter.py
+├── bridges/
+│   └── flight_mcp_bridge.py
+├── services/
+│   ├── auth_service.py
+│   ├── flight_service.py
+│   ├── poi_recommender.py
+│   ├── rail_service.py
+│   ├── route_service.py
+│   ├── trip_extractor.py
+│   ├── trip_planner.py
+│   └── weather_service.py
+├── static/
+│   ├── index.html
+│   ├── main.js
+│   ├── style.css
+│   └── travel-mark.png
+├── resources/
+├── uploads/
+└── utils/
 ```
 
 ## 快速开始
@@ -69,19 +114,13 @@ pip install -r requirements.txt
 
 ### 2. 配置环境变量
 
-复制示例配置：
-
 ```bash
 cp .env.example .env
 ```
 
-然后至少配置一组模型参数：
+至少准备一组可用的大模型配置，然后按需补充旅行相关能力配置。
 
-- `OPENAI_API_KEY`
-- 或 `LLM_API_KEY`
-- 如需自定义兼容地址，可配置 `OPENAI_BASE_URL` 或 `LLM_BASE_URL`
-
-### 3. 启动 Web 应用
+### 3. 启动项目
 
 ```bash
 python app.py
@@ -95,40 +134,84 @@ http://127.0.0.1:8000
 
 ## 环境变量说明
 
-### 必填或常用
+### 模型配置
 
 - `LLM_PROVIDER`
 - `LLM_MODEL`
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`
 - `LLM_API_KEY`
 - `LLM_BASE_URL`
 
-### 可选能力
+兼容备用配置：
 
-- `TAVILY_API_KEY`
-  用于联网搜索。
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `DASHSCOPE_API_KEY`
+- `DASHSCOPE_BASE_URL`
+- `DEEPSEEK_API_KEY`
+- `DEEPSEEK_BASE_URL`
 
-- `AMAP_WEB_API_KEY`
-  用于天气与地理编码能力。
-
-- `JUHE_STOCK_API_KEY`
-  用于 A 股指数 / 股票行情查询。
+### 文件检索 / Embedding
 
 - `EMBEDDING_API_KEY`
 - `EMBEDDING_BASE_URL`
 - `EMBEDDING_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
-  用于 Chroma 文档检索的 embedding 配置。未单独配置时，会回退复用 `LLM_API_KEY` / `OPENAI_API_KEY` 等现有模型配置；默认模型为 `text-embedding-3-small`。
+
+如果不单独配置，会优先复用主模型 key。
+
+### 搜索与时效信息
+
+- `TAVILY_API_KEY`
+
+### 地图 / 天气
+
+- `AMAP_WEB_API_KEY`
+
+### 航班 Bridge
+
+- `FLIGHT_MCP_ENABLED`
+- `FLIGHT_MCP_MODE`
+- `FLIGHT_MCP_COMMAND`
+- `FLIGHT_MCP_TIMEOUT_SECONDS`
+- `FLIGHT_BRIDGE_MODE`
+- `FLIGHT_MCP_HTTP_URL`
+
+### 观测
 
 - `LANGSMITH_API_KEY`
 - `LANGSMITH_TRACING`
 - `LANGSMITH_PROJECT`
-  用于链路观测。
 
-## 支持的文件类型
+### OSS
 
-### 文本类
+- `OSS_ACCESS_KEY_ID`
+- `OSS_ACCESS_KEY_SECRET`
+- `OSS_BUCKET`
+
+## 航班查询说明
+
+项目当前的航班能力是桥接式的，不是写死在单一接口里。
+
+支持的接入方式包括：
+
+- 本地 `bridges/flight_mcp_bridge.py`
+- Flight MCP 兼容命令
+- 兼容 HTTP 返回的航班服务
+- 本地演示 dummy 数据
+
+示例配置：
+
+```env
+FLIGHT_MCP_ENABLED=true
+FLIGHT_MCP_MODE=command
+FLIGHT_MCP_COMMAND=python bridges\\flight_mcp_bridge.py
+FLIGHT_BRIDGE_MODE=package
+FLIGHT_MCP_TIMEOUT_SECONDS=120
+```
+
+## 文件支持
+
+文本类：
 
 - `.pdf`
 - `.txt`
@@ -139,7 +222,7 @@ http://127.0.0.1:8000
 - `.xlsx`
 - `.xls`
 
-### 图片类
+图片类：
 
 - `.png`
 - `.jpg`
@@ -149,48 +232,38 @@ http://127.0.0.1:8000
 
 ## 文档检索说明
 
-- 文本附件上传后，会先被解析、切块，再进入本地 Chroma 检索流程。
-- 当前策略为：`Chroma 语义检索优先 + 关键词召回兜底`。
-- 适合提升长文档、多段落、近义表达、弱关键词问题下的命中率。
-- Chroma 运行期数据默认写入 `resources/chroma_runtime/`。
+上传文本附件后，系统会先解析内容，再进入本地 Chroma 检索流程。  
+当前策略更偏向“旅行问答主流程 + 文件补充上下文”，适合：
 
-## MCP Server
+- 行程单解读
+- 酒店 / 车票 /机票截图辅助识别
+- 攻略文档补充问答
+- 会议出差资料和行程需求一起提问
 
-启动本地 MCP Server：
+Chroma 运行时目录默认写入：
 
-```bash
-python mcp_server/server.py
-```
-
-当前暴露的主要工具包括：
-
-- `web_search`
-- `current_datetime_tool`
-- `geocode_location_tool`
-- `weather_lookup_tool`
-- `hs_index_snapshot`
-- `hs_stock_snapshot`
-- `summarize_file`
-- `list_supported_file_types`
+- `resources/chroma_runtime/`
 
 ## 适用场景
 
-- 文档问答与资料整理
-- 图片 / 截图理解
-- 一般工作台式 AI 助手
-- 带可见工具过程的演示项目
-- 可复用 MCP 工具后端
+- 出差行程助手
+- 旅游路线规划
+- 城市内交通与天气辅助
+- 机票 / 高铁 / 路线联动问答
+- 带账户隔离的团队共用旅行工作台
 
 ## 已知说明
 
-- 联网搜索默认关闭，只有前端显式开启后才会触发。
-- `.doc` 为兼容性有限格式，推荐优先上传 `.docx`。
-- 运行过程中会在本地产生 SQLite 会话数据和缓存文件，不建议提交到仓库。
-- 当前 Chroma 接入为本地运行时检索方案，适合单机开发与演示；如需更强性能，可继续扩展为持久化索引与多文件缓存。
+- 联网搜索默认关闭，需要前端手动开启
+- `.doc` 兼容性有限，优先建议使用 `.docx`
+- 航班能力依赖桥接配置或外部服务，不同环境返回效果可能不同
+- 项目当前使用本地 SQLite 与本地缓存目录，适合单机开发和演示
+- `.env` 中如果放了真实密钥，不应提交到公开仓库
 
-## 后续可扩展方向
+## 后续建议
 
-- 为 Chroma 增加文件级持久化索引和增量更新能力。
-- 为搜索来源增加更强的排序与缓存。
-- 增加更完整的测试脚本与自动化回归。
-- 增加 Docker 部署文件与生产环境配置。
+- 增加邮箱验证码注册 / 找回密码
+- 为账号体系补充管理员后台
+- 给航班结果增加更强的去重、排序与异常兜底
+- 把 SQLite 迁移到 MySQL / PostgreSQL，便于正式部署
+- 增加 Docker 部署与回归测试脚本

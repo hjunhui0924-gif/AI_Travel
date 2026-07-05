@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import re
+
+from adapters.amap_adapter import plan_route, resolve_place_in_city
+from agents.schemas import RoutePlan, TravelQuery
+
+
+def _dedupe_places(items: list[str]) -> list[str]:
+    result: list[str] = []
+    for item in items:
+        cleaned = (item or "").strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
+def _parse_duration_minutes(value: str) -> int:
+    if not value:
+        return 10**9
+    match = re.search(r"(\d+)", value)
+    if match:
+        return int(match.group(1))
+    return 10**9
+
+
+def _parse_distance_meters(value: str) -> int:
+    if not value:
+        return 10**9
+    match = re.search(r"(\d+)", value)
+    if match:
+        return int(match.group(1))
+    return 10**9
+
+
+def _resolve_places(city: str, places: list[str]) -> list[dict]:
+    resolved_places = []
+    for place in places:
+        resolved = resolve_place_in_city(city, place)
+        if resolved:
+            resolved_places.append(resolved)
+        else:
+            resolved_places.append(
+                {
+                    "name": place,
+                    "address": "",
+                    "formatted_address": place,
+                    "city": city,
+                    "location": "",
+                }
+            )
+    return resolved_places
+
+
+def _build_segments(query: TravelQuery) -> list[tuple[dict, dict]]:
+    city = query.destination or query.city
+    named_places = _dedupe_places(query.named_places)
+    if not city or not named_places:
+        return []
+
+    resolved_places = _resolve_places(city, named_places)
+    segments: list[tuple[dict, dict]] = []
+    for start, end in zip(resolved_places, resolved_places[1:]):
+        start_key = (start.get("name", ""), start.get("formatted_address", ""), start.get("location", ""))
+        end_key = (end.get("name", ""), end.get("formatted_address", ""), end.get("location", ""))
+        if start_key == end_key:
+            continue
+        segments.append((start, end))
+    return segments
+
+
+def get_route_plans(query: TravelQuery) -> list[RoutePlan]:
+    segments = _build_segments(query)
+    if not segments:
+        return []
+
+    results: list[RoutePlan] = []
+    for start, end in segments:
+        candidates: list[RoutePlan] = []
+        for mode in ["transit", "driving", "walking"]:
+            payload = plan_route(start["name"], end["name"], strategy=mode)
+            if not payload:
+                continue
+            candidates.append(
+                RoutePlan(
+                    mode=mode,
+                    origin=payload.get("origin", start["name"]),
+                    destination=payload.get("destination", end["name"]),
+                    origin_address=start.get("formatted_address", start["name"]),
+                    destination_address=end.get("formatted_address", end["name"]),
+                    duration=payload.get("duration", ""),
+                    distance=payload.get("distance", ""),
+                    summary=payload.get("summary", ""),
+                )
+            )
+
+        if candidates:
+            usable = []
+            for item in candidates:
+                distance = _parse_distance_meters(item.distance)
+                if item.mode == "walking" and distance > 3000:
+                    continue
+                usable.append(item)
+            if not usable:
+                usable = [item for item in candidates if item.mode != "walking"] or candidates
+            best = min(usable, key=lambda item: _parse_duration_minutes(item.duration))
+            results.append(best)
+
+    return results

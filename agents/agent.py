@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain.messages import AIMessage, HumanMessage
+from langchain.messages import AIMessage, AIMessageChunk, HumanMessage
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -33,6 +33,7 @@ except Exception:
 from utils.oss_utils import delete_oss_object
 from utils.stock_utils import format_hs_stock_item, get_hs_index_item, get_hs_stock_item, has_juhe_stock_key
 from utils.weather_utils import current_cn_datetime, format_weather_text, has_amap_key
+from agents.travel_agent import plan_travel, render_travel_response
 
 load_dotenv()
 
@@ -1006,6 +1007,55 @@ def _build_display_text(user_text: str, attachments: list[dict], search_enabled:
     return f"{safe_text}\n\n{ACTIVITY_START}{metadata}{ACTIVITY_END}"
 
 
+def _is_travel_query(message: str, attachments: list[dict]) -> bool:
+    travel_keywords = [
+        "\u65c5\u884c",
+        "\u51fa\u884c",
+        "\u884c\u7a0b",
+        "\u9ad8\u94c1",
+        "\u706b\u8f66",
+        "12306",
+        "\u673a\u7968",
+        "\u98de\u673a",
+        "\u822a\u73ed",
+        "\u9152\u5e97",
+        "\u666f\u70b9",
+        "\u5468\u8fb9",
+        "\u653b\u7565",
+        "\u8def\u7ebf",
+        "\u9910\u5385",
+        "\u5496\u5561\u9986",
+    ]
+    if any(keyword in message for keyword in travel_keywords):
+        return True
+
+    if not attachments:
+        return False
+
+    lowered = message.lower()
+    attachment_names = " ".join(attachment.get("name", "") for attachment in attachments).lower()
+    return any(token in lowered or token in attachment_names for token in ["trip", "travel", "flight", "hotel", "ticket"])
+
+
+def _stream_travel_response(message: str, attachments: list[dict]):
+    _log_activity("think", "Travel intent detected", "Route request to travel orchestrator")
+    _log_activity("tool", "Build travel context", "Extract origin, destination, date, preferences, attachments", state="running")
+    response = plan_travel(message, attachments)
+    _log_activity("tool", "Build travel context", "Travel context ready")
+
+    if response.transport_options:
+        _log_activity("tool", "Build transport candidates", f"candidate count {len(response.transport_options)}")
+    if response.timeline:
+        _log_activity("tool", "Build itinerary timeline", f"timeline items {len(response.timeline)}")
+    if response.poi_recommendations:
+        _log_activity("tool", "Recommend nearby places", f"poi count {len(response.poi_recommendations)}")
+    if response.weather_summary:
+        _log_activity("tool", "Attach weather summary", "weather context added")
+
+    rendered = render_travel_response(response)
+    yield AIMessageChunk(content=[{"type": "text", "text": rendered}]), {"travel": True}
+
+
 def stream_chat(message: str, thread_id: str, search_enabled: bool, attachments: list[dict]):
     _reset_runtime_buffers()
 
@@ -1026,6 +1076,9 @@ def stream_chat(message: str, thread_id: str, search_enabled: bool, attachments:
         _log_activity("search", "联网搜索未开启", "本轮回答不会访问外部网页。")
 
     _log_activity("think", "整理回答策略", "准备汇总上下文并生成最终回复")
+
+    if _is_travel_query(message, attachments):
+        return _stream_travel_response(message, attachments)
 
     prompt_text = build_user_prompt(message, attachments, search_enabled)
     user_content = _build_user_content(message, attachments, search_enabled)

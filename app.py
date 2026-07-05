@@ -1,9 +1,10 @@
 import json
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.messages import AIMessage, AIMessageChunk
 
@@ -14,8 +15,21 @@ from agents.agent import (
     delete_thread,
     encode_assistant_metadata,
     get_messages,
-    list_threads,
     stream_chat,
+)
+from services.auth_service import (
+    DEFAULT_THREAD_TITLE,
+    authenticate_user,
+    create_session,
+    create_thread,
+    create_user,
+    delete_session,
+    delete_thread_record,
+    ensure_thread_for_user,
+    get_user_by_session_token,
+    is_thread_owned_by_user,
+    list_threads_for_user,
+    update_thread_activity,
 )
 from utils.file_utils import UnsupportedFileTypeError, parse_uploads
 
@@ -23,6 +37,7 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+SESSION_COOKIE_NAME = "ai_agent_session"
 
 app = FastAPI(title="AI Agent")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -49,6 +64,33 @@ def _sse_event(event_type: str, payload: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _current_user_from_request(request: Request) -> dict:
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    user = get_user_by_session_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录。")
+    return user
+
+
+def _auth_json_response(user: dict, session_token: str) -> JSONResponse:
+    response = JSONResponse({"status": "success", "user": user})
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=60 * 60 * 24 * 30,
+        path="/",
+    )
+    return response
+
+
+def _is_guest_thread_id(thread_id: str) -> bool:
+    cleaned = (thread_id or "").strip().lower()
+    return cleaned.startswith("guest_") and bool(re.fullmatch(r"guest_[0-9a-f]+", cleaned))
+
+
 @app.get("/")
 def read_root():
     with open(STATIC_DIR / "index.html", "r", encoding="utf-8") as file:
@@ -57,7 +99,7 @@ def read_root():
 
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
-    return FileResponse(STATIC_DIR / "gpt.png")
+    return FileResponse(STATIC_DIR / "travel-mark.png")
 
 
 @app.get("/health")
@@ -65,25 +107,98 @@ def health_check():
     return {"status": "ok"}
 
 
-@app.get("/sessions")
-def get_sessions():
+@app.get("/auth/me")
+def auth_me(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    user = get_user_by_session_token(token)
+    return {"status": "success", "authenticated": bool(user), "user": user}
+
+
+@app.post("/auth/register")
+async def auth_register(
+    username: str = Form(""),
+    password: str = Form(""),
+    display_name: str = Form(""),
+):
     try:
-        return {"status": "success", "sessions": list_threads()}
+        user = create_user(username=username, password=password, display_name=display_name)
+        session_token = create_session(int(user["id"]))
+        return _auth_json_response(user, session_token)
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+
+
+@app.post("/auth/login")
+async def auth_login(
+    username: str = Form(""),
+    password: str = Form(""),
+):
+    user = authenticate_user(username=username, password=password)
+    if not user:
+        return JSONResponse({"status": "error", "message": "用户名或密码不正确。"}, status_code=401)
+    session_token = create_session(int(user["id"]))
+    return _auth_json_response(user, session_token)
+
+
+@app.post("/auth/logout")
+def auth_logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    delete_session(token)
+    response = JSONResponse({"status": "success"})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
+
+
+@app.post("/threads")
+def create_chat_thread(request: Request):
+    try:
+        user = _current_user_from_request(request)
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    thread = create_thread(int(user["id"]), DEFAULT_THREAD_TITLE)
+    return {"status": "success", "thread": thread}
+
+
+@app.get("/sessions")
+def get_sessions(request: Request):
+    try:
+        user = _current_user_from_request(request)
+        return {"status": "success", "sessions": list_threads_for_user(int(user["id"]))}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
 
 @app.get("/history/{thread_id}")
-def get_history(thread_id: str):
+def get_history(thread_id: str, request: Request):
     try:
+        try:
+            user = _current_user_from_request(request)
+        except HTTPException:
+            user = None
+        if user is None:
+            if not _is_guest_thread_id(thread_id):
+                return JSONResponse({"status": "error", "message": "请先登录。"}, status_code=401)
+        elif not is_thread_owned_by_user(int(user["id"]), thread_id):
+            return JSONResponse({"status": "error", "message": "无权访问该会话。"}, status_code=404)
         return {"status": "success", "messages": get_messages(thread_id)}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
 
 @app.delete("/history/{thread_id}")
-def clear_history(thread_id: str):
+def clear_history(thread_id: str, request: Request):
     try:
+        try:
+            user = _current_user_from_request(request)
+        except HTTPException:
+            user = None
+        if user is None:
+            if not _is_guest_thread_id(thread_id):
+                return JSONResponse({"status": "error", "message": "请先登录。"}, status_code=401)
+        elif not delete_thread_record(int(user["id"]), thread_id):
+            return JSONResponse({"status": "error", "message": "无权删除该会话。"}, status_code=404)
         delete_thread(thread_id)
         return {"status": "success"}
     except Exception as exc:
@@ -92,11 +207,22 @@ def clear_history(thread_id: str):
 
 @app.post("/chat")
 async def chat(
+    request: Request,
     message: str = Form(""),
     thread_id: str = Form("default"),
     search_enabled: bool = Form(False),
     files: list[UploadFile] | None = File(default=None),
 ):
+    try:
+        user = _current_user_from_request(request)
+    except HTTPException as exc:
+        if not _is_guest_thread_id(thread_id):
+            async def unauthorized_response():
+                yield _sse_event("error", {"message": exc.detail})
+
+            return StreamingResponse(unauthorized_response(), media_type="text/event-stream; charset=utf-8")
+        user = None
+
     try:
         attachments = parse_uploads(files or [])
     except UnsupportedFileTypeError as exc:
@@ -116,13 +242,11 @@ async def chat(
 
         return StreamingResponse(empty_response(), media_type="text/event-stream; charset=utf-8")
 
-    def flush_runtime_events():
-        payloads = []
-        for activity in consume_activity_log():
-            payloads.append(_sse_event("activity", activity))
-        for source in consume_source_cards():
-            payloads.append(_sse_event("source", source))
-        return payloads
+    if user is not None and not ensure_thread_for_user(int(user["id"]), thread_id, DEFAULT_THREAD_TITLE):
+        async def forbidden_thread_response():
+            yield _sse_event("error", {"message": "无权访问该会话。"})
+
+        return StreamingResponse(forbidden_thread_response(), media_type="text/event-stream; charset=utf-8")
 
     def stream_generator():
         try:
@@ -181,6 +305,12 @@ async def chat(
                 attach_assistant_metadata(thread_id, seen_text, assistant_activities, assistant_sources)
             except Exception:
                 pass
+
+            if user is not None:
+                try:
+                    update_thread_activity(int(user["id"]), thread_id, title=message.strip()[:32])
+                except Exception:
+                    pass
 
             if not has_output:
                 yield _sse_event("text", {"delta": "暂时没有生成结果，请再试一次。"})

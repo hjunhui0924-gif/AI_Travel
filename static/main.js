@@ -9,8 +9,10 @@ let searchEnabled = localStorage.getItem(STORAGE_SEARCH_TOGGLE_KEY) === "1";
 let selectedFiles = [];
 let activeDrawerSources = [];
 let lastRequestPayload = null;
-let userScrollingChat = false;
-let userScrollTimer = null;
+let currentUser = null;
+let authMode = "login";
+let guestMode = false;
+let accountMenuOpen = false;
 
 const toggleSidebarBtn = document.getElementById("toggle-sidebar-btn");
 const mobileOverlay = document.getElementById("mobile-overlay");
@@ -27,11 +29,53 @@ const searchDrawer = document.getElementById("search-drawer");
 const searchDrawerOverlay = document.getElementById("search-drawer-overlay");
 const searchDrawerBody = document.getElementById("search-drawer-body");
 const searchDrawerClose = document.getElementById("search-drawer-close");
+const travelHero = document.getElementById("travel-hero");
+const scrollBottomBtn = document.getElementById("scroll-bottom-btn");
+
+const accountPanel = document.getElementById("account-panel");
+const accountCard = document.getElementById("account-card");
+const accountAvatar = document.getElementById("account-avatar");
+const accountName = document.getElementById("account-name");
+const accountSubtitle = document.getElementById("account-subtitle");
+const accountMenu = document.getElementById("account-menu");
+const accountMenuStatus = document.getElementById("account-menu-status");
+const accountMenuHint = document.getElementById("account-menu-hint");
+const loginTriggerBtn = document.getElementById("login-trigger-btn");
+const registerTriggerBtn = document.getElementById("register-trigger-btn");
+const logoutBtn = document.getElementById("logout-btn");
+
+const authModal = document.getElementById("auth-modal");
+const authModalOverlay = document.getElementById("auth-modal-overlay");
+const authModalTitle = document.getElementById("auth-modal-title");
+const authCloseBtn = document.getElementById("auth-close-btn");
+const authForm = document.getElementById("auth-form");
+const authModeInput = document.getElementById("auth-mode");
+const authUsernameInput = document.getElementById("auth-username");
+const authDisplayNameInput = document.getElementById("auth-display-name");
+const authPasswordInput = document.getElementById("auth-password");
+const displayNameField = document.getElementById("display-name-field");
+const authFeedback = document.getElementById("auth-feedback");
+const authSubmitBtn = document.getElementById("auth-submit-btn");
+const authSwitchCopy = document.getElementById("auth-switch-copy");
+const authSwitchBtn = document.getElementById("auth-switch-btn");
 
 marked.setOptions({ breaks: true, gfm: true });
 
 function isMobile() {
     return window.innerWidth <= 860;
+}
+
+function escapeHtml(value) {
+    return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;")
+        .replaceAll("'", "&#39;");
+}
+
+function compactMarkdown(text) {
+    return String(text || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 function updateSidebarState(open) {
@@ -43,15 +87,33 @@ function saveCurrentThread() {
     localStorage.setItem(STORAGE_THREAD_KEY, currentThreadId || "");
 }
 
+function clearCurrentThread() {
+    currentThreadId = null;
+    localStorage.removeItem(STORAGE_THREAD_KEY);
+}
+
+function isGuestThreadId(threadId) {
+    return /^guest_[0-9a-f]{16,64}$/i.test(String(threadId || ""));
+}
+
+function createGuestThreadId() {
+    const array = new Uint8Array(12);
+    window.crypto.getRandomValues(array);
+    return `guest_${Array.from(array).map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function updateSearchToggleState() {
     searchToggle.classList.toggle("active", searchEnabled);
     localStorage.setItem(STORAGE_SEARCH_TOGGLE_KEY, searchEnabled ? "1" : "0");
 }
 
 function setSendingState(sending) {
-    messageInput.disabled = sending;
-    sendButton.disabled = sending;
-    searchToggle.disabled = sending;
+    const canUseComposer = Boolean(currentUser || guestMode);
+    messageInput.disabled = sending || !canUseComposer;
+    sendButton.disabled = sending || !canUseComposer;
+    searchToggle.disabled = sending || !canUseComposer;
+    newChatBtn.disabled = sending;
+    fileInput.disabled = sending || !canUseComposer;
     sendButton.classList.toggle("is-loading", sending);
 }
 
@@ -60,45 +122,26 @@ function autoResizeTextarea() {
     messageInput.style.height = `${Math.min(messageInput.scrollHeight, 180)}px`;
 }
 
-function deriveSessionTitle(text, attachments) {
-    const cleaned = (text || "").replace(/\s+/g, " ").trim();
-    if (cleaned) return cleaned.slice(0, 16);
-    if (attachments && attachments.length > 0) return `文件问答: ${attachments[0].name.slice(0, 8)}`;
-    return "新会话";
-}
-
-function escapeHtml(value) {
-    return (value || "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll("\"", "&quot;")
-        .replaceAll("'", "&#39;");
-}
-
-function compactMarkdown(text) {
-    return (text || "")
-        .replace(/\r\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-}
-
-function allowUserScrollPriority() {
-    userScrollingChat = true;
-    if (userScrollTimer) clearTimeout(userScrollTimer);
-    userScrollTimer = setTimeout(() => {
-        userScrollingChat = false;
-    }, 1400);
-}
-
-function maybeScrollToBottom(force = false) {
-    if (!force && userScrollingChat) return;
+function maybeScrollToBottom(force = false, smooth = false) {
+    if (!force) return;
+    const previousBehavior = chatContainer.style.scrollBehavior;
+    chatContainer.style.scrollBehavior = smooth ? "smooth" : "auto";
     chatContainer.scrollTop = chatContainer.scrollHeight;
+    if (previousBehavior) {
+        chatContainer.style.scrollBehavior = previousBehavior;
+    } else {
+        chatContainer.style.removeProperty("scroll-behavior");
+    }
+}
+
+function updateScrollBottomButton() {
+    const remaining = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight;
+    scrollBottomBtn.classList.toggle("visible", remaining > 180);
 }
 
 function renderImageList(imageUrls) {
     if (!imageUrls || imageUrls.length === 0) return "";
-    return `<div class="message-image-strip">${imageUrls.map((url) => `<img class="history-image" src="${url}" alt="uploaded image">`).join("")}</div>`;
+    return `<div class="message-image-strip">${imageUrls.map((url) => `<img class="history-image" src="${escapeHtml(url)}" alt="uploaded image">`).join("")}</div>`;
 }
 
 function openSearchDrawer(sources) {
@@ -145,12 +188,7 @@ function dedupeSources(sources) {
 }
 
 function shouldDisplayActivity(item) {
-    if (!item) return false;
-    const title = String(item.title || "").trim();
-    if (!title) return false;
-    if (item.stage === "attachment" && title === "未附加文件") return false;
-    if (item.stage === "search" && title === "联网搜索未开启") return false;
-    return true;
+    return Boolean(String(item?.title || "").trim());
 }
 
 function renderAnswerActions() {
@@ -199,21 +237,17 @@ function renderFileSources(attachments) {
     return `<div class="file-source-note">来源文件：${textFiles.map((item) => escapeHtml(item.name)).join("、")}</div>`;
 }
 
-function renderEmptyState() {
+function renderEmptyState(message = "") {
     chatContainer.innerHTML = `
         <div class="empty-state">
             <div class="empty-card">
-                <img src="/static/gpt.png" alt="AI Agent">
+                <img src="/static/travel-mark.png" alt="AI Travel Agent">
                 <div class="eyebrow">AI Agent Workspace</div>
-                <h2>文件问答、图片理解、联网搜索、活动跟踪</h2>
-                <p>上传文件或图片后直接提问，界面会展示顺序步骤、搜索摘要与引用来源。</p>
+                <h2>${escapeHtml(message || "登录后即可开始专属会话与历史记录隔离")}</h2>
+                <p>${escapeHtml(currentUser ? "上传文件或图片后直接提问，系统会仅展示当前账号自己的会话记录。" : "请先登录或注册账号，之后每位用户都只会看到自己的聊天记录。")}</p>
             </div>
         </div>
     `;
-}
-
-function jumpChatToBottom(force = false) {
-    maybeScrollToBottom(force);
 }
 
 function moveSessionToTop(threadId) {
@@ -224,25 +258,6 @@ function moveSessionToTop(threadId) {
         if (id !== threadId) reordered[id] = sessionMetas[id];
     });
     sessionMetas = reordered;
-}
-
-function isCurrentSessionEmptyNew() {
-    const hasMessages = Boolean(chatContainer.querySelector(".message-wrapper"));
-    return Boolean(currentThreadId)
-        && sessionMetas[currentThreadId]?.title === "新会话"
-        && !hasMessages;
-}
-
-function createNewSession() {
-    if (isCurrentSessionEmptyNew()) return;
-    const newId = `thread_${Math.random().toString(36).slice(2, 10)}`;
-    sessionMetas[newId] = { title: "新会话" };
-    currentThreadId = newId;
-    moveSessionToTop(newId);
-    saveCurrentThread();
-    renderSessionList();
-    renderEmptyState();
-    if (isMobile()) updateSidebarState(false);
 }
 
 function renderFileChips() {
@@ -257,10 +272,7 @@ function renderFileChips() {
         chip.type = "button";
         chip.className = "file-chip";
         chip.dataset.fileIndex = String(index);
-        chip.innerHTML = `
-            <span>${escapeHtml(file.name)}</span>
-            <span class="chip-close">×</span>
-        `;
+        chip.innerHTML = `<span>${escapeHtml(file.name)}</span><span class="chip-close">×</span>`;
         fileChipList.appendChild(chip);
     });
 }
@@ -279,11 +291,7 @@ function removeSelectedFile(index) {
 
 function renderAttachmentList(attachments) {
     if (!attachments || attachments.length === 0) return "";
-    return `
-        <div class="message-attachments">
-            ${attachments.map((item) => `<span class="attachment-pill">${escapeHtml(item.name || item)}</span>`).join("")}
-        </div>
-    `;
+    return `<div class="message-attachments">${attachments.map((item) => `<span class="attachment-pill">${escapeHtml(item.name || item)}</span>`).join("")}</div>`;
 }
 
 function renderStepPanel(stepState) {
@@ -320,7 +328,7 @@ function renderSessionList() {
         item.innerHTML = `
             <div class="session-main" data-session-id="${id}">
                 <span class="session-chat-icon" aria-hidden="true"></span>
-                <span class="session-title">${escapeHtml(sessionMetas[id].title || "新会话")}</span>
+                <span class="session-title">${escapeHtml(sessionMetas[id].title || "新对话")}</span>
             </div>
             <button class="delete-session-btn" type="button" data-delete-id="${id}" title="删除会话">
                 <svg stroke="currentColor" fill="none" stroke-width="2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" height="15" width="15" aria-hidden="true">
@@ -339,28 +347,28 @@ function renderSessionList() {
 function appendMessageUI(role, content, attachments = [], imageUrls = [], isSearching = false, autoScroll = true, sources = [], stepState = null, textSourceAttachments = []) {
     const emptyState = chatContainer.querySelector(".empty-state");
     if (emptyState) emptyState.remove();
+    if (travelHero) travelHero.classList.add("compressed");
 
     const isBot = role === "bot" || role === "assistant";
     const wrapper = document.createElement("div");
     wrapper.className = `message-wrapper ${isBot ? "bot" : "user"}`;
-
-    const safeContent = typeof content === "string" ? content : String(content ?? "");
+    const safeContent = String(content || "");
     const textHtml = isBot
-        ? marked.parse(compactMarkdown(safeContent || "正在思考中..."))
-        : `<div class="plain-user-text">${escapeHtml(safeContent || "上传了文件或图片")}</div>`;
+        ? marked.parse(compactMarkdown(safeContent || "正在思考并整理答案..."))
+        : `<div class="plain-user-text">${escapeHtml(safeContent || "已上传文件或图片")}</div>`;
 
     wrapper.innerHTML = `
         <div class="message-content">
             <div class="avatar ${isBot ? "bot-avatar" : "user-avatar"}">${isBot ? "AI" : "U"}</div>
             <div class="message-stack">
                 <div class="text">
-                ${isSearching && isBot ? '<div class="search-indicator">联网搜索已开启</div>' : ""}
-                ${renderAttachmentList(attachments)}
-                ${renderImageList(imageUrls)}
-                ${isBot ? renderStepPanel(stepState) : ""}
-                <div class="assistant-text-block">${textHtml}</div>
-                ${isBot && sources.length > 0 ? renderSearchSummary(sources) : ""}
-                ${isBot ? renderFileSources(textSourceAttachments) : ""}
+                    ${isSearching && isBot ? '<div class="search-indicator">联网搜索已开启</div>' : ""}
+                    ${renderAttachmentList(attachments)}
+                    ${renderImageList(imageUrls)}
+                    ${isBot ? renderStepPanel(stepState) : ""}
+                    <div class="assistant-text-block">${textHtml}</div>
+                    ${isBot && sources.length > 0 ? renderSearchSummary(sources) : ""}
+                    ${isBot ? renderFileSources(textSourceAttachments) : ""}
                 </div>
                 <div class="message-footer-actions">
                     ${isBot ? renderAnswerActions() : renderUserActions()}
@@ -376,6 +384,7 @@ function appendMessageUI(role, content, attachments = [], imageUrls = [], isSear
     wrapper.__userText = !isBot ? safeContent : "";
     chatContainer.appendChild(wrapper);
     if (autoScroll) maybeScrollToBottom(true);
+    updateScrollBottomButton();
     return wrapper;
 }
 
@@ -387,43 +396,21 @@ function createAssistantMessageFrame(searchState) {
         collapsed: false,
         lastRenderedCount: 0,
     };
-    const sources = [];
-    const textSourceAttachments = [];
-    const wrapper = appendMessageUI(
-        "bot",
-        buildStreamingPlaceholder(searchState),
-        [],
-        [],
-        searchState,
-        true,
-        sources,
-        stepState,
-        textSourceAttachments
-    );
-    const textContainer = wrapper.querySelector(".assistant-text-block");
-    const stepsContainer = wrapper.querySelector(".thinking-steps");
+    const wrapper = appendMessageUI("bot", buildStreamingPlaceholder(searchState), [], [], searchState, true, [], stepState, []);
     return {
         wrapper,
-        textContainer,
-        stepsContainer,
+        textContainer: wrapper.querySelector(".assistant-text-block"),
+        stepsContainer: wrapper.querySelector(".thinking-steps"),
         stepState,
-        sources,
-        textSourceAttachments,
+        sources: [],
+        textSourceAttachments: [],
         fullText: "",
     };
 }
 
 function renderAssistantFrame(frame, searchState) {
     const textRoot = frame.wrapper.querySelector(".text");
-    if (!frame.textContainer) {
-        frame.textContainer = frame.wrapper.querySelector(".assistant-text-block");
-    }
-    let thinkingPanel = frame.wrapper.querySelector(".thinking-panel");
-    if (!thinkingPanel && frame.stepState && textRoot && frame.textContainer) {
-        frame.textContainer.insertAdjacentHTML("beforebegin", renderStepPanel(frame.stepState));
-        thinkingPanel = frame.wrapper.querySelector(".thinking-panel");
-        frame.stepsContainer = frame.wrapper.querySelector(".thinking-steps");
-    }
+    const thinkingPanel = frame.wrapper.querySelector(".thinking-panel");
     if (thinkingPanel) {
         thinkingPanel.classList.toggle("completed", frame.stepState.completed);
         const titleNode = thinkingPanel.querySelector(".thinking-header-left span:last-child");
@@ -457,6 +444,191 @@ function renderAssistantFrame(frame, searchState) {
     frame.wrapper.__lastRequestPayload = lastRequestPayload;
     frame.wrapper.__stepState = frame.stepState;
     maybeScrollToBottom();
+    updateScrollBottomButton();
+}
+
+function setComposerEnabled(enabled) {
+    messageInput.disabled = !enabled;
+    sendButton.disabled = !enabled;
+    newChatBtn.disabled = false;
+    searchToggle.disabled = !enabled;
+    fileInput.disabled = !enabled;
+}
+
+function setAccountMenuOpen(open) {
+    accountMenuOpen = Boolean(open);
+    accountPanel.classList.toggle("menu-open", accountMenuOpen);
+    accountCard.setAttribute("aria-expanded", accountMenuOpen ? "true" : "false");
+    accountMenu.setAttribute("aria-hidden", accountMenuOpen ? "false" : "true");
+}
+
+function closeAccountMenu() {
+    setAccountMenuOpen(false);
+}
+
+function setAuthMode(mode) {
+    authMode = mode;
+    authModeInput.value = mode;
+    const isRegister = mode === "register";
+    authModalTitle.textContent = isRegister ? "注册账号" : "登录账号";
+    authSubmitBtn.textContent = isRegister ? "注册并登录" : "登录";
+    authSwitchCopy.textContent = isRegister ? "已经有账号？" : "还没有账号？";
+    authSwitchBtn.textContent = isRegister ? "去登录" : "去注册";
+    displayNameField.classList.toggle("hidden", !isRegister);
+    authDisplayNameInput.disabled = !isRegister;
+    authFeedback.classList.add("hidden");
+    authFeedback.classList.remove("success");
+    authFeedback.textContent = "";
+    authPasswordInput.autocomplete = isRegister ? "new-password" : "current-password";
+}
+
+function openAuthModal(mode = "login") {
+    closeAccountMenu();
+    setAuthMode(mode);
+    authModal.classList.remove("hidden");
+    authModalOverlay.classList.remove("hidden");
+    authModal.setAttribute("aria-hidden", "false");
+    authUsernameInput.focus();
+}
+
+function closeAuthModal(force = false) {
+    if (!force && !currentUser) return;
+    authModal.classList.add("hidden");
+    authModalOverlay.classList.add("hidden");
+    authModal.setAttribute("aria-hidden", "true");
+}
+
+function enterGuestMode() {
+    guestMode = true;
+    closeAccountMenu();
+    closeAccountMenu();
+    currentUser = null;
+    closeAccountMenu();
+    clearCurrentThread();
+    currentThreadId = createGuestThreadId();
+    saveCurrentThread();
+    sessionMetas = {};
+    selectedFiles = [];
+    renderFileChips();
+    renderSessionList();
+    updateAccountPanel();
+    renderEmptyState("游客模式已开启，聊天记录仅在本次网页会话中保留");
+    closeAuthModal(true);
+}
+
+function currentGuestLabel() {
+    if (!guestMode || !isGuestThreadId(currentThreadId)) return "";
+    const guestId = String(currentThreadId || "");
+    const suffix = guestId.includes("_") ? guestId.split("_").pop() : guestId;
+    return suffix.slice(-6);
+}
+
+function showAuthFeedback(message, success = false) {
+    authFeedback.textContent = message;
+    authFeedback.classList.remove("hidden");
+    authFeedback.classList.toggle("success", success);
+}
+
+function syncAccountMenuMeta(statusText, hintText) {
+    if (!accountMenu) return;
+
+    let statusNode = document.getElementById("account-menu-status");
+    let hintNode = document.getElementById("account-menu-hint");
+
+    if (!statusNode || !hintNode) {
+        const header = document.createElement("div");
+        header.className = "account-menu-header";
+
+        statusNode = document.createElement("div");
+        statusNode.className = "account-menu-status";
+        statusNode.id = "account-menu-status";
+
+        hintNode = document.createElement("div");
+        hintNode.className = "account-menu-hint";
+        hintNode.id = "account-menu-hint";
+
+        header.appendChild(statusNode);
+        header.appendChild(hintNode);
+        accountMenu.insertBefore(header, accountMenu.firstChild);
+    }
+
+    statusNode.textContent = statusText;
+    hintNode.textContent = hintText;
+}
+
+function updateAccountPanel() {
+    if (currentUser) {
+        guestMode = false;
+        accountCard.classList.remove("is-guest");
+        accountAvatar.textContent = currentUser.avatar_label || "U";
+        accountName.textContent = currentUser.display_name || currentUser.username || "已登录";
+        accountSubtitle.textContent = currentUser.username || "";
+        syncAccountMenuMeta(
+            currentUser.display_name || currentUser.username || "已登录",
+            currentUser.username || "当前账号已启用独立会话"
+        );
+        loginTriggerBtn.classList.add("hidden");
+        registerTriggerBtn.classList.add("hidden");
+        logoutBtn.classList.remove("hidden");
+        setComposerEnabled(true);
+    } else {
+        accountCard.classList.add("is-guest");
+        accountAvatar.textContent = guestMode ? "T" : "G";
+        accountName.textContent = guestMode ? `游客 ${currentGuestLabel()}` : "未登录";
+        accountSubtitle.textContent = guestMode ? "关闭网页后自动清除本次会话" : "登录后可隔离聊天记录";
+        syncAccountMenuMeta(
+            guestMode ? `游客 ${currentGuestLabel()}` : "未登录",
+            guestMode ? "关闭网页后自动清除本次会话" : "登录后可隔离聊天记录"
+        );
+        loginTriggerBtn.classList.remove("hidden");
+        registerTriggerBtn.classList.remove("hidden");
+        logoutBtn.classList.add("hidden");
+        setComposerEnabled(guestMode);
+    }
+}
+
+async function fetchCurrentUser() {
+    const response = await fetch("/auth/me");
+    const data = await response.json();
+    currentUser = data.authenticated ? data.user : null;
+    updateAccountPanel();
+    return currentUser;
+}
+
+async function createThreadOnServer() {
+    const response = await fetch("/threads", { method: "POST" });
+    const data = await response.json();
+    if (data.status !== "success" || !data.thread?.thread_id) {
+        throw new Error(data.message || "创建会话失败。");
+    }
+    const thread = data.thread;
+    sessionMetas[thread.thread_id] = { title: thread.title || "新对话" };
+    currentThreadId = thread.thread_id;
+    saveCurrentThread();
+    renderSessionList();
+    renderEmptyState("开始你的专属对话");
+    return thread.thread_id;
+}
+
+async function createNewSession() {
+    if (!currentUser && guestMode) {
+        currentThreadId = createGuestThreadId();
+        saveCurrentThread();
+        renderEmptyState("新的游客会话已创建");
+        if (isMobile()) updateSidebarState(false);
+        return;
+    }
+    if (!currentUser) {
+        openAuthModal("login");
+        return;
+    }
+    try {
+        await createThreadOnServer();
+        if (isMobile()) updateSidebarState(false);
+    } catch (error) {
+        console.error(error);
+        appendMessageUI("bot", `创建新会话失败：${error.message}`);
+    }
 }
 
 async function switchSession(id) {
@@ -471,20 +643,29 @@ async function switchSession(id) {
 async function deleteSession(id) {
     if (!confirm("确定要删除这个会话的全部记录吗？")) return;
     try {
-        await fetch(`/history/${id}`, { method: "DELETE" });
+        const response = await fetch(`/history/${id}`, { method: "DELETE" });
+        const data = await response.json();
+        if (data.status !== "success") {
+            throw new Error(data.message || "删除失败。");
+        }
     } catch (error) {
-        console.error("删除后端记录失败:", error);
-    }
-
-    delete sessionMetas[id];
-    if (Object.keys(sessionMetas).length === 0) {
-        currentThreadId = null;
-        saveCurrentThread();
-        createNewSession();
+        console.error(error);
         return;
     }
 
-    if (currentThreadId === id) currentThreadId = Object.keys(sessionMetas)[0];
+    delete sessionMetas[id];
+    if (currentThreadId === id) {
+        clearCurrentThread();
+    }
+
+    const ids = Object.keys(sessionMetas);
+    if (ids.length === 0) {
+        renderSessionList();
+        renderEmptyState("暂无会话，点击左侧新建对话开始");
+        return;
+    }
+
+    currentThreadId = ids[0];
     saveCurrentThread();
     renderSessionList();
     await loadAndRenderHistory(currentThreadId);
@@ -498,27 +679,21 @@ async function loadAndRenderHistory(id) {
         const data = await response.json();
         chatContainer.innerHTML = "";
 
-        if (data.status === "success" && Array.isArray(data.messages) && data.messages.length > 0) {
+        if (data.status !== "success") {
+            throw new Error(data.message || "加载失败");
+        }
+
+        if (Array.isArray(data.messages) && data.messages.length > 0) {
             data.messages.forEach((msg) => {
-                if (msg.role !== "user" && Array.isArray(msg.activities) && msg.activities.length > 0) {
+                if (msg.role === "assistant" && Array.isArray(msg.activities) && msg.activities.length > 0) {
                     const stepState = {
-                        activities: (msg.activities || []).filter(shouldDisplayActivity),
+                        activities: msg.activities.filter(shouldDisplayActivity),
                         startedAt: Date.now(),
                         completed: true,
                         collapsed: false,
                         lastRenderedCount: 0,
                     };
-                    const wrapper = appendMessageUI(
-                        "bot",
-                        msg.content,
-                        [],
-                        [],
-                        false,
-                        false,
-                        msg.sources || [],
-                        stepState,
-                        msg.attachments || []
-                    );
+                    const wrapper = appendMessageUI("bot", msg.content, [], [], false, false, msg.sources || [], stepState, msg.attachments || []);
                     const frame = {
                         wrapper,
                         textContainer: wrapper.querySelector(".assistant-text-block"),
@@ -529,28 +704,44 @@ async function loadAndRenderHistory(id) {
                         fullText: msg.content || "",
                     };
                     renderAssistantFrame(frame, false);
-                    return;
+                } else {
+                    appendMessageUI(
+                        msg.role === "user" ? "user" : "bot",
+                        msg.content || "",
+                        msg.attachments || [],
+                        msg.image_urls || [],
+                        Boolean(msg.search_enabled)
+                    );
                 }
-                appendMessageUI(
-                    msg.role === "user" ? "user" : "bot",
-                    msg.content,
-                    msg.attachments || [],
-                    msg.image_urls || [],
-                    Boolean(msg.search_enabled)
-                );
             });
             maybeScrollToBottom(true);
         } else {
-            renderEmptyState();
+            renderEmptyState("这个会话还没有消息");
         }
     } catch (error) {
         chatContainer.innerHTML = "";
-        appendMessageUI("bot", "加载历史对话失败，可能是后端服务未启动。");
+        appendMessageUI("bot", `加载历史对话失败：${error.message}`);
         console.error(error);
     }
 }
 
 async function initializeSessions() {
+    if (!currentUser) {
+        sessionMetas = {};
+        if (!guestMode) {
+            clearCurrentThread();
+        } else if (!currentThreadId || !isGuestThreadId(currentThreadId)) {
+            currentThreadId = createGuestThreadId();
+            saveCurrentThread();
+        }
+        renderSessionList();
+        renderEmptyState();
+        if (!guestMode) {
+            openAuthModal("login");
+        }
+        return;
+    }
+
     try {
         const response = await fetch("/sessions");
         const data = await response.json();
@@ -559,17 +750,17 @@ async function initializeSessions() {
         if (data.status === "success" && Array.isArray(data.sessions)) {
             data.sessions.forEach((session) => {
                 if (!session?.thread_id) return;
-                sessionMetas[session.thread_id] = { title: session.title || session.thread_id };
+                sessionMetas[session.thread_id] = { title: session.title || "新对话" };
             });
         }
     } catch (error) {
-        sessionMetas = {};
         console.error("加载会话列表失败:", error);
+        sessionMetas = {};
     }
 
     const ids = Object.keys(sessionMetas);
     if (ids.length === 0) {
-        createNewSession();
+        await createThreadOnServer();
         return;
     }
 
@@ -586,6 +777,22 @@ function buildStreamingPlaceholder(isSearching) {
 }
 
 async function runAssistantResponse(payloadOverride = null, targetWrapper = null) {
+    if (!currentUser) {
+        if (!guestMode) {
+            openAuthModal("login");
+            return;
+        }
+    }
+
+    if (!currentThreadId) {
+        if (guestMode && !currentUser) {
+            currentThreadId = createGuestThreadId();
+            saveCurrentThread();
+        } else {
+            await createThreadOnServer();
+        }
+    }
+
     const sourcePayload = payloadOverride || {
         text: messageInput.value.trim(),
         attachments: [...selectedFiles],
@@ -609,14 +816,7 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
     attachments.forEach((file) => formData.append("files", file));
 
     if (!payloadOverride) {
-        appendMessageUI(
-            "user",
-            text || "请结合我上传的文件或图片回答。",
-            attachments.map((file) => ({ name: file.name })),
-            [],
-            searchState
-        );
-
+        appendMessageUI("user", text || "请结合我上传的文件或图片回答。", attachments.map((file) => ({ name: file.name })), [], searchState);
         messageInput.value = "";
         selectedFiles = [];
         syncFileInput();
@@ -630,36 +830,22 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
         moveSessionToTop(currentThreadId);
         renderSessionList();
 
-        let frame;
-        if (targetWrapper) {
-            frame = {
+        const frame = targetWrapper
+            ? {
                 wrapper: targetWrapper,
                 textContainer: targetWrapper.querySelector(".assistant-text-block"),
                 stepsContainer: targetWrapper.querySelector(".thinking-steps"),
-                stepState: {
-                    activities: [],
-                    startedAt: Date.now(),
-                    completed: false,
-                    collapsed: false,
-                    lastRenderedCount: 0,
-                },
+                stepState: { activities: [], startedAt: Date.now(), completed: false, collapsed: false, lastRenderedCount: 0 },
                 sources: [],
                 textSourceAttachments: [],
                 fullText: "",
-            };
-            targetWrapper.classList.add("regenerating");
-        } else {
-            frame = createAssistantMessageFrame(searchState);
-        }
+            }
+            : createAssistantMessageFrame(searchState);
 
         const timer = setInterval(() => renderAssistantFrame(frame, searchState), 220);
         renderAssistantFrame(frame, searchState);
 
-        const response = await fetch("/chat", {
-            method: "POST",
-            body: formData,
-        });
-
+        const response = await fetch("/chat", { method: "POST", body: formData });
         if (!response.body) throw new Error("响应流为空");
 
         const reader = response.body.getReader();
@@ -685,12 +871,9 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
 
                 const payload = JSON.parse(data);
                 if (eventType === "activity") {
-                    if (shouldDisplayActivity(payload)) {
-                        frame.stepState.activities.push(payload);
-                    }
+                    if (shouldDisplayActivity(payload)) frame.stepState.activities.push(payload);
                 } else if (eventType === "source") {
-                    frame.sources.push(payload);
-                    frame.sources = dedupeSources(frame.sources);
+                    frame.sources = dedupeSources([...frame.sources, payload]);
                 } else if (eventType === "text") {
                     frame.fullText += payload.delta || "";
                 } else if (eventType === "done") {
@@ -704,6 +887,10 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
                         frame.sources = dedupeSources(payload.sources);
                     }
                     frame.textSourceAttachments.splice(0, frame.textSourceAttachments.length, ...(payload.attachments || []));
+                    if (sessionMetas[currentThreadId] && text.trim()) {
+                        sessionMetas[currentThreadId].title = text.slice(0, 18);
+                        renderSessionList();
+                    }
                 } else if (eventType === "error") {
                     frame.fullText += payload.message || "";
                     frame.stepState.completed = true;
@@ -715,9 +902,8 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
         frame.stepState.completed = true;
         clearInterval(timer);
         renderAssistantFrame(frame, searchState);
-        if (targetWrapper) targetWrapper.classList.remove("regenerating");
     } catch (error) {
-        appendMessageUI("bot", "发送失败，请检查网络或确认后端服务是否正常运行。");
+        appendMessageUI("bot", `发送失败：${error.message}`);
         console.error(error);
     } finally {
         setSendingState(false);
@@ -727,6 +913,69 @@ async function runAssistantResponse(payloadOverride = null, targetWrapper = null
 
 async function sendMessage(payloadOverride = null) {
     return runAssistantResponse(payloadOverride, null);
+}
+
+async function submitAuthForm(event) {
+    event.preventDefault();
+    const username = authUsernameInput.value.trim();
+    const password = authPasswordInput.value;
+    const displayName = authDisplayNameInput.value.trim();
+
+    if (!username || !password) {
+        showAuthFeedback("请填写用户名和密码。");
+        return;
+    }
+
+    authSubmitBtn.disabled = true;
+    authSubmitBtn.textContent = authMode === "register" ? "提交中..." : "登录中...";
+
+    try {
+        const formData = new FormData();
+        formData.append("username", username);
+        formData.append("password", password);
+        if (authMode === "register") formData.append("display_name", displayName);
+
+        const response = await fetch(authMode === "register" ? "/auth/register" : "/auth/login", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await response.json();
+        if (data.status !== "success") {
+            throw new Error(data.message || "认证失败。");
+        }
+
+        currentUser = data.user;
+        updateAccountPanel();
+        closeAuthModal(true);
+        authForm.reset();
+        authDisplayNameInput.value = "";
+        showAuthFeedback(authMode === "register" ? "注册成功，已为你登录。" : "登录成功。", true);
+        await initializeSessions();
+    } catch (error) {
+        showAuthFeedback(error.message || "认证失败。");
+    } finally {
+        authSubmitBtn.disabled = false;
+        authSubmitBtn.textContent = authMode === "register" ? "注册并登录" : "登录";
+    }
+}
+
+async function handleLogout() {
+    try {
+        await fetch("/auth/logout", { method: "POST" });
+    } catch (error) {
+        console.error(error);
+    }
+
+    currentUser = null;
+    guestMode = false;
+    sessionMetas = {};
+    selectedFiles = [];
+    clearCurrentThread();
+    renderFileChips();
+    renderSessionList();
+    updateAccountPanel();
+    renderEmptyState();
+    openAuthModal("login");
 }
 
 toggleSidebarBtn.addEventListener("click", () => {
@@ -742,9 +991,41 @@ recentToggle.addEventListener("click", () => {
     renderSessionList();
 });
 
-newChatBtn.addEventListener("click", createNewSession);
+newChatBtn.addEventListener("click", () => {
+    createNewSession();
+});
+
 searchDrawerClose.addEventListener("click", closeSearchDrawer);
 searchDrawerOverlay.addEventListener("click", closeSearchDrawer);
+
+accountCard.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setAccountMenuOpen(!accountMenuOpen);
+});
+
+accountMenu.addEventListener("click", (event) => {
+    event.stopPropagation();
+});
+
+loginTriggerBtn.addEventListener("click", () => openAuthModal("login"));
+registerTriggerBtn.addEventListener("click", () => openAuthModal("register"));
+logoutBtn.addEventListener("click", handleLogout);
+authCloseBtn.addEventListener("click", () => {
+    if (!currentUser) {
+        enterGuestMode();
+        return;
+    }
+    closeAuthModal();
+});
+authModalOverlay.addEventListener("click", () => {
+    if (!currentUser) {
+        enterGuestMode();
+        return;
+    }
+    closeAuthModal();
+});
+authSwitchBtn.addEventListener("click", () => setAuthMode(authMode === "login" ? "register" : "login"));
+authForm.addEventListener("submit", submitAuthForm);
 
 sessionListEl.addEventListener("click", async (event) => {
     const deleteTarget = event.target.closest("[data-delete-id]");
@@ -771,7 +1052,6 @@ chatContainer.addEventListener("click", async (event) => {
         const wrapper = actionButton.closest(".message-wrapper");
         if (!wrapper) return;
         const action = actionButton.dataset.action;
-
         if (action === "copy") {
             try {
                 await navigator.clipboard.writeText(wrapper.__assistantText || "");
@@ -780,13 +1060,9 @@ chatContainer.addEventListener("click", async (event) => {
             } catch (error) {
                 console.error(error);
             }
-            return;
         }
-
-        if (action === "regenerate") {
-            const payload = wrapper.__lastRequestPayload;
-            if (!payload) return;
-            await runAssistantResponse(payload, wrapper);
+        if (action === "regenerate" && wrapper.__lastRequestPayload) {
+            await runAssistantResponse(wrapper.__lastRequestPayload, wrapper);
         }
         return;
     }
@@ -796,23 +1072,17 @@ chatContainer.addEventListener("click", async (event) => {
         const wrapper = userActionButton.closest(".message-wrapper");
         if (!wrapper) return;
         const action = userActionButton.dataset.userAction;
-
         if (action === "copy-user") {
             try {
                 await navigator.clipboard.writeText(wrapper.__userText || "");
-                userActionButton.classList.add("copied");
-                setTimeout(() => userActionButton.classList.remove("copied"), 1200);
             } catch (error) {
                 console.error(error);
             }
-            return;
         }
-
         if (action === "edit-user") {
             messageInput.value = wrapper.__userText || "";
             autoResizeTextarea();
             messageInput.focus();
-            return;
         }
     }
 });
@@ -825,13 +1095,11 @@ chatContainer.addEventListener("toggle", (event) => {
     wrapper.__stepState.collapsed = !panel.open;
 }, true);
 
-chatContainer.addEventListener("wheel", () => {
-    allowUserScrollPriority();
-}, { passive: true });
-
-chatContainer.addEventListener("touchmove", () => {
-    allowUserScrollPriority();
-}, { passive: true });
+chatContainer.addEventListener("scroll", updateScrollBottomButton, { passive: true });
+scrollBottomBtn.addEventListener("click", () => {
+    maybeScrollToBottom(true, true);
+    updateScrollBottomButton();
+});
 
 fileInput.addEventListener("change", () => {
     const incoming = [...fileInput.files];
@@ -858,14 +1126,41 @@ messageInput.addEventListener("keydown", (event) => {
         sendMessage();
     }
 });
+
 sendButton.addEventListener("click", () => sendMessage());
 
+document.addEventListener("click", (event) => {
+    if (!accountPanel.contains(event.target)) {
+        closeAccountMenu();
+    }
+});
+
+window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+        closeAccountMenu();
+    }
+});
+
 window.addEventListener("resize", () => {
+    closeAccountMenu();
     updateSidebarState(!isMobile());
+});
+
+window.addEventListener("beforeunload", () => {
+    if (guestMode && currentThreadId && isGuestThreadId(currentThreadId)) {
+        fetch(`/history/${currentThreadId}`, { method: "DELETE", keepalive: true }).catch(() => {});
+    }
 });
 
 updateSidebarState(!isMobile());
 updateSearchToggleState();
 renderSessionList();
 autoResizeTextarea();
-initializeSessions();
+updateAccountPanel();
+renderEmptyState();
+fetchCurrentUser().then(() => initializeSessions()).catch(() => {
+    currentUser = null;
+    updateAccountPanel();
+    renderEmptyState();
+    openAuthModal("login");
+});

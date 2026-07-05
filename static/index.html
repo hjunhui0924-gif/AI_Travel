@@ -3,10 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Agent</title>
-    <link rel="icon" type="image/png" href="/static/gpt.png">
+    <title>AI Travel Agent</title>
+    <link rel="icon" type="image/png" href="/static/travel-mark.png">
     <link rel="stylesheet" href="/static/style.css">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body class="sidebar-open">
     <div class="app-shell">
@@ -15,11 +18,11 @@
                 <div class="sidebar-top">
                     <div class="brand">
                         <span class="brand-mark" aria-hidden="true">
-                            <img src="/static/gpt.png" alt="AI Agent">
+                            <img src="/static/travel-mark.png" alt="AI Travel Agent">
                         </span>
                         <div>
-                            <div class="brand-name">AI Agent</div>
-                            <div class="brand-subtitle">General Assistant</div>
+                            <div class="brand-name">AI Travel Agent</div>
+                            <div class="brand-subtitle">Amap-Driven Trip Copilot</div>
                         </div>
                     </div>
                 </div>
@@ -47,6 +50,26 @@
                 </div>
 
                 <div class="session-list" id="session-list"></div>
+
+                <div class="account-panel" id="account-panel">
+                    <button class="account-card is-guest" id="account-card" type="button" aria-haspopup="menu" aria-expanded="false">
+                        <div class="account-avatar" id="account-avatar">G</div>
+                        <div class="account-meta">
+                            <div class="account-name" id="account-name">未登录</div>
+                            <div class="account-subtitle" id="account-subtitle">登录后可隔离聊天记录</div>
+                        </div>
+                        <span class="account-card-arrow" aria-hidden="true">
+                            <svg stroke="currentColor" fill="none" stroke-width="2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" height="16" width="16" aria-hidden="true">
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </span>
+                    </button>
+                    <div class="account-menu" id="account-menu" role="menu" aria-hidden="true">
+                        <button class="account-btn" id="login-trigger-btn" type="button">登录</button>
+                        <button class="account-btn ghost" id="register-trigger-btn" type="button">注册</button>
+                        <button class="account-btn danger hidden" id="logout-btn" type="button">退出登录</button>
+                    </div>
+                </div>
             </div>
         </aside>
 
@@ -61,11 +84,31 @@
                         <line x1="3" y1="18" x2="21" y2="18"></line>
                     </svg>
                 </button>
-                <div class="header-title">AI Agent</div>
+                <div class="header-title">Travel Planning Workspace</div>
                 <div class="ghost-slot" aria-hidden="true"></div>
             </div>
 
+            <section class="travel-hero" id="travel-hero">
+                <div class="travel-hero-copy">
+                    <div class="travel-kicker">High-Signal Trip Planning</div>
+                    <h1>从地点解析、路线规划到附近推荐，一次生成可执行行程。</h1>
+                    <p>保留聊天工作台的轻量体验，同时把出行类回答升级成更适合查看和行动的结构化面板。</p>
+                </div>
+                <div class="travel-hero-pills">
+                    <span class="hero-pill">地点标准化</span>
+                    <span class="hero-pill">最短用时路线</span>
+                    <span class="hero-pill">12306 高铁</span>
+                    <span class="hero-pill">高德天气</span>
+                </div>
+            </section>
+
             <div class="chat-container" id="chat-container"></div>
+            <button class="scroll-bottom-btn" id="scroll-bottom-btn" type="button" title="回到底部" aria-label="回到底部">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 5v14"></path>
+                    <path d="M6 13l6 6 6-6"></path>
+                </svg>
+            </button>
 
             <div class="search-drawer-overlay" id="search-drawer-overlay"></div>
             <aside class="search-drawer" id="search-drawer" aria-hidden="true">
@@ -94,7 +137,7 @@
                             <input type="file" id="file-input" multiple accept=".pdf,.txt,.md,.csv,.doc,.docx,.xls,.xlsx,.png,.jpg,.jpeg,.webp,.gif,image/*">
                         </label>
 
-                        <textarea id="message-input" rows="1" placeholder="给 AI Agent 发消息，上传文档后提问，或直接发图片做 OCR / 图像理解"></textarea>
+                        <textarea id="message-input" rows="1" placeholder="例如：我明天从上海去杭州出差，住西湖国宾馆，下午去博览中心开会，顺便安排附近吃饭和路线"></textarea>
 
                         <button class="search-toggle" id="search-toggle" type="button" title="开启或关闭联网搜索">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -111,12 +154,49 @@
                             </svg>
                         </button>
                     </div>
-                    <div class="composer-hint">支持 PDF、TXT、Excel、Word 与常见图片格式；搜索网页结果可在答案末尾展开右侧侧栏查看。</div>
+                    <div class="composer-hint">支持 PDF、Word、Excel、图片；出行类问题会优先展示交通方案、路线规划、时间轴和周边推荐。若旧会话里出现问号，请新建对话查看最新效果。</div>
                 </div>
             </div>
         </main>
     </div>
 
-    <script src="/static/main.js?v=20260602-1"></script>
+    <div class="auth-modal-overlay hidden" id="auth-modal-overlay"></div>
+    <section class="auth-modal hidden" id="auth-modal" aria-hidden="true">
+        <div class="auth-modal-header">
+            <div>
+                <div class="auth-modal-eyebrow">Account Access</div>
+                <h2 class="auth-modal-title" id="auth-modal-title">登录账号</h2>
+            </div>
+            <button class="auth-close-btn" id="auth-close-btn" type="button" title="关闭">
+                <svg stroke="currentColor" fill="none" stroke-width="2.2" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" height="20" width="20" aria-hidden="true">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+            </button>
+        </div>
+        <form class="auth-form" id="auth-form">
+            <input type="hidden" id="auth-mode" value="login">
+            <label class="auth-field">
+                <span>用户名</span>
+                <input class="auth-input" id="auth-username" name="username" type="text" autocomplete="username" placeholder="例如 travel_admin">
+            </label>
+            <label class="auth-field hidden" id="display-name-field">
+                <span>显示名称</span>
+                <input class="auth-input" id="auth-display-name" name="display_name" type="text" autocomplete="nickname" placeholder="例如 张三">
+            </label>
+            <label class="auth-field">
+                <span>密码</span>
+                <input class="auth-input" id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="至少 6 位">
+            </label>
+            <div class="auth-feedback hidden" id="auth-feedback"></div>
+            <button class="auth-submit-btn" id="auth-submit-btn" type="submit">登录</button>
+        </form>
+        <div class="auth-switcher">
+            <span id="auth-switch-copy">还没有账号？</span>
+            <button class="auth-switch-btn" id="auth-switch-btn" type="button">去注册</button>
+        </div>
+    </section>
+
+    <script src="/static/main.js?v=20260703-1"></script>
 </body>
 </html>
