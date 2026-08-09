@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from adapters.flight_mcp_adapter import is_flight_mcp_enabled
 from adapters.ctrip_flight_adapter import probe_ctrip_flight_page
 from agents.schemas import (
     Evidence,
@@ -23,7 +25,7 @@ from agents.schemas import (
     TravelQuery,
 )
 from services.flight_service import get_flight_options
-from services.poi_recommender import recommend_pois
+from services.poi_recommender import PoiRecommendationResult, recommend_pois
 from services.rail_service import get_rail_options
 from services.route_service import get_route_plans
 from services.trip_extractor import extract_attachment_notes, extract_named_places
@@ -32,6 +34,7 @@ from services.weather_service import get_weather_summary
 
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
+MAX_REQUESTED_TRIP_DAYS = 365
 
 KNOWN_CITIES = [
     "北京", "上海", "广州", "深圳", "杭州", "苏州", "南京", "成都",
@@ -166,17 +169,23 @@ def _extract_explicit_dates(text: str) -> list[date]:
     return sorted(result)
 
 
-def _extract_days(text: str) -> int:
+def _extract_duration_days(text: str) -> tuple[int, bool]:
     match = re.search(
         r"(?<!月)(?<![-/])(?:玩|游玩|停留|旅行|旅游)?\s*(\d+|[一二两三四五六七八九十百]+)\s*[天日]",
         text,
     )
     if match:
-        return max(1, min(31, _parse_number(match.group(1), 1)))
+        requested_days = max(1, _parse_number(match.group(1), 1))
+        return min(MAX_REQUESTED_TRIP_DAYS, requested_days), requested_days > MAX_REQUESTED_TRIP_DAYS
     nights = re.search(r"(\d+|[一二两三四五六七八九十]+)\s*晚", text)
     if nights:
-        return max(1, min(31, _parse_number(nights.group(1), 1) + 1))
-    return 1
+        requested_days = max(1, _parse_number(nights.group(1), 1) + 1)
+        return min(MAX_REQUESTED_TRIP_DAYS, requested_days), requested_days > MAX_REQUESTED_TRIP_DAYS
+    return 1, False
+
+
+def _extract_days(text: str) -> int:
+    return _extract_duration_days(text)[0]
 
 
 def _has_explicit_duration(text: str) -> bool:
@@ -206,7 +215,7 @@ def _extract_date_range(message: str) -> tuple[str, str, bool, int]:
     elif explicit_dates:
         start = explicit_dates[0]
         if len(explicit_dates) >= 2:
-            days = max(1, (explicit_dates[-1] - start).days + 1)
+            days = min(MAX_REQUESTED_TRIP_DAYS, max(1, (explicit_dates[-1] - start).days + 1))
     else:
         start = today
     end = start + timedelta(days=max(days, 1) - 1)
@@ -278,6 +287,8 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
     named_places = extract_named_places(attachments, message=message)
     city = destination or origin
     start_date, end_date, date_is_assumed, days = _extract_date_range(message)
+    explicit_dates = _extract_explicit_dates(message)
+    _duration_days, duration_was_capped = _extract_duration_days(message)
     preferences = _extract_preferences(message)
 
     travel_mode = ""
@@ -300,6 +311,11 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
         preferences=preferences,
         constraints=_extract_constraints(message, preferences),
         duration_is_assumed=not _has_explicit_duration(message),
+        duration_was_capped=duration_was_capped
+        or (
+            len(explicit_dates) >= 2
+            and (explicit_dates[-1] - explicit_dates[0]).days + 1 > MAX_REQUESTED_TRIP_DAYS
+        ),
         attachment_notes=attachment_notes,
         named_places=named_places,
     )
@@ -370,7 +386,10 @@ def _transport_evidence(options: list[TransportOption]) -> list[Evidence]:
                 provider=provider,
                 title=option.title,
                 url="https://kyfw.12306.cn/" if option.mode == "rail" else "",
-                snippet=f"{option.depart_time} -> {option.arrive_time} {option.duration}".strip(),
+                snippet=(
+                    f"{option.depart_date or ''} {option.depart_time} -> "
+                    f"{option.arrive_date or ''} {option.arrive_time} {option.duration}"
+                ).strip(),
                 retrieved_at=_now_cn().isoformat(timespec="seconds"),
                 freshness="current_query",
                 reliability="adapter_result",
@@ -417,6 +436,8 @@ def _new_plan_item(
     source_ids: list[str] | None = None,
     estimated_cost: str = "",
     confidence: str = "unknown",
+    end_date: str = "",
+    is_demo: bool = False,
 ) -> PlanItem:
     return PlanItem(
         item_id=_stable_item_id(item_type, title, day),
@@ -431,6 +452,8 @@ def _new_plan_item(
         source_ids=list(dict.fromkeys(source_ids or [])),
         estimated_cost=estimated_cost,
         confidence=confidence,
+        end_date=end_date,
+        is_demo=is_demo,
     )
 
 
@@ -446,6 +469,23 @@ def _date_sequence(start_date: str, end_date: str) -> list[str]:
     return [(start + timedelta(days=index)).isoformat() for index in range(span)]
 
 
+def _ensure_unique_item_ids(items: list[PlanItem]) -> None:
+    """Keep PATCH addressing unambiguous when providers repeat a title."""
+
+    seen: dict[str, int] = {}
+    assigned: set[str] = set()
+    for item in items:
+        base_id = item.item_id or _stable_item_id(item.item_type, item.title, item.date)
+        occurrence = seen.get(base_id, 0)
+        candidate = base_id if occurrence == 0 else f"{base_id}_{occurrence + 1}"
+        while candidate in assigned:
+            occurrence += 1
+            candidate = f"{base_id}_{occurrence + 1}"
+        seen[base_id] = occurrence + 1
+        assigned.add(candidate)
+        item.item_id = candidate
+
+
 def _build_structured_plan(
     query: TravelQuery,
     *,
@@ -458,26 +498,57 @@ def _build_structured_plan(
     sources: list[Evidence],
     conflicts: list[str],
     risks: list[str],
+    alerts: list[str],
+    diagnostics: list[str],
+    adapter_status: dict[str, str],
     current_plan: TravelPlan | None,
 ) -> TravelPlan:
     day_dates = _date_sequence(query.start_date, query.end_date)
     days = [PlanDay(date=value, day_number=index + 1) for index, value in enumerate(day_dates)]
+    out_of_range_items: list[PlanItem] = []
 
     if transport_options and days:
         option = transport_options[0]
-        days[0].items.append(
+        transport_date = option.depart_date or query.start_date or days[0].date
+        target_day = next((day for day in days if day.date == transport_date), days[0])
+        arrival_date = option.arrive_date or transport_date
+        transport_source_ids = [
+            item.evidence_id
+            for item in sources
+            if item.source_type.endswith("realtime") and item.title == option.title
+        ]
+        target_day.items.append(
             _new_plan_item(
                 item_type="transport",
                 title=f"前往 {query.destination or '目的地'}：{option.title}",
-                day=days[0].date,
+                day=target_day.date,
                 start_time=option.depart_time,
                 end_time=option.arrive_time,
                 detail=f"{option.mode}；{option.duration or '时长待补充'}；{option.summary or ''}".strip("；"),
-                source_ids=[item.evidence_id for item in sources if item.source_type.endswith("realtime") and item.title == option.title],
+                source_ids=transport_source_ids,
                 estimated_cost=option.price,
                 confidence="source_backed",
+                end_date=arrival_date if arrival_date != target_day.date else "",
+                is_demo=option.is_demo,
             )
         )
+        if arrival_date != target_day.date:
+            arrival_day = next((day for day in days if day.date == arrival_date), None)
+            if arrival_day is None:
+                risks.append("跨日交通的抵达日期超出当前日历展开范围，已保留在出发日的跨日项目中。")
+            else:
+                arrival_day.items.append(
+                    _new_plan_item(
+                        item_type="transport_arrival",
+                        title=f"抵达 {query.destination or '目的地'}：{option.title}",
+                        day=arrival_date,
+                        start_time=option.arrive_time,
+                        detail=f"由 {option.title} 抵达；请以实际到站信息为准。",
+                        source_ids=transport_source_ids,
+                        confidence="source_backed",
+                        is_demo=option.is_demo,
+                    )
+                )
 
     for index, route in enumerate(route_plans):
         day = days[min(index, len(days) - 1)]
@@ -515,6 +586,7 @@ def _build_structured_plan(
         )
 
     locked_items: list[PlanItem] = []
+    conflict_dates: set[str] = set()
     if current_plan:
         locked_items = [
             item
@@ -522,20 +594,39 @@ def _build_structured_plan(
             for item in plan_day.items
             if item.locked or item.status in {"confirmed", "booked"}
         ]
+        locked_items.extend(
+            item
+            for item in current_plan.out_of_range_items
+            if item.locked or item.status in {"confirmed", "booked"}
+        )
     for item in locked_items:
         if item.date not in {day.date for day in days}:
             conflicts.append(f"已锁定项目“{item.title}”不在新的日期范围内，未自动移动。")
+            out_of_range_items.append(deepcopy(item))
+            if days:
+                conflict_dates.add(days[0].date if item.date < days[0].date else days[-1].date)
             continue
         target_day = next(day for day in days if day.date == item.date)
-        if not any(existing.item_id == item.item_id for existing in target_day.items):
-            target_day.items.append(item)
+        existing_index = next(
+            (index for index, existing in enumerate(target_day.items) if existing.item_id == item.item_id),
+            None,
+        )
+        if existing_index is None:
+            target_day.items.append(deepcopy(item))
+        else:
+            # The freshly generated suggestion may have the same stable ID
+            # as an existing locked item.  The locked snapshot is authoritative
+            # and must win over the new suggestion in every field.
+            target_day.items[existing_index] = deepcopy(item)
 
     for day in days:
         day.items.sort(key=lambda item: (item.start_time or "99:99", item.item_type, item.title))
         titles = [item.title for item in day.items]
         day.title = f"第 {day.day_number} 天"
         day.summary = "、".join(titles[:4]) if titles else "暂无已确认的具体安排，可继续告诉我想去的地方。"
-        day.has_conflicts = bool(conflicts)
+        day.has_conflicts = day.date in conflict_dates
+
+    _ensure_unique_item_ids([item for day in days for item in day.items] + out_of_range_items)
 
     facts = [
         TravelFact(
@@ -561,6 +652,8 @@ def _build_structured_plan(
     ]
     if query.date_is_assumed:
         risks.append("未明确出发日期，当前按今天起算；请确认日期后再查看交通方案。")
+    if query.duration_was_capped:
+        risks.append("日期范围超过 365 天，当前计划已截取前 365 天；请缩小范围后再细化行程。")
     if len(day_dates) >= 31 and query.end_date > day_dates[-1]:
         risks.append("行程超过 31 天，日历暂只展开前 31 天。")
 
@@ -570,20 +663,30 @@ def _build_structured_plan(
         version=0,
         timezone="Asia/Shanghai",
         start_date=day_dates[0] if day_dates else query.start_date,
-        end_date=day_dates[-1] if day_dates else query.end_date,
+        # Keep the requested range even when the calendar projection is
+        # intentionally capped at 31 expanded days.
+        end_date=query.end_date or (day_dates[-1] if day_dates else ""),
+        requested_days=max(1, query.days),
+        projected_days=len(day_dates),
+        calendar_truncated=bool(query.end_date and day_dates and query.end_date > day_dates[-1]),
+        projection_end_date=day_dates[-1] if day_dates else query.start_date,
         origin=query.origin,
         destination=query.destination or query.city,
         travelers=query.travelers,
         preferences=list(query.preferences),
         summary=_build_summary(query),
         days=days,
+        out_of_range_items=out_of_range_items,
         facts=facts,
         constraints=constraints,
         conflicts=list(dict.fromkeys(conflicts)),
         risks=list(dict.fromkeys(risks)),
+        alerts=list(dict.fromkeys(alerts)),
+        diagnostics=list(dict.fromkeys(diagnostics)),
+        adapter_status=dict(adapter_status),
         sources=list(dict((item.evidence_id, item) for item in sources).values()),
         search_enabled=search_enabled,
-        status="needs_attention" if conflicts or risks else "draft",
+        status="needs_attention" if conflicts or risks or alerts or diagnostics else "draft",
     )
 
 
@@ -600,38 +703,146 @@ def plan_travel(
     has_cross_city_route = bool(query.origin and query.destination and query.origin != query.destination)
 
     should_fetch_transport = query.intent in {"rail_query", "flight_query", "transport_compare", "trip_plan", "trip_replan"}
+    rail_requested = should_fetch_transport and not (
+        query.intent == "flight_query" and query.travel_mode == "flight"
+    )
+    flight_requested = should_fetch_transport and not (
+        query.intent == "rail_query" and query.travel_mode == "rail"
+    )
     rail_options: list[TransportOption] = []
     flight_options: list[TransportOption] = []
-    if should_fetch_transport:
-        if query.intent == "flight_query" and query.travel_mode == "flight":
-            flight_options = get_flight_options(query)
-        elif query.intent == "rail_query" and query.travel_mode == "rail":
-            rail_options = get_rail_options(query)
-        else:
-            rail_options = get_rail_options(query)
-            flight_options = get_flight_options(query)
+    alerts: list[str] = []
+    risks: list[str] = []
+    conflicts: list[str] = []
+    try:
+        diagnostics = _build_flight_diagnostics(query)
+    except Exception as exc:
+        diagnostics = [f"flight probe failed: {type(exc).__name__}"]
+    adapter_status: dict[str, str] = {}
+
+    if rail_requested and query.origin and query.destination and query.date:
+        try:
+            rail_result = get_rail_options(query)
+            rail_options = list(rail_result)
+            rail_errors = list(getattr(rail_result, "errors", []) or [])
+            if rail_errors:
+                adapter_status["rail"] = "partial" if rail_options else "failed"
+                diagnostics.extend(f"rail row failed: {error}" for error in rail_errors)
+                if rail_options:
+                    alerts.append("部分火车结果格式异常，已保留仍可用的车次候选。")
+            else:
+                adapter_status["rail"] = "success" if rail_options else "empty"
+        except Exception as exc:
+            adapter_status["rail"] = "failed"
+            diagnostics.append(f"rail adapter failed: {type(exc).__name__}")
+            alerts.append("高铁数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+    else:
+        adapter_status["rail"] = "not_requested"
+
+    if flight_requested and query.origin and query.destination and query.date:
+        try:
+            flight_result = get_flight_options(query)
+            flight_options = list(flight_result)
+            flight_errors = list(getattr(flight_result, "errors", []) or [])
+            if flight_errors:
+                adapter_status["flight"] = "partial" if flight_options else "failed"
+                diagnostics.extend(f"flight row failed: {error}" for error in flight_errors)
+                if flight_options:
+                    alerts.append("部分航班结果格式异常，已保留仍可用的航班候选。")
+            else:
+                adapter_status["flight"] = (
+                    "success"
+                    if flight_options
+                    else "not_configured"
+                    if not is_flight_mcp_enabled()
+                    else "empty"
+                )
+        except Exception as exc:
+            adapter_status["flight"] = "failed"
+            diagnostics.append(f"flight adapter failed: {type(exc).__name__}")
+            alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+    else:
+        adapter_status["flight"] = "not_requested"
     transport_options = rail_options + flight_options
 
     include_explore = _should_include_explore(query)
-    route_plans = get_route_plans(query) if include_explore else []
-    poi_items, poi_groups, poi_sources, poi_errors = (
-        recommend_pois(query, search_enabled=search_enabled, activity_logger=activity_logger)
-        if include_explore
-        else ([], [], [], [])
-    )
-    timeline = build_timeline(query, transport_options, route_plans, poi_items, poi_groups) if include_explore else []
-    weather_summary = get_weather_summary(query.destination or query.city, forecast=True) if _should_include_weather(query) else ""
-    diagnostics = _build_flight_diagnostics(query)
+    if include_explore:
+        try:
+            route_result = get_route_plans(query)
+            route_plans = list(route_result)
+            route_errors = list(getattr(route_result, "errors", []) or [])
+            if route_errors:
+                adapter_status["route"] = "partial" if route_plans else "failed"
+                diagnostics.extend(f"route mode failed: {error}" for error in route_errors)
+                alerts.append(
+                    "部分地图路线模式查询失败，已保留仍可用的路线结果。"
+                    if route_plans
+                    else "地图路线模式查询失败，本次没有可用路线结果。"
+                )
+            else:
+                adapter_status["route"] = "success" if route_plans else "empty"
+        except Exception as exc:
+            route_plans = []
+            adapter_status["route"] = "failed"
+            diagnostics.append(f"route adapter failed: {type(exc).__name__}")
+            alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
+        try:
+            poi_result = recommend_pois(
+                query, search_enabled=search_enabled, activity_logger=activity_logger
+            )
+            if isinstance(poi_result, PoiRecommendationResult):
+                poi_items = poi_result.recommendations
+                poi_groups = poi_result.groups
+                poi_sources = poi_result.evidence
+                poi_errors = poi_result.errors
+                poi_status = poi_result.poi_status
+                web_search_status = poi_result.web_search_status
+            else:
+                poi_items, poi_groups, poi_sources, poi_errors = poi_result
+                poi_status = "success" if poi_items else ("failed" if poi_errors else "empty")
+                web_search_status = "disabled" if not search_enabled else ("failed" if poi_errors else "empty")
+        except Exception as exc:
+            poi_items, poi_groups, poi_sources = [], [], []
+            poi_errors = ["地图 POI 接口失败，未生成未经验证的地点。"]
+            poi_status = "failed"
+            web_search_status = "disabled" if not search_enabled else "failed"
+            adapter_status["poi"] = "failed"
+            diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
+        else:
+            adapter_status["poi"] = poi_status
+    else:
+        route_plans = []
+        poi_items, poi_groups, poi_sources, poi_errors = [], [], [], []
+        web_search_status = "not_requested"
+        adapter_status["route"] = "not_requested"
+        adapter_status["poi"] = "not_requested"
 
-    alerts: list[str] = []
-    risks: list[str] = list(poi_errors)
-    conflicts: list[str] = []
+    weather_requested = _should_include_weather(query)
+    if weather_requested:
+        try:
+            weather_summary = get_weather_summary(query.destination or query.city, forecast=True)
+            adapter_status["weather"] = "success" if weather_summary else "empty"
+        except Exception as exc:
+            weather_summary = ""
+            adapter_status["weather"] = "failed"
+            diagnostics.append(f"weather adapter failed: {type(exc).__name__}")
+            alerts.append("天气接口暂时失败，行程中的天气判断需要重新查询。")
+    else:
+        weather_summary = ""
+        adapter_status["weather"] = "not_requested"
+
+    adapter_status["web_search"] = "not_requested" if not include_explore else web_search_status
+    risks.extend(poi_errors)
+    timeline = build_timeline(query, transport_options, route_plans, poi_items, poi_groups) if include_explore else []
     if any(option.is_demo for option in transport_options):
         risks.append("当前交通列表含演示数据，只用于联调展示，不可用于购票或判断真实班次。")
     if not rail_options and query.travel_mode == "rail":
         alerts.append("当前未获取到高铁实时结果，可能是站点、日期或 12306 查询受限。")
     if not flight_options and query.travel_mode == "flight":
-        alerts.append("本次未获取到可用航班结果；请把它视为未查询到，不是无航班或可预订结果。")
+        if adapter_status.get("flight") == "not_configured":
+            alerts.append("航班查询能力尚未启用，本次没有执行真实航班查询。")
+        else:
+            alerts.append("本次未获取到可用航班结果；请把它视为未查询到，不是无航班或可预订结果。")
     if has_cross_city_route and should_fetch_transport and not transport_options:
         risks.append("已识别到跨城出行，但暂未拿到高铁或航班候选，不能把交通时间当作已确认事实。")
     if has_cross_city_route and include_explore and not route_plans:
@@ -669,6 +880,9 @@ def plan_travel(
         sources=sources,
         conflicts=conflicts,
         risks=risks,
+        alerts=alerts,
+        diagnostics=diagnostics,
+        adapter_status=adapter_status,
         current_plan=current_plan,
     )
 
@@ -684,6 +898,7 @@ def plan_travel(
         alerts=alerts,
         extracted_context=query.attachment_notes,
         diagnostics=diagnostics,
+        adapter_status=adapter_status,
         trip_plan=plan,
         sources=plan.sources,
         conflicts=plan.conflicts,
@@ -706,7 +921,8 @@ def render_travel_response(response: TravelPlanResponse) -> str:
         lines.extend(["", "## 交通方案"])
         for option in response.transport_options:
             lines.append(
-                f"- [{'演示' if option.is_demo else option.mode}] {option.title} | {option.depart_time} -> {option.arrive_time} | "
+                f"- [{'演示' if option.is_demo else option.mode}] {option.title} | "
+                f"{option.depart_date or ''} {option.depart_time} -> {option.arrive_date or ''} {option.arrive_time} | "
                 f"{option.duration or '时长待补充'} | {option.price or '价格待补充'}"
             )
             if option.summary:

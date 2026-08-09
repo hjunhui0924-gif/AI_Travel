@@ -39,10 +39,12 @@ from agents.travel_agent import plan_travel, render_travel_response
 from services.travel_store import (
     delete_travel_thread,
     get_current_plan,
+    list_conversation_turns,
     list_travel_turns,
     save_plan_version,
     save_travel_turn,
 )
+from services.travel_search import _is_denied_source, _normalize_url
 
 load_dotenv()
 
@@ -243,17 +245,31 @@ def _get_chroma_client():
 model = init_chat_model(**_resolve_model_settings())
 
 _raw_web_search = None
-if os.getenv("TAVILY_API_KEY"):
-    _raw_web_search = TavilySearch(
-        max_results=6,
-        topic="general",
-        include_images=False,
-        include_answer=False,
-        include_raw_content=False,
-        search_depth="advanced",
-        handle_tool_error=True,
-        handle_validation_error="搜索参数无效，请简化关键词后重试。",
-    )
+
+
+def _get_raw_web_search():
+    """Create the web search client only after a request opts into search."""
+
+    global _raw_web_search
+    if _raw_web_search is not None:
+        return _raw_web_search
+    if TavilySearch is None or not os.getenv("TAVILY_API_KEY"):
+        return None
+    try:
+        _raw_web_search = TavilySearch(
+            max_results=6,
+            topic="general",
+            include_images=False,
+            include_answer=False,
+            include_raw_content=False,
+            search_depth="advanced",
+            handle_tool_error=True,
+            handle_validation_error="搜索参数无效，请简化关键词后重试。",
+        )
+    except Exception as exc:
+        _log_activity("tool", "联网搜索初始化失败", str(exc))
+        return None
+    return _raw_web_search
 
 
 def _is_time_sensitive_query(query: str) -> bool:
@@ -744,7 +760,8 @@ def perform_web_search(query: str) -> str:
         _log_activity("think", "识别到天气问题", f"地点: {location}，模式: {'预报' if forecast else '实时'}")
         weather_result = weather_lookup_impl(location=location, forecast=forecast)
 
-    if not _raw_web_search:
+    raw_web_search = _get_raw_web_search()
+    if not raw_web_search:
         if weather_result and "失败" not in weather_result:
             _log_activity("search", "未使用网页搜索", "已命中天气专用接口")
             return weather_result
@@ -772,18 +789,39 @@ def perform_web_search(query: str) -> str:
     for search_query in _search_queries(query):
         _log_activity("search", "执行联网搜索", search_query, state="running")
         try:
-            result = _raw_web_search.invoke({"query": search_query})
+            result = raw_web_search.invoke({"query": search_query})
         except Exception as exc:
             _log_activity("tool", "web_search 失败", str(exc))
             return f"联网搜索失败: {exc}"
 
-        for item in result.get("results", []):
-            url = (item.get("url") or "").strip()
-            if url and url in seen_urls:
+        if not isinstance(result, dict) or "results" not in result or not isinstance(result["results"], list):
+            _log_activity("tool", "web_search 返回格式无效", "结果缺少 results 列表")
+            return "联网搜索失败：搜索服务返回格式无效。"
+
+        for item in result["results"]:
+            if not isinstance(item, dict):
                 continue
-            if url:
-                seen_urls.add(url)
-            merged_results.append(item)
+            raw_title = str(item.get("title") or "").strip()
+            raw_content = str(item.get("content") or "").strip()
+            url = str(item.get("url") or "").strip()
+            normalized_url = _normalize_url(url)
+            denied_marker = any(
+                marker in f"{raw_title} {raw_content}".lower()
+                for marker in ("dianping.com", "大众点评")
+            )
+            if not normalized_url:
+                _log_activity("search", "过滤无来源链接的网页结果", raw_title or "未命名结果")
+                continue
+            if _is_denied_source(normalized_url) or denied_marker:
+                _log_activity("search", "过滤受限网页来源", normalized_url)
+                continue
+            if normalized_url and normalized_url in seen_urls:
+                continue
+            if normalized_url:
+                seen_urls.add(normalized_url)
+            safe_item = dict(item)
+            safe_item["url"] = normalized_url or url
+            merged_results.append(safe_item)
 
     if not merged_results and market_snapshot:
         return market_snapshot
@@ -795,7 +833,7 @@ def perform_web_search(query: str) -> str:
     for index, item in enumerate(merged_results, start=1):
         title = (item.get("title") or "未命名结果").strip()
         url = (item.get("url") or "").strip()
-        summary = (item.get("content") or "").strip().replace("\n", " ")
+        summary = str(item.get("content") or "").strip().replace("\n", " ")
         found_dates = _extract_dates(f"{title} {summary}")
         latest_date = max(found_dates) if found_dates else None
         processed.append(
@@ -874,6 +912,30 @@ def web_search(query: str) -> str:
 connection = sqlite3.connect(DB_PATH, check_same_thread=False)
 checkpoint = SqliteSaver(connection)
 checkpoint.setup()
+
+
+def has_checkpoint_data(thread_id: str) -> bool:
+    """Return whether a thread has legacy LangGraph state or writes.
+
+    Anonymous access must not mint a first capability for an old checkpoint
+    thread because the checkpoint store has no guest ownership metadata.  A
+    storage read failure fails closed so it cannot become an authorization
+    bypass.
+    """
+
+    try:
+        row = connection.execute(
+            """
+            SELECT 1 FROM checkpoints WHERE thread_id = ?
+            UNION ALL
+            SELECT 1 FROM writes WHERE thread_id = ?
+            LIMIT 1
+            """,
+            (thread_id, thread_id),
+        ).fetchone()
+    except Exception:
+        return True
+    return row is not None
 
 BASE_SYSTEM_PROMPT = f"""
 你是一个通用 AI 助手，面向多种办公、学习、创作、分析与问答场景。
@@ -1045,13 +1107,40 @@ def _build_current_travel_plan_block(plan: TravelPlan) -> str:
 
 
 def _message_mentions_travel_context(message: str) -> bool:
-    return any(keyword in message for keyword in ["行程", "路线", "安排", "旅行", "出发", "目的地"])
+    return any(
+        keyword in message
+        for keyword in [
+            "行程",
+            "路线",
+            "旅行",
+            "旅游",
+            "出行",
+            "出发",
+            "目的地",
+            "景点",
+            "酒店",
+            "餐厅",
+            "咖啡馆",
+            "车票",
+            "机票",
+            "高铁",
+            "航班",
+            "交通",
+            "周边",
+            "下雨",
+            "天气",
+            "晚点",
+        ]
+    )
 
 
 def _message_mentions_replan(message: str) -> bool:
-    return any(
+    explicit_replan = ["重新规划", "重排", "改行程", "改路线", "调整行程", "调整路线"]
+    if any(keyword in message for keyword in explicit_replan):
+        return True
+    return _message_mentions_travel_context(message) and any(
         keyword in message
-        for keyword in ["下雨", "晚点", "不想走路", "少走路", "重新规划", "重排", "改成", "增加", "去掉", "取消", "预算变"]
+        for keyword in ["下雨", "晚点", "不想走路", "少走路", "改成", "增加", "去掉", "取消", "预算变"]
     )
 
 
@@ -1129,7 +1218,17 @@ def _stream_travel_response(
                 saved_plan,
                 user_id=user_id,
                 change_summary="重规划" if current_plan else "首次生成",
+                # Version 0 is the CAS token for the first write.  Passing
+                # None here would make concurrent first requests both look
+                # like valid creates.
+                expected_version=current_plan.version if current_plan else 0,
             )
+        except Exception as exc:
+            _log_activity("storage", "旅行计划保存失败", str(exc))
+            response.alerts.append("本次计划尚未成功持久化，请刷新当前计划后再继续修改。")
+            saved_plan = None
+            response.trip_plan = None
+        else:
             response.trip_plan = saved_plan
             response.sources = saved_plan.sources
             response.conflicts = saved_plan.conflicts
@@ -1143,26 +1242,25 @@ def _stream_travel_response(
                         source_date=evidence.retrieved_at,
                         evidence_id=evidence.evidence_id,
                     )
-            save_travel_turn(
-                thread_id=thread_id,
-                user_id=user_id,
-                role="user",
-                content=message.strip() or "请结合附件生成旅行计划。",
-                attachments=[
-                    {
-                        "name": attachment.get("name", ""),
-                        "extension": attachment.get("extension", ""),
-                        "modality": attachment.get("modality", "text"),
-                        "image_url": attachment.get("image_url"),
-                    }
-                    for attachment in attachments
-                ],
-                search_enabled=search_enabled,
-            )
-        except Exception as exc:
-            _log_activity("storage", "旅行计划保存失败", str(exc))
-            if saved_plan is not None:
-                saved_plan.risks.append("计划尚未成功持久化，请稍后重试或保留本次结果。")
+            try:
+                save_travel_turn(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    role="user",
+                    content=message.strip() or "请结合附件生成旅行计划。",
+                    attachments=[
+                        {
+                            "name": attachment.get("name", ""),
+                            "extension": attachment.get("extension", ""),
+                            "modality": attachment.get("modality", "text"),
+                            "image_url": attachment.get("image_url"),
+                        }
+                        for attachment in attachments
+                    ],
+                    search_enabled=search_enabled,
+                )
+            except Exception as exc:
+                _log_activity("storage", "旅行请求历史保存失败", str(exc))
     rendered = render_travel_response(response)
     if saved_plan is not None and thread_id:
         try:
@@ -1281,10 +1379,15 @@ def _extract_assistant_metadata(text: str) -> dict:
         return {}
 
 
-def _travel_turn_messages(thread_id: str) -> list[dict]:
-    """Expose travel turns through the same history shape as LangGraph chat."""
+def _travel_turn_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
+    """Expose legacy travel turns through the chat history shape."""
+    return _stored_turn_messages(list_travel_turns(thread_id, user_id=user_id))
+
+
+def _stored_turn_messages(turns: list[dict]) -> list[dict]:
+    """Convert durable conversation turns to the frontend history shape."""
     result = []
-    for turn in list_travel_turns(thread_id):
+    for turn in turns:
         attachments = turn.get("attachments") or []
         if turn.get("role") == "user":
             result.append(
@@ -1297,12 +1400,17 @@ def _travel_turn_messages(thread_id: str) -> list[dict]:
                 }
             )
         elif turn.get("role") == "assistant":
+            content = str(turn.get("content") or "")
+            metadata = _extract_assistant_metadata(content)
+            cleaned_content = _strip_assistant_metadata(content)
+            if not cleaned_content:
+                continue
             result.append(
                 {
                     "role": "assistant",
-                    "content": str(turn.get("content") or ""),
-                    "activities": [],
-                    "sources": [],
+                    "content": cleaned_content,
+                    "activities": metadata.get("activities", []),
+                    "sources": metadata.get("sources", []),
                     "plan_id": turn.get("plan_id"),
                     "plan_version": turn.get("plan_version"),
                 }
@@ -1310,18 +1418,172 @@ def _travel_turn_messages(thread_id: str) -> list[dict]:
     return result
 
 
-def get_messages(thread_id: str) -> list[dict]:
+def _conversation_turn_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
+    return _stored_turn_messages(list_conversation_turns(thread_id, user_id=user_id))
+
+
+def _checkpoint_message_item(msg) -> dict | None:
+    content = _extract_text_content(msg.content)
+    if not content:
+        return None
+    if isinstance(msg, HumanMessage):
+        metadata = _extract_metadata(content)
+        attachments = metadata.get("attachments", [])
+        return {
+            "role": "user",
+            "content": _strip_internal_sections(content),
+            "attachments": attachments,
+            "search_enabled": bool(metadata.get("search_enabled")),
+            "image_urls": [item.get("image_url") for item in attachments if item.get("image_url")],
+        }
+    if isinstance(msg, AIMessage):
+        metadata = _extract_assistant_metadata(content)
+        cleaned_content = _strip_assistant_metadata(content)
+        if not cleaned_content:
+            return None
+        return {
+            "role": "assistant",
+            "content": cleaned_content,
+            "activities": metadata.get("activities", []),
+            "sources": metadata.get("sources", []),
+        }
+    return None
+
+
+def _history_datetime(value: object) -> datetime:
+    text = str(value or "").strip().replace("Z", "+00:00")
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text)
+            return parsed.replace(tzinfo=parsed.tzinfo or CN_TZ)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=CN_TZ)
+
+
+def _history_timestamp_is_known(value: datetime) -> bool:
+    return value != datetime.min.replace(tzinfo=CN_TZ)
+
+
+def _legacy_checkpoint_events(thread_id: str) -> list[tuple[datetime, int, dict]]:
+    """Recover per-checkpoint timestamps for histories written before turn log."""
+
+    try:
+        snapshots = list(checkpoint.list({"configurable": {"thread_id": thread_id}}))
+    except Exception:
+        return []
+
+    events: list[tuple[datetime, int, dict]] = []
+    seen_ids: set[str] = set()
+    seen_counts: dict[tuple[str, str], int] = {}
+    sequence = 0
+    for snapshot in reversed(snapshots):
+        state = snapshot.checkpoint if isinstance(snapshot.checkpoint, dict) else {}
+        values = state.get("channel_values") or {}
+        messages = values.get("messages") or []
+        occurrence_counts: dict[tuple[str, str], int] = {}
+        timestamp = state.get("ts") or (snapshot.metadata or {}).get("created_at", "")
+        for msg in messages:
+            message_id = str(getattr(msg, "id", "") or "").strip()
+            if message_id:
+                if message_id in seen_ids:
+                    continue
+                seen_ids.add(message_id)
+            else:
+                base = (msg.__class__.__name__, _extract_text_content(getattr(msg, "content", "")))
+                occurrence = occurrence_counts.get(base, 0)
+                occurrence_counts[base] = occurrence + 1
+                if occurrence < seen_counts.get(base, 0):
+                    continue
+                seen_counts[base] = occurrence + 1
+
+            item = _checkpoint_message_item(msg)
+            if item is None:
+                continue
+            events.append((_history_datetime(timestamp), sequence, item))
+            sequence += 1
+    return events
+
+
+def _merge_legacy_history(
+    thread_id: str,
+    user_id: int | None,
+    turns: list[dict] | None = None,
+) -> list[dict]:
+    checkpoint_events = _legacy_checkpoint_events(thread_id)
+    turns = turns if turns is not None else list_conversation_turns(thread_id, user_id=user_id)
+    events: list[tuple[datetime, int, dict, str]] = [
+        (timestamp, sequence, item, "checkpoint")
+        for timestamp, sequence, item in checkpoint_events
+    ]
+    for index, turn in enumerate(turns, start=len(events)):
+        stored = _stored_turn_messages([turn])
+        if stored:
+            events.append((_history_datetime(turn.get("created_at")), index, stored[0], "turn"))
+
+    # A current ordinary-chat checkpoint often contains the same user/assistant
+    # pair that was also written to the ordered turn log.  Match those copies
+    # one-to-one and only inside a small timestamp window; content alone is
+    # not a safe identity because users can legitimately repeat a question.
+    checkpoint_events = [event for event in events if event[3] == "checkpoint"]
+    turn_events = [event for event in events if event[3] == "turn"]
+    matched_checkpoint_sequences: set[int] = set()
+    used_checkpoint_sequences: set[int] = set()
+    for turn_timestamp, _turn_sequence, turn_item, _source in turn_events:
+        if not _history_timestamp_is_known(turn_timestamp):
+            continue
+        candidates = [
+            event
+            for event in checkpoint_events
+            if event[1] not in used_checkpoint_sequences
+            and event[2].get("role") == turn_item.get("role")
+            and event[2].get("content") == turn_item.get("content")
+            and _history_timestamp_is_known(event[0])
+            and abs((event[0] - turn_timestamp).total_seconds()) <= 5 * 60
+        ]
+        if not candidates:
+            continue
+        matched = min(candidates, key=lambda event: abs((event[0] - turn_timestamp).total_seconds()))
+        used_checkpoint_sequences.add(matched[1])
+        matched_checkpoint_sequences.add(matched[1])
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    result: list[dict] = []
+    for _timestamp, _sequence, item, source in events:
+        if source == "checkpoint" and _sequence in matched_checkpoint_sequences:
+            continue
+        if item.get("role") == "assistant" and result and result[-1].get("role") == "assistant":
+            if item.get("content") not in result[-1].get("content", ""):
+                result[-1]["content"] = f"{result[-1]['content']}\n\n{item['content']}".strip()
+            result[-1].setdefault("activities", []).extend(item.get("activities", []))
+            result[-1].setdefault("sources", []).extend(item.get("sources", []))
+        else:
+            result.append(item)
+    return result
+
+
+def get_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
+    conversation_turns = list_conversation_turns(thread_id, user_id=user_id)
     cp = checkpoint.get({"configurable": {"thread_id": thread_id}})
     if not cp:
-        return _travel_turn_messages(thread_id)
+        return _conversation_turn_messages(thread_id, user_id=user_id)
 
     channel_values = cp.get("channel_values")
     if not channel_values:
-        return _travel_turn_messages(thread_id)
+        return _conversation_turn_messages(thread_id, user_id=user_id)
 
     messages = channel_values.get("messages", [])
     if not messages:
-        return _travel_turn_messages(thread_id)
+        return _conversation_turn_messages(thread_id, user_id=user_id)
+
+    # Once ordinary chat turns are recorded, the durable turn log is the
+    # source of truth for ordering travel and non-travel messages.  The
+    # checkpoint remains the fallback for histories written before this log
+    # existed.
+    if conversation_turns:
+        merged_legacy = _merge_legacy_history(thread_id, user_id, conversation_turns)
+        if merged_legacy:
+            return merged_legacy
 
     result = []
     for msg in messages:
@@ -1360,7 +1622,7 @@ def get_messages(thread_id: str) -> list[dict]:
                     "sources": metadata.get("sources", []),
                 }
             )
-    travel_messages = _travel_turn_messages(thread_id)
+    travel_messages = _travel_turn_messages(thread_id, user_id=user_id)
     if travel_messages:
         # A travel turn is persisted outside the LangGraph execution state.
         # Avoid duplicating it when a future checkpoint implementation starts
@@ -1445,10 +1707,10 @@ def list_threads() -> list[dict]:
     return sessions
 
 
-def delete_thread(thread_id: str):
-    for message in get_messages(thread_id):
+def delete_thread(thread_id: str, user_id: int | None = None):
+    for message in get_messages(thread_id, user_id=user_id):
         for attachment in message.get("attachments", []):
             if attachment.get("storage") == "oss" and attachment.get("object_key"):
                 delete_oss_object(attachment["object_key"])
     checkpoint.delete_thread(thread_id)
-    delete_travel_thread(thread_id)
+    delete_travel_thread(thread_id, user_id=user_id)

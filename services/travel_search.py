@@ -9,8 +9,10 @@ fake searcher without touching the network.
 from __future__ import annotations
 
 import os
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 try:
@@ -20,6 +22,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
+DENIED_SOURCE_HOSTS = {"dianping.com", "www.dianping.com", "m.dianping.com"}
 
 
 @dataclass(slots=True)
@@ -28,10 +31,39 @@ class TravelSearchResult:
     sources: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     attempted: bool = False
+    status: str = "not_requested"
 
 
 def _now_label() -> str:
     return datetime.now(CN_TZ).isoformat(timespec="seconds")
+
+
+def _normalize_url(value: str) -> str:
+    parsed = urlsplit((value or "").strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return urlunsplit(
+        (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path,
+            parsed.query,
+            "",
+        )
+    )
+
+
+def _is_denied_source(url: str) -> bool:
+    parsed = urlsplit(url if "://" in url else f"//{url}")
+    host = parsed.hostname or ""
+    host = host.lower().rstrip(".")
+    return host in DENIED_SOURCE_HOSTS or host.endswith(".dianping.com")
+
+
+def _evidence_id(*, url: str, title: str, anchor: str, query: str) -> str:
+    key = _normalize_url(url) or "|".join((anchor, query, title))
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"web_{digest}"
 
 
 def _default_searcher():
@@ -62,16 +94,19 @@ def discover_travel_places(
 
     result = TravelSearchResult()
     if not search_enabled:
+        result.status = "disabled"
         return result
 
     result.attempted = True
     if not city:
         result.errors.append("缺少目的地，无法进行附近地点搜索。")
+        result.status = "failed"
         return result
 
     active_searcher = searcher or _default_searcher()
     if active_searcher is None:
         result.errors.append("未配置 Tavily 搜索能力。")
+        result.status = "not_configured"
         if activity_logger:
             activity_logger("search", "旅行网页搜索不可用", "未配置 Tavily API Key")
         return result
@@ -95,34 +130,48 @@ def discover_travel_places(
         except Exception as exc:
             message = f"{query}: {exc}"
             result.errors.append(message)
+            result.status = "partial" if result.candidates else "failed"
             if activity_logger:
                 activity_logger("tool", "旅行网页搜索失败", str(exc))
             continue
 
-        items = raw.get("results", []) if isinstance(raw, dict) else []
-        if not isinstance(items, list):
+        if not isinstance(raw, dict) or "results" not in raw or not isinstance(raw["results"], list):
+            result.errors.append(f"{query}: 搜索服务返回格式无效。")
+            result.status = "partial" if result.candidates else "failed"
             continue
+        items = raw["results"]
         for index, item in enumerate(items, start=1):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title") or "").strip()
             url = str(item.get("url") or "").strip()
-            snippet = str(item.get("content") or item.get("snippet") or "").strip().replace("\n", " ")
-            if not title and not url:
+            raw_content = str(item.get("content") or "").strip()
+            normalized_url = _normalize_url(url)
+            if not title or not normalized_url:
                 continue
-            if url and url in seen_urls:
+            if _is_denied_source(normalized_url) or any(
+                marker in f"{title} {url} {raw_content}".lower()
+                for marker in ("dianping.com", "大众点评")
+            ):
+                # Travel discovery must not copy or expose review text from
+                # Dianping.  Such a result is not a candidate source.
                 continue
-            if url:
-                seen_urls.add(url)
-            evidence_id = f"web_{len(result.sources) + 1:03d}"
+            if normalized_url and normalized_url in seen_urls:
+                continue
+            if normalized_url:
+                seen_urls.add(normalized_url)
+            evidence_id = _evidence_id(url=normalized_url, title=title, anchor=anchor, query=query)
             result.sources.append(
                 {
                     "evidence_id": evidence_id,
                     "source_type": "web_search",
                     "provider": "Tavily",
                     "title": title,
-                    "url": url,
-                    "snippet": snippet[:500],
+                    "url": normalized_url,
+                    # Search content is discovery text, not an authorized
+                    # review excerpt.  Keep only metadata in the durable
+                    # evidence record.
+                    "snippet": "",
                     "retrieved_at": retrieved_at,
                     "valid_until": "",
                     "freshness": "unknown",
@@ -135,8 +184,8 @@ def discover_travel_places(
                 {
                     "name_hint": title,
                     "category_hint": "美食" if "餐" in query or "吃" in query else "景点",
-                    "url": url,
-                    "snippet": snippet[:500],
+                    "url": normalized_url,
+                    "snippet": "",
                     "source_id": evidence_id,
                     "rank": index,
                 }
@@ -144,4 +193,10 @@ def discover_travel_places(
         if activity_logger:
             activity_logger("search", "旅行网页搜索完成", f"候选 {len(result.candidates)} 条")
 
+    if result.candidates:
+        result.status = "partial" if result.errors else "success"
+    elif result.errors:
+        result.status = result.status if result.status in {"failed", "not_configured"} else "failed"
+    else:
+        result.status = "empty"
     return result

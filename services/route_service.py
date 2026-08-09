@@ -6,6 +6,18 @@ from adapters.amap_adapter import plan_route, resolve_place_in_city
 from agents.schemas import RoutePlan, TravelQuery
 
 
+class RoutePlansResult(list[RoutePlan]):
+    """List-compatible route result with provider partial-failure metadata."""
+
+    def __init__(self, items: list[RoutePlan] | None = None, *, errors: list[str] | None = None):
+        super().__init__(items or [])
+        self.errors = list(errors or [])
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.errors)
+
+
 def _dedupe_places(items: list[str]) -> list[str]:
     result: list[str] = []
     for item in items:
@@ -69,17 +81,25 @@ def _build_segments(query: TravelQuery) -> list[tuple[dict, dict]]:
     return segments
 
 
-def get_route_plans(query: TravelQuery) -> list[RoutePlan]:
+def get_route_plans(query: TravelQuery) -> RoutePlansResult:
     segments = _build_segments(query)
     if not segments:
-        return []
+        return RoutePlansResult()
 
-    results: list[RoutePlan] = []
+    results = RoutePlansResult()
+    errors: list[str] = []
     for start, end in segments:
         candidates: list[RoutePlan] = []
         for mode in ["transit", "driving", "walking"]:
-            payload = plan_route(start["name"], end["name"], strategy=mode)
-            if not payload:
+            try:
+                payload = plan_route(start["name"], end["name"], strategy=mode)
+            except Exception as exc:
+                # Route modes are independent provider calls.  A transit
+                # outage must not prevent driving/walking alternatives from
+                # being considered for the same pair of places.
+                errors.append(f"{mode}:{type(exc).__name__}")
+                continue
+            if not isinstance(payload, dict) or not payload:
                 continue
             candidates.append(
                 RoutePlan(
@@ -106,4 +126,5 @@ def get_route_plans(query: TravelQuery) -> list[RoutePlan]:
             best = min(usable, key=lambda item: _parse_duration_minutes(item.duration))
             results.append(best)
 
+    results.errors = errors
     return results

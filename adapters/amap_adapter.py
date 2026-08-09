@@ -6,10 +6,7 @@ from utils.weather_utils import _amap_get, geocode_location, has_amap_key
 def safe_geocode(location: str) -> dict | None:
     if not location or not has_amap_key():
         return None
-    try:
-        return geocode_location(location)
-    except Exception:
-        return None
+    return geocode_location(location)
 
 
 def search_pois(location: str, keywords: str, page_size: int = 5) -> list[dict]:
@@ -18,18 +15,15 @@ def search_pois(location: str, keywords: str, page_size: int = 5) -> list[dict]:
         return []
 
     city = geo.get("city") or geo.get("province") or location
-    try:
-        payload = _amap_get(
-            "/v5/place/text",
-            {
-                "keywords": keywords,
-                "region": city,
-                "page_size": page_size,
-                "show_fields": "business,photos,indoor,navi,discount_tag,rating,cost",
-            },
-        )
-    except Exception:
-        return []
+    payload = _amap_get(
+        "/v5/place/text",
+        {
+            "keywords": keywords,
+            "region": city,
+            "page_size": page_size,
+            "show_fields": "business,photos,indoor,navi,discount_tag,rating,cost",
+        },
+    )
 
     pois = payload.get("pois") or []
     results = []
@@ -53,18 +47,15 @@ def resolve_place_in_city(city: str, place: str) -> dict | None:
     if not city or not place or not has_amap_key():
         return None
 
-    try:
-        payload = _amap_get(
-            "/v5/place/text",
-            {
-                "keywords": place,
-                "region": city,
-                "page_size": 1,
-                "show_fields": "business,navi",
-            },
-        )
-    except Exception:
-        return None
+    payload = _amap_get(
+        "/v5/place/text",
+        {
+            "keywords": place,
+            "region": city,
+            "page_size": 1,
+            "show_fields": "business,navi",
+        },
+    )
 
     pois = payload.get("pois") or []
     if not pois:
@@ -101,10 +92,7 @@ def search_pois_around_location(
     if types:
         params["types"] = types
 
-    try:
-        payload = _amap_get("/v3/place/around", params)
-    except Exception:
-        return []
+    payload = _amap_get("/v3/place/around", params)
 
     pois = payload.get("pois") or []
     results = []
@@ -152,10 +140,7 @@ def plan_route(origin: str, destination: str, strategy: str = "walking") -> dict
     if strategy == "transit":
         params["city"] = destination_geo.get("adcode") or destination_geo.get("city") or destination
 
-    try:
-        payload = _amap_get(path, params)
-    except Exception:
-        return None
+    payload = _amap_get(path, params)
 
     route = payload.get("route", {})
     paths = route.get("paths") or route.get("transits") or []

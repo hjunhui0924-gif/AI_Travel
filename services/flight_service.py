@@ -1,7 +1,20 @@
 from __future__ import annotations
 
-from adapters.flight_mcp_adapter import FlightQueryError, is_flight_mcp_enabled, search_flights
+from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
 from agents.schemas import TransportOption, TravelQuery
+from services.transport_dates import resolve_transport_dates
+
+
+class FlightOptionsResult(list[TransportOption]):
+    """List-compatible flight result with malformed-row metadata."""
+
+    def __init__(self, items: list[TransportOption] | None = None, *, errors: list[str] | None = None):
+        super().__init__(items or [])
+        self.errors = list(errors or [])
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.errors)
 
 
 def _time_to_minutes(value: str) -> int:
@@ -108,41 +121,52 @@ def _select_recommended_flights(raw_options: list[dict], limit: int = 5) -> list
     return sorted(selected[:limit], key=_display_priority)
 
 
-def get_flight_options(query: TravelQuery) -> list[TransportOption]:
+def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
     if not query.origin or not query.destination or not query.date:
-        return []
+        return FlightOptionsResult()
 
-    try:
-        raw_options = search_flights(query.origin, query.destination, query.date)
-    except FlightQueryError:
-        return []
+    provider_options = search_flights(query.origin, query.destination, query.date) or []
+    if not isinstance(provider_options, (list, tuple)):
+        provider_options = []
+    raw_options = [item for item in provider_options if isinstance(item, dict)]
 
-    results: list[TransportOption] = []
+    errors = [] if len(raw_options) == len(provider_options) else ["malformed provider row"]
+    results = FlightOptionsResult(errors=errors)
     for item in _select_recommended_flights(raw_options, limit=5):
-        summary_parts = [item.get("summary", "")]
-        if item.get("airport"):
-            summary_parts.append(item["airport"])
+        try:
+            depart_date, arrive_date = resolve_transport_dates(query.date, item)
+            summary_parts = [item.get("summary", "")]
+            if item.get("airport"):
+                summary_parts.append(item["airport"])
 
-        results.append(
-            TransportOption(
-                mode="flight",
-                title=item.get("flight_no", "航班"),
-                depart_time=item.get("depart_time", ""),
-                arrive_time=item.get("arrive_time", ""),
-                duration=item.get("duration", ""),
-                price=item.get("price", ""),
-                summary=" | ".join(part for part in summary_parts if part),
-                provider=item.get("provider", "FlightTicketMCP" if is_flight_mcp_enabled() else ""),
-                seats=[
-                    part
-                    for part in [
-                        item.get("airline", ""),
-                        item.get("cabin", ""),
-                        item.get("airport", ""),
-                    ]
-                    if part
-                ],
-                is_demo=bool(item.get("is_demo", False)),
+            results.append(
+                TransportOption(
+                    mode="flight",
+                    title=item.get("flight_no", "航班"),
+                    depart_time=item.get("depart_time", ""),
+                    arrive_time=item.get("arrive_time", ""),
+                    duration=item.get("duration", ""),
+                    price=item.get("price", ""),
+                    summary=" | ".join(part for part in summary_parts if part),
+                    provider=item.get("provider", "FlightTicketMCP" if is_flight_mcp_enabled() else ""),
+                    seats=[
+                        part
+                        for part in [
+                            item.get("airline", ""),
+                            item.get("cabin", ""),
+                            item.get("airport", ""),
+                        ]
+                        if part
+                    ],
+                    is_demo=bool(item.get("is_demo", False)),
+                    depart_date=depart_date,
+                    arrive_date=arrive_date,
+                )
             )
-        )
+        except Exception:
+            # A malformed provider row must not discard valid flights from
+            # the same response.  The orchestrator will expose an empty or
+            # partial-looking result rather than inventing a replacement.
+            results.errors.append(f"row:{type(item).__name__}")
+            continue
     return results

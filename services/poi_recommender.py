@@ -1,17 +1,52 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from adapters.amap_adapter import resolve_place_in_city, search_pois, search_pois_around_location
 from agents.schemas import Evidence, PoiGroup, PoiRecommendation, TravelQuery
 from services.travel_search import discover_travel_places
+from utils.weather_utils import has_amap_key
 
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
 FOOD_TYPES = "050000|060000"
 LEISURE_TYPES = "110000|120000|160000"
+
+
+@dataclass(slots=True)
+class PoiGroupDiscoveryResult:
+    groups: list[PoiGroup]
+    evidence: list[Evidence]
+    errors: list[str]
+    web_search_status: str = "not_requested"
+    poi_status: str = "empty"
+
+    def __iter__(self):
+        # Keep the original three-value unpacking seam for callers that do not
+        # need adapter status yet.
+        yield self.groups
+        yield self.evidence
+        yield self.errors
+
+
+@dataclass(slots=True)
+class PoiRecommendationResult:
+    recommendations: list[PoiRecommendation]
+    groups: list[PoiGroup]
+    evidence: list[Evidence]
+    errors: list[str]
+    web_search_status: str = "not_requested"
+    poi_status: str = "empty"
+
+    def __iter__(self):
+        # Existing tests and integrations can continue to unpack four values.
+        yield self.recommendations
+        yield self.groups
+        yield self.evidence
+        yield self.errors
 
 
 def _now_label() -> str:
@@ -144,32 +179,63 @@ def build_poi_groups(
     *,
     search_enabled: bool = False,
     activity_logger=None,
-) -> tuple[list[PoiGroup], list[Evidence], list[str]]:
+) -> PoiGroupDiscoveryResult:
     city = query.destination or query.city
     if not city:
-        return [], [], ["缺少目的地，无法发现附近地点。"]
+        return PoiGroupDiscoveryResult(
+            groups=[],
+            evidence=[],
+            errors=["缺少目的地，无法发现附近地点。"],
+            web_search_status="failed" if search_enabled else "disabled",
+            poi_status="failed",
+        )
 
     groups: list[PoiGroup] = []
     evidence: list[Evidence] = []
     errors: list[str] = []
+    web_search_statuses: list[str] = []
+    has_map_items = False
+    map_failed = False
     anchors = query.named_places[:4] or [""]
     for place in anchors:
-        resolved = resolve_place_in_city(city, place) if place else None
+        try:
+            resolved = resolve_place_in_city(city, place) if place else None
+        except Exception as exc:
+            resolved = None
+            map_failed = True
+            errors.append(f"地图地点解析失败：{type(exc).__name__}")
         anchor_name = resolved.get("name", place) if resolved else (place or city)
 
         food_items: list[dict] = []
         leisure_items: list[dict] = []
         if resolved and resolved.get("location"):
-            food_items = search_pois_around_location(
-                resolved["location"], page_size=4, radius=1800, types=FOOD_TYPES
-            )
-            leisure_items = search_pois_around_location(
-                resolved["location"], page_size=3, radius=2200, types=LEISURE_TYPES
-            )
+            try:
+                food_items = search_pois_around_location(
+                    resolved["location"], page_size=4, radius=1800, types=FOOD_TYPES
+                )
+            except Exception as exc:
+                map_failed = True
+                errors.append(f"附近餐饮查询失败：{type(exc).__name__}")
+            try:
+                leisure_items = search_pois_around_location(
+                    resolved["location"], page_size=3, radius=2200, types=LEISURE_TYPES
+                )
+            except Exception as exc:
+                map_failed = True
+                errors.append(f"附近去处查询失败：{type(exc).__name__}")
         if not food_items:
-            food_items = search_pois(anchor_name, "附近餐厅 美食 咖啡馆", page_size=4)
+            try:
+                food_items = search_pois(anchor_name, "附近餐厅 美食 咖啡馆", page_size=4)
+            except Exception as exc:
+                map_failed = True
+                errors.append(f"餐饮 POI 查询失败：{type(exc).__name__}")
         if not leisure_items:
-            leisure_items = search_pois(anchor_name, "附近景点 娱乐", page_size=3)
+            try:
+                leisure_items = search_pois(anchor_name, "附近景点 娱乐", page_size=3)
+            except Exception as exc:
+                map_failed = True
+                errors.append(f"景点 POI 查询失败：{type(exc).__name__}")
+        has_map_items = has_map_items or bool(food_items or leisure_items)
 
         items: list[PoiRecommendation] = []
         for item in _sort_by_travel_fit(food_items, query.preferences)[:3]:
@@ -183,41 +249,91 @@ def build_poi_groups(
 
         # Search can discover popularity signals, but map data remains the
         # gate for a place card.  Unresolved web titles stay in evidence only.
-        search_result = discover_travel_places(
-            city,
-            anchor=anchor_name if place else "",
-            preferences=query.preferences,
-            search_enabled=search_enabled,
-            activity_logger=activity_logger,
-        )
-        evidence.extend(Evidence(**item) for item in search_result.sources)
-        errors.extend(search_result.errors)
-        for candidate in search_result.candidates[:4]:
-            resolved_candidate = resolve_place_in_city(city, candidate.get("name_hint", ""))
-            if not resolved_candidate:
-                errors.append(f"网页候选未通过地图地点验证：{candidate.get('name_hint', '')}")
-                continue
-            item = {
-                **resolved_candidate,
-                "source_ids": [candidate.get("source_id", "")],
-            }
-            poi, source = _to_poi(
-                item,
-                candidate.get("category_hint", "景点"),
+        try:
+            search_result = discover_travel_places(
                 city,
-                prefix="网页发现 + 地图验证",
-                extra_source_ids=[candidate.get("source_id", "")],
-                popularity_signal="网页结果提及（不等同于评分）",
-                popularity_source=candidate.get("source_id", ""),
-                website_url=candidate.get("url", ""),
+                anchor=anchor_name if place else "",
+                preferences=query.preferences,
+                search_enabled=search_enabled,
+                activity_logger=activity_logger,
             )
-            items.append(poi)
-            evidence.append(source)
+        except Exception as exc:
+            # Web discovery is supplementary.  A search client construction or
+            # provider failure must not discard map results already collected
+            # for this or earlier anchors.
+            errors.append(f"旅行网页搜索失败：{type(exc).__name__}")
+            web_search_statuses.append("failed" if search_enabled else "disabled")
+            search_result = None
+        if search_result is not None:
+            evidence.extend(Evidence(**item) for item in search_result.sources)
+            errors.extend(search_result.errors)
+            web_search_statuses.append(search_result.status)
+            for candidate in search_result.candidates[:4]:
+                try:
+                    resolved_candidate = resolve_place_in_city(city, candidate.get("name_hint", ""))
+                except Exception as exc:
+                    map_failed = True
+                    errors.append(f"网页候选地图验证失败：{type(exc).__name__}")
+                    continue
+                if not resolved_candidate:
+                    errors.append(f"网页候选未通过地图地点验证：{candidate.get('name_hint', '')}")
+                    continue
+                item = {
+                    **resolved_candidate,
+                    "source_ids": [candidate.get("source_id", "")],
+                }
+                poi, source = _to_poi(
+                    item,
+                    candidate.get("category_hint", "景点"),
+                    city,
+                    prefix="网页发现 + 地图验证",
+                    extra_source_ids=[candidate.get("source_id", "")],
+                    popularity_signal="网页结果提及（不等同于评分）",
+                    popularity_source=candidate.get("source_id", ""),
+                    website_url=candidate.get("url", ""),
+                )
+                items.append(poi)
+                evidence.append(source)
 
         if items:
             groups.append(PoiGroup(anchor=anchor_name, items=_dedupe_items(items)[:8]))
 
-    return groups, _dedupe_evidence(evidence), _dedupe_errors(errors)
+    web_search_status = _combine_search_statuses(web_search_statuses, search_enabled)
+    poi_status = (
+        "partial" if has_map_items and map_failed
+        else "success" if has_map_items or groups
+        else "not_configured" if not has_amap_key()
+        else "failed" if map_failed
+        else "empty"
+    )
+    if groups and poi_status == "empty":
+        poi_status = "success"
+    return PoiGroupDiscoveryResult(
+        groups=groups,
+        evidence=_dedupe_evidence(evidence),
+        errors=_dedupe_errors(errors),
+        web_search_status=web_search_status,
+        poi_status=poi_status,
+    )
+
+
+def _combine_search_statuses(statuses: list[str], search_enabled: bool) -> str:
+    if not search_enabled:
+        return "disabled"
+    if not statuses:
+        return "empty"
+    normalized = set(statuses)
+    if "partial" in normalized:
+        return "partial"
+    if "success" in normalized and normalized.intersection({"failed", "not_configured"}):
+        return "partial"
+    if "success" in normalized:
+        return "success"
+    if "not_configured" in normalized:
+        return "not_configured"
+    if "failed" in normalized:
+        return "failed"
+    return "empty"
 
 
 def _dedupe_evidence(items: list[Evidence]) -> list[Evidence]:
@@ -244,24 +360,53 @@ def recommend_pois(
     *,
     search_enabled: bool = False,
     activity_logger=None,
-) -> tuple[list[PoiRecommendation], list[PoiGroup], list[Evidence], list[str]]:
+) -> PoiRecommendationResult:
     city = query.destination or query.city
     if not city:
-        return [], [], [], ["缺少目的地，无法推荐 POI。"]
+        return PoiRecommendationResult(
+            recommendations=[],
+            groups=[],
+            evidence=[],
+            errors=["缺少目的地，无法推荐 POI。"],
+            web_search_status="failed" if search_enabled else "disabled",
+            poi_status="failed",
+        )
 
-    poi_groups, evidence, errors = build_poi_groups(
+    group_result = build_poi_groups(
         query,
         search_enabled=search_enabled,
         activity_logger=activity_logger,
     )
+    if isinstance(group_result, PoiGroupDiscoveryResult):
+        poi_groups = group_result.groups
+        evidence = group_result.evidence
+        errors = group_result.errors
+        web_search_status = group_result.web_search_status
+        poi_status = group_result.poi_status
+    else:
+        poi_groups, evidence, errors = group_result
+        web_search_status = "disabled" if not search_enabled else ("failed" if errors else "empty")
+        poi_status = "success" if poi_groups else ("failed" if errors else "empty")
+
     recommendations: list[PoiRecommendation] = []
     for group in poi_groups:
         recommendations.extend(group.items)
 
     # These are map-backed city-level candidates and work even when web search
     # is disabled.  Ratings are shown only if the adapter actually returned one.
-    food_items = search_pois(city, "本地特色餐厅 美食", page_size=4)
-    sight_items = search_pois(city, "热门景点 旅游", page_size=4)
+    city_lookup_failed = False
+    try:
+        food_items = search_pois(city, "本地特色餐厅 美食", page_size=4)
+    except Exception as exc:
+        food_items = []
+        city_lookup_failed = True
+        errors.append(f"城市餐饮 POI 查询失败：{type(exc).__name__}")
+    try:
+        sight_items = search_pois(city, "热门景点 旅游", page_size=4)
+    except Exception as exc:
+        sight_items = []
+        city_lookup_failed = True
+        errors.append(f"城市景点 POI 查询失败：{type(exc).__name__}")
     for item in _sort_by_travel_fit(food_items, query.preferences):
         poi, source = _to_poi(item, "美食", city)
         recommendations.append(poi)
@@ -272,6 +417,21 @@ def recommend_pois(
         evidence.append(source)
 
     deduped = _dedupe_items(recommendations)
+    if deduped:
+        poi_status = "partial" if city_lookup_failed or poi_status == "partial" else "success"
+    elif not has_amap_key():
+        poi_status = "not_configured"
+    elif city_lookup_failed or poi_status in {"failed", "partial"}:
+        poi_status = "failed" if not recommendations else "partial"
+    elif poi_status not in {"failed", "not_configured"}:
+        poi_status = "empty"
     if not deduped:
         errors.append("当前未获取到可验证的地图 POI；未生成虚构地点占位卡。")
-    return deduped[:16], poi_groups, _dedupe_evidence(evidence), _dedupe_errors(errors)
+    return PoiRecommendationResult(
+        recommendations=deduped[:16],
+        groups=poi_groups,
+        evidence=_dedupe_evidence(evidence),
+        errors=_dedupe_errors(errors),
+        web_search_status=web_search_status,
+        poi_status=poi_status,
+    )

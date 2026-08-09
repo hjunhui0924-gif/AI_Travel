@@ -1,16 +1,22 @@
 from uuid import uuid4
 import json
+from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from langchain.messages import AIMessage, AIMessageChunk, HumanMessage
+from starlette.requests import Request
 
 import app as app_module
 from agents import agent as agent_module
 from agents.schemas import PlanDay, PlanItem, TravelPlan, TravelPlanResponse
-from services.travel_store import delete_travel_thread
+from services.travel_store import delete_travel_thread, ensure_guest_access, save_travel_turn
 
 
 def test_guest_travel_plan_and_calendar_endpoints():
     thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
     plan = TravelPlan(
         plan_id="",
         thread_id=thread_id,
@@ -32,6 +38,7 @@ def test_guest_travel_plan_and_calendar_endpoints():
     )
     saved = app_module.save_plan_version(plan)
     client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
     try:
         response = client.get(f"/travel/plans/{thread_id}")
         assert response.status_code == 200
@@ -50,12 +57,19 @@ def test_guest_travel_plan_and_calendar_endpoints():
         assert updated.json()["item"]["locked"] is True
         assert updated.json()["item"]["status"] == "confirmed"
         assert updated.json()["plan"]["version"] == 2
+
+        stale = client.patch(
+            f"/travel/plans/{thread_id}/items/poi-1",
+            json={"locked": False, "expected_version": 1},
+        )
+        assert stale.status_code == 409
     finally:
         delete_travel_thread(thread_id)
 
 
 def test_chat_done_contains_structured_plan_and_version(monkeypatch):
     thread_id = f"guest_{uuid4().hex}"
+    expected_versions = []
 
     def fake_plan(message, attachments, *, thread_id="", search_enabled=False, current_plan=None, activity_logger=None):
         plan = TravelPlan(
@@ -77,6 +91,13 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
         return TravelPlanResponse(intent="trip_plan", summary="ok", trip_plan=plan, sources=plan.sources)
 
     monkeypatch.setattr(agent_module, "plan_travel", fake_plan)
+    original_save_plan_version = agent_module.save_plan_version
+
+    def spy_save_plan_version(*args, **kwargs):
+        expected_versions.append(kwargs.get("expected_version"))
+        return original_save_plan_version(*args, **kwargs)
+
+    monkeypatch.setattr(agent_module, "save_plan_version", spy_save_plan_version)
     client = TestClient(app_module.app)
     try:
         first = client.post(
@@ -85,6 +106,7 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
         )
         done = json.loads([line[6:] for line in first.text.splitlines() if line.startswith("data:")][-1])
         assert done["trip_plan"]["version"] == 1
+        assert expected_versions == [0]
 
         second = client.post(
             "/chat",
@@ -92,5 +114,353 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
         )
         done_again = json.loads([line[6:] for line in second.text.splitlines() if line.startswith("data:")][-1])
         assert done_again["trip_plan"]["version"] == 2
+        assert expected_versions == [0, 1]
     finally:
         delete_travel_thread(thread_id)
+
+
+def test_guest_id_cannot_read_owned_thread(monkeypatch):
+    thread_id = "guest_abcd1234"
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: None)
+    monkeypatch.setattr(app_module, "get_thread", lambda value: {"thread_id": value, "user_id": 7} if value == thread_id else None)
+    client = TestClient(app_module.app)
+
+    response = client.get(f"/travel/plans/{thread_id}")
+
+    assert response.status_code == 404
+
+
+def test_old_checkpoint_only_guest_thread_cannot_mint_new_capability(monkeypatch):
+    thread_id = "guest_legacy_checkpoint"
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: None)
+    monkeypatch.setattr(app_module, "get_thread", lambda value: None)
+    monkeypatch.setattr(app_module, "get_plan_owner_id", lambda value: None)
+    monkeypatch.setattr(app_module, "has_checkpoint_data", lambda value: value == thread_id)
+    client = TestClient(app_module.app)
+
+    response = client.get(f"/history/{thread_id}")
+
+    assert response.status_code == 404
+
+
+def test_old_checkpoint_cannot_be_claimed_with_arbitrary_guest_cookie(monkeypatch):
+    thread_id = "guest_legacy_checkpoint_cookie"
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: None)
+    monkeypatch.setattr(app_module, "get_thread", lambda value: None)
+    monkeypatch.setattr(app_module, "get_plan_owner_id", lambda value: None)
+    monkeypatch.setattr(app_module, "has_checkpoint_data", lambda value: value == thread_id)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, "attacker-controlled-token")
+
+    response = client.get(f"/history/{thread_id}")
+
+    assert response.status_code == 404
+
+
+def test_legacy_thread_migration_is_explicit_and_only_claims_known_ids(monkeypatch):
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: {"id": 42})
+    monkeypatch.setattr(app_module, "list_legacy_thread_ids", lambda: ["guest_legacy_known_1234"])
+    claimed = []
+    monkeypatch.setattr(
+        app_module,
+        "assign_threads_to_user",
+        lambda user_id, thread_ids, title: claimed.extend(thread_ids),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "is_thread_owned_by_user",
+        lambda user_id, thread_id: thread_id in claimed,
+    )
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.SESSION_COOKIE_NAME, "valid-session")
+
+    response = client.post(
+        "/threads/migrate-legacy",
+        json={"thread_ids": ["guest_legacy_known_1234", "not-a-known-legacy-id", "default"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["migrated_thread_ids"] == ["guest_legacy_known_1234"]
+    assert response.json()["skipped_thread_ids"] == ["not-a-known-legacy-id", "default"]
+    assert claimed == ["guest_legacy_known_1234"]
+
+
+def test_guest_request_mints_http_only_capability_cookie():
+    thread_id = f"guest_{uuid4().hex}"
+    client = TestClient(app_module.app)
+
+    try:
+        response = client.get(f"/travel/plans/{thread_id}")
+
+        assert response.status_code == 200
+        assert response.json()["plan"] is None
+        token = client.cookies.get(app_module.GUEST_COOKIE_NAME)
+        assert token
+        set_cookie = response.headers.get("set-cookie", "")
+        assert f"{app_module.GUEST_COOKIE_NAME}={token}" in set_cookie
+        assert "HttpOnly" in set_cookie
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_guest_plan_requires_matching_capability_cookie():
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+    )
+    app_module.save_plan_version(plan)
+
+    try:
+        no_cookie = TestClient(app_module.app).get(f"/travel/plans/{thread_id}")
+        assert no_cookie.status_code == 404
+
+        wrong_cookie_client = TestClient(app_module.app)
+        wrong_cookie_client.cookies.set(app_module.GUEST_COOKIE_NAME, "wrong-token")
+        wrong_cookie = wrong_cookie_client.get(f"/travel/plans/{thread_id}")
+        assert wrong_cookie.status_code == 404
+
+        authorized_client = TestClient(app_module.app)
+        authorized_client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+        authorized = authorized_client.get(f"/travel/plans/{thread_id}")
+        assert authorized.status_code == 200
+        assert authorized.json()["plan"]["destination"] == "杭州"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_out_of_range_plan_item_can_be_unlocked_via_patch():
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+        out_of_range_items=[
+            PlanItem(
+                "outside-item",
+                "hotel",
+                "日期外酒店",
+                "2026-09-03",
+                status="confirmed",
+                locked=True,
+            )
+        ],
+    )
+    saved = app_module.save_plan_version(plan)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.patch(
+            f"/travel/plans/{thread_id}/items/outside-item",
+            json={"locked": False, "expected_version": saved.version},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["item"]["locked"] is False
+        assert response.json()["plan"]["out_of_range_items"][0]["status"] == "suggested"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_logged_in_request_cannot_use_guest_namespace(monkeypatch):
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: {"id": 7})
+    request = Request({"type": "http", "headers": []})
+
+    with pytest.raises(HTTPException) as raised:
+        app_module._authorized_thread_user(request, "guest_abc123")
+
+    assert raised.value.status_code == 400
+
+
+def test_logged_in_user_can_open_explicitly_migrated_guest_thread(monkeypatch):
+    monkeypatch.setattr(app_module, "get_user_by_session_token", lambda token: {"id": 7})
+    monkeypatch.setattr(app_module, "is_thread_owned_by_user", lambda user_id, thread_id: True)
+    request = Request({"type": "http", "headers": []})
+
+    assert app_module._authorized_thread_user(request, "guest_migrated_old") == {"id": 7}
+
+
+def test_mixed_travel_and_regular_history_keeps_turn_order(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+
+    def fake_stream_chat(**kwargs):
+        yield AIMessageChunk(content=[{"type": "text", "text": "普通聊天回复"}]), {}
+
+    monkeypatch.setattr(app_module, "stream_chat", fake_stream_chat)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+    save_travel_turn(thread_id=thread_id, role="user", content="旅行 T1")
+    save_travel_turn(thread_id=thread_id, role="assistant", content="旅行回复 T1")
+    try:
+        response = client.post(
+            "/chat",
+            data={"message": "普通 G1", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert response.status_code == 200
+
+        save_travel_turn(thread_id=thread_id, role="user", content="旅行 T2")
+        save_travel_turn(thread_id=thread_id, role="assistant", content="旅行回复 T2")
+        history = client.get(f"/history/{thread_id}")
+        assert history.status_code == 200
+        assert [item["content"] for item in history.json()["messages"]] == [
+            "旅行 T1",
+            "旅行回复 T1",
+            "普通 G1",
+            "普通聊天回复",
+            "旅行 T2",
+            "旅行回复 T2",
+        ]
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_legacy_checkpoint_and_travel_turns_are_merged_by_timestamp(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    old_user = HumanMessage(content="普通 T0")
+    old_assistant = AIMessage(content="普通 A0")
+    new_user = HumanMessage(content="普通 T2")
+    new_assistant = AIMessage(content="普通 A2")
+    snapshots = [
+        SimpleNamespace(
+            checkpoint={
+                "ts": "2026-08-09T02:00:00+00:00",
+                "channel_values": {
+                    "messages": [old_user, old_assistant, new_user, new_assistant]
+                },
+            },
+            metadata={},
+        ),
+        SimpleNamespace(
+            checkpoint={
+                "ts": "2026-08-09T00:00:00+00:00",
+                "channel_values": {"messages": [old_user, old_assistant]},
+            },
+            metadata={},
+        ),
+    ]
+    travel_turns = [
+        {
+            "turn_type": "travel",
+            "role": "user",
+            "content": "旅行 T1",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": None,
+            "plan_version": None,
+            "created_at": "2026-08-09T01:00:00+00:00",
+        },
+        {
+            "turn_type": "travel",
+            "role": "assistant",
+            "content": "旅行 A1",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": "plan_1",
+            "plan_version": 1,
+            "created_at": "2026-08-09T01:01:00+00:00",
+        },
+        {
+            "turn_type": "chat",
+            "role": "user",
+            "content": "普通 T3",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": None,
+            "plan_version": None,
+            "created_at": "2026-08-09T03:00:00+00:00",
+        },
+        {
+            "turn_type": "chat",
+            "role": "assistant",
+            "content": "普通 A3",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": None,
+            "plan_version": None,
+            "created_at": "2026-08-09T03:01:00+00:00",
+        },
+    ]
+    monkeypatch.setattr(agent_module.checkpoint, "list", lambda config: snapshots)
+    monkeypatch.setattr(
+        agent_module.checkpoint,
+        "get",
+        lambda config: {"channel_values": {"messages": [old_user, old_assistant, new_user, new_assistant]}},
+    )
+    monkeypatch.setattr(agent_module, "list_conversation_turns", lambda *args, **kwargs: travel_turns)
+    monkeypatch.setattr(agent_module, "list_travel_turns", lambda *args, **kwargs: travel_turns)
+
+    messages = agent_module.get_messages(thread_id)
+
+    assert [item["content"] for item in messages] == [
+        "普通 T0",
+        "普通 A0",
+        "旅行 T1",
+        "旅行 A1",
+        "普通 T2",
+        "普通 A2",
+        "普通 T3",
+        "普通 A3",
+    ]
+
+
+def test_legacy_history_keeps_later_repeated_user_message(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    old_user = HumanMessage(content="同一句话")
+    old_assistant = AIMessage(content="旧回复")
+    snapshots = [
+        SimpleNamespace(
+            checkpoint={
+                "ts": "2026-08-09T00:00:00+00:00",
+                "channel_values": {"messages": [old_user, old_assistant]},
+            },
+            metadata={},
+        )
+    ]
+    turns = [
+        {
+            "turn_type": "chat",
+            "role": "user",
+            "content": "同一句话",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": None,
+            "plan_version": None,
+            "created_at": "2026-08-09T01:00:00+00:00",
+        },
+        {
+            "turn_type": "chat",
+            "role": "assistant",
+            "content": "新回复",
+            "attachments": [],
+            "search_enabled": False,
+            "plan_id": None,
+            "plan_version": None,
+            "created_at": "2026-08-09T01:01:00+00:00",
+        },
+    ]
+    monkeypatch.setattr(agent_module.checkpoint, "list", lambda config: snapshots)
+    monkeypatch.setattr(
+        agent_module.checkpoint,
+        "get",
+        lambda config: {"channel_values": {"messages": [old_user, old_assistant]}},
+    )
+    monkeypatch.setattr(agent_module, "list_conversation_turns", lambda *args, **kwargs: turns)
+
+    messages = agent_module.get_messages(thread_id)
+
+    assert [item["content"] for item in messages] == ["同一句话", "旧回复", "同一句话", "新回复"]

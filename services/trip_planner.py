@@ -28,11 +28,15 @@ def build_timeline(
 
     if transport_options:
         best = transport_options[0]
+        depart_date = best.depart_date or query.start_date
+        arrive_date = best.arrive_date or depart_date
         items.append(
             TimelineItem(
                 time_label=best.depart_time or "待定",
                 title=f"从 {query.origin or '出发地'} 前往 {query.destination or '目的地'}",
                 detail=f"建议优先关注 {best.mode} 方案 {best.title}，预计历时 {best.duration or '待补充'}。",
+                date=depart_date,
+                end_date=arrive_date if arrive_date != depart_date else "",
             )
         )
 

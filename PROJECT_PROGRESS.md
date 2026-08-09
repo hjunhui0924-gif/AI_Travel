@@ -58,6 +58,11 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - services/poi_recommender.py 已按评分、距离和偏好做基础排序；营业状态仍保留为 unknown，不能当作营业事实。
 - 旅行分支仍绕过通用 LangGraph 执行图，但现在通过 `travel_plans.db` 持久化 TravelPlan 版本和旅行回合，历史恢复不再依赖 Markdown。
 - `trip_replan` 已读取当前 TravelPlan，并在生成新版本时保留 `locked/confirmed/booked` 项目，日期范围冲突会进入 `conflicts`。
+- 重规划时日期范围外的已确认/锁定项目会进入结构化 `TravelPlan.out_of_range_items`，不会静默消失；该列表也支持计划项 PATCH。
+- 首次旅行计划写入使用 `expected_version=0`，与 SQLite `BEGIN IMMEDIATE` CAS 配合，避免并发首次请求互相覆盖。
+- 航班/铁路候选逐条隔离异常，路线 transit/driving/walking 按模式隔离异常；一个 provider 行或模式失败不会丢弃同批有效结果，并通过 `partial/failed` 状态和 diagnostics 暴露。
+- guest capability 服务端校验创建时间和最近使用时间的 30 天 TTL；旧 checkpoint 只能通过登录用户主动提交已知 ID 的迁移接口归属，禁止自动迁移。
+- 计划项生成后做同日 ID 去重，避免相同标题导致 PATCH 更新到错误项目。
 - 航班 bridge 的 auto 路径已移除默认 dummy fallback；Flight MCP 现在必须显式启用。
 - 已新增旅行搜索发现层和证据对象；搜索关闭时不会创建 Tavily searcher 或调用网页搜索。
 - 自动化测试目录已建立，覆盖存储、日期、搜索开关、POI 无结果、重规划、锁定项、航班 demo 隔离、API 和 SSE。
@@ -105,28 +110,28 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ### Phase 1：旅行计划状态与结构化契约
 
-- 状态：已完成，待对抗式审查
+- 状态：已完成，第一轮审查已完成，第二轮复查中
 - 目标：持久化 TravelPlan、版本、日历数据和 SSE 输出。
 - 已完成：领域 dataclass、SQLite 版本库、旅行回合存储、thread_id 绑定、`/chat done.trip_plan`。
 - 验证：`python -m pytest -q` 14 passed；`python -m compileall` 通过；SSE 烟测确认 `done.trip_plan` 和版本递增。
 
 ### Phase 2：搜索开关、附近探索和证据
 
-- 状态：进行中
+- 状态：已完成，已通过两轮审查修复来源泄漏、受限域名和证据 ID 问题
 - 目标：接入搜索开关、POI 验证、热度信号、来源和新鲜度。
 - 已完成：`services/travel_search.py` opt-in 发现层；网页候选必须经过地图解析才进入 POI 卡；评分、热度、距离和来源字段分离。
 - 验证：搜索层 fixture 已覆盖关闭、开启、来源保留和失败；地图无结果不生成虚构 POI。
 
 ### Phase 3：重规划、冲突和测试
 
-- 状态：进行中
+- 状态：已完成，已通过两轮审查修复锁定项、CAS、历史合并、结构化失败状态和日期外项目保留问题
 - 目标：用户修改偏好或天气后生成新版本，保留锁定项并标出冲突。
 - 已完成：当前计划继承、锁定项保留、日期越界冲突、独立重规划 HTTP 接口。
 - 验证：pytest 覆盖锁定项、日期边界、adapter 空结果、版本 API、SSE 和删除恢复。
 
 ### Phase 4：对抗式审查与前端交接
 
-- 状态：待开始
+- 状态：已完成，交接文档已更新，Critical/Important 问题已修复并完成最终验证
 - 目标：独立代码审查、修复 Critical/Important 问题，生成包含接口和 JSON 示例的前端交接文档。
 
 ## 9. 每阶段必须检查的坑
@@ -140,6 +145,9 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 是否把 provider 字段泄漏给领域模型或前端。
 - 是否破坏访客会话、用户会话隔离和旧聊天历史。
 - 是否把时区、跨天到达和日期边界处理错误。
+- 是否在日期范围缩小时把已确认/锁定项目移出响应；应检查 `out_of_range_items`。
+- 是否允许旧 checkpoint 通过任意 guest cookie 首次绑定，或让过期 capability 继续访问。
+- 是否把同日同名项目生成相同 `item_id`，导致 PATCH 地址不唯一。
 - 是否在后端契约未稳定前修改前端文件。
 
 ## 10. 变更日志
@@ -159,3 +167,35 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 修正航班 adapter：未显式启用时关闭，auto 查询失败返回空结果，不再返回伪装成真实航班的 dummy。
 - 增加计划项 `PATCH` 确认/锁定接口；锁定项会在后续重规划中保留。
 - 修复日期日字段被误识别为行程天数、SSE 线程池 ContextVar 丢失结构化计划、旅行重规划路由和来源卡重复等问题。
+- 增加 turn-only 线程的存储层用户归属校验、guest capability cookie 端到端测试、旧 checkpoint 与 chat/travel turn 交错历史测试。
+- 增加通用联网搜索的 Dianping 过滤、无效响应状态测试和网页搜索状态机测试。
+- 增加 `FRONTEND_HANDOFF.md`，记录 SSE、TravelPlan、日历、计划项 CAS、guest cookie、来源和错误契约。
+- 修复旧 checkpoint 的任意 guest cookie 劫持：旧 checkpoint 不能首次 mint capability；已有合法绑定仍可验证。
+- 增加 guest capability 服务端 TTL（创建时间/最近使用时间均超过 30 天则失效）；空线程可重新生成新 token，有持久化数据的线程不会静默重绑。
+- 增加登录用户主动迁移旧 checkpoint 的 `POST /threads/migrate-legacy`，仅接受用户显式提交且仍存在的 `guest_...` 随机线程 ID，不自动认领 `default` 等歧义历史。
+- 增加 `TravelPlan.out_of_range_items` 和日历 `out_of_range_item_count`，保留日期范围外的 confirmed/locked/booked 项并支持 PATCH。
+- 首次旅行计划保存显式传 `expected_version=0`；航班单条结果、路线各模式失败互不阻断；同日重复项目自动生成唯一 `item_id`。
+
+## 11. 对抗式审查修复记录（2026-08-09）
+
+第一轮独立审查曾发现以下合并前问题，当前工作树已加入修复和回归测试：
+
+- guest 会话只允许匿名使用；登录用户必须使用账户线程 ID，匿名请求不能访问已归属用户的线程或旅行计划。
+- 计划项 PATCH 与重规划使用 `expected_version` 做 SQLite 事务内 CAS；省略时后端以本次读取到的版本作为期望版本，过期写入返回 HTTP 409。
+- 重规划遇到同 `item_id` 的建议项时，以用户已确认/锁定快照覆盖建议项，不能降级为 suggested/unlocked。
+- 网页地点发现只保存来源元数据，不保存网页正文/评价摘要；Dianping 域名结果直接丢弃。网页 Evidence ID 按规范化 URL 稳定生成。
+- `TravelPlan` 现在持久化 `alerts`、`diagnostics`、`adapter_status`；PlanItem 和 Evidence 保留 `is_demo`，前端不能把演示数据当作真实交通。
+- 交通 adapter、路线、POI、天气和网页搜索失败会进入结构化状态；`success`、`empty`、`failed`、`not_configured`、`not_requested`、`disabled`、`partial` 等状态必须与自然语言风险同时展示。
+- 交通方案增加 `depart_date/arrive_date`；PlanItem/TimelineItem 增加跨日结束日期。31 天以上计划保留真实 `TravelPlan.end_date`，日历只投影前 31 天并记录风险。
+- 旅行回合和普通聊天回合进入统一有序 turn log；旧 checkpoint 与新 turn log 会按时间合并并按内容去重，避免迁移后丢失旧聊天。
+- 计划增加 `requested_days`、`projected_days`、`calendar_truncated`、`projection_end_date`，前端不再从风险文本推断日历是否截断；跨午夜交通在抵达日期生成结构化 arrival 清单项。
+- 通用网页搜索使用惰性初始化和受限来源过滤；高德 POI adapter 的网络失败不再静默伪装成空结果。
+
+第二轮本地对抗审查补充检查了以下攻击面并加入回归测试：
+
+- 旧 checkpoint 带任意 guest cookie 不能首次 mint capability；只有已有合法绑定可以验证。
+- 旧历史迁移只接受登录用户显式提交的、仍存在且长度足够的 `guest_...` ID；`default` 等共享/歧义 ID 不允许自助认领。迁移后已归属当前用户的旧 guest ID 可以正常访问。
+- guest capability 服务端校验 30 天创建/最近使用 TTL；空线程过期后生成新 token，带持久化数据的过期线程不重绑。
+- 首次旅行计划路径明确传 `expected_version=0`；日期外锁定项保存在 `out_of_range_items`，同日重复项目经过全局 ID 去重；航班、铁路和路线 partial/failed 状态会保留可用结果并进入 diagnostics。
+
+最终验证证据：`python -m pytest -q` 为 **52 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services app.py tests` 通过；`git diff --check` 通过，仅报告 Windows 换行转换提示。`FRONTEND_HANDOFF.md` 已按最终接口契约更新。

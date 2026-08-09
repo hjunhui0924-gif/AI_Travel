@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from copy import deepcopy
 from dataclasses import asdict
@@ -19,11 +20,13 @@ from agents.agent import (
     delete_thread,
     encode_assistant_metadata,
     get_messages,
+    has_checkpoint_data,
     stream_chat,
 )
 from services.auth_service import (
     DEFAULT_THREAD_TITLE,
     authenticate_user,
+    assign_threads_to_user,
     create_session,
     create_thread,
     create_user,
@@ -31,15 +34,21 @@ from services.auth_service import (
     delete_thread_record,
     ensure_thread_for_user,
     get_user_by_session_token,
+    get_thread,
     is_thread_owned_by_user,
     list_threads_for_user,
+    list_legacy_thread_ids,
     update_thread_activity,
 )
 from agents.travel_agent import plan_travel, render_travel_response
 from services.travel_store import (
+    PlanVersionConflict,
     get_current_plan,
     get_plan_version,
+    get_plan_owner_id,
+    ensure_guest_access,
     list_plan_versions,
+    save_conversation_turn,
     save_plan_version,
     save_travel_turn,
 )
@@ -50,9 +59,32 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SESSION_COOKIE_NAME = "ai_agent_session"
+GUEST_COOKIE_NAME = "ai_agent_guest"
+COOKIE_SECURE = (
+    os.getenv("AI_AGENT_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes", "on"}
+    or os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}
+    or os.getenv("ENVIRONMENT", "").strip().lower() in {"prod", "production"}
+)
 
 app = FastAPI(title="AI Agent")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.middleware("http")
+async def attach_guest_access_cookie(request: Request, call_next):
+    response = await call_next(request)
+    guest_token = getattr(request.state, "guest_access_token", "")
+    if guest_token:
+        response.set_cookie(
+            key=GUEST_COOKIE_NAME,
+            value=guest_token,
+            httponly=True,
+            samesite="lax",
+            secure=COOKIE_SECURE,
+            max_age=60 * 60 * 24 * 30,
+            path="/",
+        )
+    return response
 
 
 def extract_renderable_content(content) -> str:
@@ -91,7 +123,7 @@ def _auth_json_response(user: dict, session_token: str) -> JSONResponse:
         value=session_token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=COOKIE_SECURE,
         max_age=60 * 60 * 24 * 30,
         path="/",
     )
@@ -100,7 +132,15 @@ def _auth_json_response(user: dict, session_token: str) -> JSONResponse:
 
 def _is_guest_thread_id(thread_id: str) -> bool:
     cleaned = (thread_id or "").strip().lower()
-    return cleaned.startswith("guest_") and bool(re.fullmatch(r"guest_[0-9a-f]+", cleaned))
+    # Guest IDs are client-generated and older checkpoints used UUIDs with
+    # hyphens (and occasionally a readable suffix).  Keep the namespace
+    # deliberately narrow without requiring one exact generation format.
+    return bool(re.fullmatch(r"guest_[a-z0-9_-]{1,128}", cleaned))
+
+
+def _is_migratable_guest_thread_id(thread_id: str) -> bool:
+    cleaned = (thread_id or "").strip().lower()
+    return _is_guest_thread_id(cleaned) and len(cleaned.removeprefix("guest_")) >= 16
 
 
 def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
@@ -109,8 +149,33 @@ def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
     if user is None:
         if not _is_guest_thread_id(thread_id):
             raise HTTPException(status_code=401, detail="请先登录。")
+        # A guest-shaped id is an anonymous capability only.  It must never
+        # become an alternate path to a logged-in user's thread or plan.
+        if get_thread(thread_id) is not None or get_plan_owner_id(thread_id) is not None:
+            raise HTTPException(status_code=404, detail="无权访问该会话。")
+        presented_guest_token = request.cookies.get(GUEST_COOKIE_NAME, "")
+        # Legacy checkpoints predate capability binding.  A caller must not
+        # be able to mint the first capability merely by supplying an
+        # arbitrary cookie; an existing, previously bound capability may
+        # still be verified below.
+        has_legacy_checkpoint = has_checkpoint_data(thread_id)
+        guest_token = ensure_guest_access(
+            thread_id,
+            presented_guest_token,
+            allow_new_binding=not has_legacy_checkpoint,
+        )
+        if not guest_token:
+            raise HTTPException(status_code=404, detail="无权访问该会话。")
+        if guest_token != request.cookies.get(GUEST_COOKIE_NAME, ""):
+            request.state.guest_access_token = guest_token
         return None
-    if not is_thread_owned_by_user(int(user["id"]), thread_id):
+    # A deliberately migrated legacy checkpoint may retain its old guest_ ID
+    # while now being owned by this account.  The ownership check remains the
+    # authority; only an unowned guest-shaped ID is rejected here.
+    thread_owned = is_thread_owned_by_user(int(user["id"]), thread_id)
+    if _is_guest_thread_id(thread_id) and not thread_owned:
+        raise HTTPException(status_code=400, detail="登录后请使用账户会话 ID，不能使用 guest 会话 ID。")
+    if not thread_owned:
         raise HTTPException(status_code=404, detail="无权访问该会话。")
     return user
 
@@ -118,11 +183,20 @@ def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
 class TravelReplanRequest(BaseModel):
     message: str
     search_enabled: bool = False
+    expected_version: int | None = None
 
 
 class TravelItemUpdateRequest(BaseModel):
     locked: bool | None = None
     status: str | None = None
+    expected_version: int | None = None
+
+
+class LegacyThreadMigrationRequest(BaseModel):
+    # Migration is deliberately opt-in and requires IDs already known by the
+    # user (for example, from their old browser state).  The server never
+    # auto-assigns every orphaned checkpoint to the current account.
+    thread_ids: list[str]
 
 
 @app.get("/")
@@ -193,6 +267,49 @@ def create_chat_thread(request: Request):
     return {"status": "success", "thread": thread}
 
 
+@app.post("/threads/migrate-legacy")
+def migrate_legacy_threads(payload: LegacyThreadMigrationRequest, request: Request):
+    try:
+        user = _current_user_from_request(request)
+        requested: list[str] = []
+        for raw_thread_id in payload.thread_ids[:100]:
+            thread_id = str(raw_thread_id or "").strip()
+            if not thread_id or len(thread_id) > 256 or thread_id in requested:
+                continue
+            requested.append(thread_id)
+        if not requested:
+            return JSONResponse(
+                {"status": "error", "message": "请提供要迁移的旧会话 ID。"},
+                status_code=400,
+            )
+
+        legacy_ids = set(list_legacy_thread_ids())
+        # Checkpoint storage has no owner metadata.  Only the random guest
+        # namespace is safe to self-claim; ambiguous legacy IDs such as
+        # "default" require an out-of-band recovery process.
+        eligible = [
+            thread_id
+            for thread_id in requested
+            if thread_id in legacy_ids and _is_migratable_guest_thread_id(thread_id)
+        ]
+        skipped = [thread_id for thread_id in requested if thread_id not in eligible]
+        assign_threads_to_user(int(user["id"]), eligible, DEFAULT_THREAD_TITLE)
+        migrated = [
+            thread_id
+            for thread_id in eligible
+            if is_thread_owned_by_user(int(user["id"]), thread_id)
+        ]
+        return {
+            "status": "success",
+            "migrated_thread_ids": migrated,
+            "skipped_thread_ids": [thread_id for thread_id in requested if thread_id not in migrated],
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
 @app.get("/sessions")
 def get_sessions(request: Request):
     try:
@@ -207,16 +324,15 @@ def get_sessions(request: Request):
 @app.get("/history/{thread_id}")
 def get_history(thread_id: str, request: Request):
     try:
-        try:
-            user = _current_user_from_request(request)
-        except HTTPException:
-            user = None
-        if user is None:
-            if not _is_guest_thread_id(thread_id):
-                return JSONResponse({"status": "error", "message": "请先登录。"}, status_code=401)
-        elif not is_thread_owned_by_user(int(user["id"]), thread_id):
-            return JSONResponse({"status": "error", "message": "无权访问该会话。"}, status_code=404)
-        return {"status": "success", "messages": get_messages(thread_id)}
+        user = _authorized_thread_user(request, thread_id)
+        return {
+            "status": "success",
+            "messages": get_messages(thread_id, user_id=int(user["id"]) if user else None),
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except PermissionError:
+        return JSONResponse({"status": "error", "message": "无权访问该会话。"}, status_code=404)
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -224,17 +340,15 @@ def get_history(thread_id: str, request: Request):
 @app.delete("/history/{thread_id}")
 def clear_history(thread_id: str, request: Request):
     try:
-        try:
-            user = _current_user_from_request(request)
-        except HTTPException:
-            user = None
-        if user is None:
-            if not _is_guest_thread_id(thread_id):
-                return JSONResponse({"status": "error", "message": "请先登录。"}, status_code=401)
-        elif not delete_thread_record(int(user["id"]), thread_id):
+        user = _authorized_thread_user(request, thread_id)
+        if user is not None and not delete_thread_record(int(user["id"]), thread_id):
             return JSONResponse({"status": "error", "message": "无权删除该会话。"}, status_code=404)
-        delete_thread(thread_id)
+        delete_thread(thread_id, user_id=int(user["id"]) if user else None)
         return {"status": "success"}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except PermissionError:
+        return JSONResponse({"status": "error", "message": "无权访问该会话。"}, status_code=404)
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
@@ -267,6 +381,11 @@ def get_travel_calendar(thread_id: str, request: Request):
             "plan_id": plan.plan_id,
             "version": plan.version,
             "timezone": plan.timezone,
+            "requested_days": plan.requested_days,
+            "projected_days": plan.projected_days,
+            "calendar_truncated": plan.calendar_truncated,
+            "projection_end_date": plan.projection_end_date,
+            "out_of_range_item_count": len(plan.out_of_range_items),
             "days": [
                 {
                     "date": day.date,
@@ -334,6 +453,16 @@ def update_travel_item(
             return JSONResponse({"status": "error", "message": "请提供 locked 或 status。"}, status_code=400)
         if payload.status is not None and payload.status not in allowed_statuses:
             return JSONResponse({"status": "error", "message": "不支持的计划项状态。"}, status_code=400)
+        if payload.status in {"confirmed", "booked"} and payload.locked is False:
+            return JSONResponse(
+                {"status": "error", "message": "confirmed/booked 计划项必须保持 locked=true。"},
+                status_code=400,
+            )
+        if payload.locked is True and payload.status not in {None, "confirmed", "booked"}:
+            return JSONResponse(
+                {"status": "error", "message": "只有 confirmed/booked 计划项可以被锁定。"},
+                status_code=400,
+            )
 
         updated_plan = deepcopy(current_plan)
         target = None
@@ -344,6 +473,11 @@ def update_travel_item(
                     break
             if target is not None:
                 break
+        if target is None:
+            target = next(
+                (item for item in updated_plan.out_of_range_items if item.item_id == item_id),
+                None,
+            )
         if target is None:
             return JSONResponse({"status": "error", "message": "计划项不存在。"}, status_code=404)
 
@@ -362,16 +496,35 @@ def update_travel_item(
             updated_plan,
             user_id=user_id,
             change_summary=f"更新计划项：{target.title}",
+            expected_version=payload.expected_version if payload.expected_version is not None else current_plan.version,
         )
         return {
             "status": "success",
             "plan": asdict(saved_plan),
-            "item": asdict(next(item for day in saved_plan.days for item in day.items if item.item_id == item_id)),
+            "item": asdict(
+                next(
+                    item
+                    for day in saved_plan.days
+                    for item in day.items
+                    if item.item_id == item_id
+                )
+                if any(item.item_id == item_id for day in saved_plan.days for item in day.items)
+                else next(item for item in saved_plan.out_of_range_items if item.item_id == item_id)
+            ),
         }
     except HTTPException as exc:
         return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
     except PermissionError as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=403)
+    except PlanVersionConflict as exc:
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+                "current_version": exc.current_version,
+            },
+            status_code=409,
+        )
     except Exception as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
@@ -400,6 +553,7 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
             response.trip_plan,
             user_id=user_id,
             change_summary=payload.message.strip()[:120],
+            expected_version=payload.expected_version if payload.expected_version is not None else current_plan.version,
         )
         response.trip_plan = saved_plan
         response.sources = saved_plan.sources
@@ -430,6 +584,15 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
         return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
     except PermissionError as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=403)
+    except PlanVersionConflict as exc:
+        return JSONResponse(
+            {
+                "status": "error",
+                "message": str(exc),
+                "current_version": exc.current_version,
+            },
+            status_code=409,
+        )
     except Exception as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
@@ -451,6 +614,21 @@ async def chat(
 
             return StreamingResponse(unauthorized_response(), media_type="text/event-stream; charset=utf-8")
         user = None
+
+    if user is not None and _is_guest_thread_id(thread_id):
+        async def invalid_guest_thread_response():
+            yield _sse_event("error", {"message": "登录后请使用账户会话 ID，不能使用 guest 会话 ID。"})
+
+        return StreamingResponse(invalid_guest_thread_response(), media_type="text/event-stream; charset=utf-8")
+
+    if user is None:
+        try:
+            _authorized_thread_user(request, thread_id)
+        except HTTPException as exc:
+            async def unauthorized_guest_response():
+                yield _sse_event("error", {"message": exc.detail})
+
+            return StreamingResponse(unauthorized_guest_response(), media_type="text/event-stream; charset=utf-8")
 
     try:
         attachments = parse_uploads(files or [])
@@ -484,6 +662,7 @@ async def chat(
             assistant_activities = []
             assistant_sources = []
             travel_plan = None
+            is_travel_response = False
 
             for chunk, metadata in stream_chat(
                 message=message,
@@ -494,6 +673,8 @@ async def chat(
             ):
                 if isinstance(metadata, dict) and metadata.get("trip_plan"):
                     travel_plan = metadata["trip_plan"]
+                if isinstance(metadata, dict) and metadata.get("travel"):
+                    is_travel_response = True
                 for activity in consume_activity_log():
                     assistant_activities.append(activity)
                     yield _sse_event("activity", activity)
@@ -550,6 +731,45 @@ async def chat(
                     yield _sse_event("source", source)
 
             seen_text_with_metadata = seen_text + encode_assistant_metadata(assistant_activities, assistant_sources)
+            final_text = seen_text or "暂时没有生成结果，请再试一次。"
+
+            if not is_travel_response:
+                try:
+                    user_content = message.strip() or "请结合我上传的文件或图片回答。"
+                    stored_attachments = [
+                        {
+                            "name": attachment.get("name", ""),
+                            "extension": attachment.get("extension", ""),
+                            "modality": attachment.get("modality", "text"),
+                            "image_url": attachment.get("image_url"),
+                            "storage": attachment.get("storage", ""),
+                            "object_key": attachment.get("object_key", ""),
+                        }
+                        for attachment in attachments
+                    ]
+                    save_conversation_turn(
+                        thread_id=thread_id,
+                        user_id=int(user["id"]) if user is not None else None,
+                        role="user",
+                        content=user_content,
+                        attachments=stored_attachments,
+                        search_enabled=search_enabled,
+                    )
+                    assistant_content = seen_text_with_metadata or (
+                        "暂时没有生成结果，请再试一次。"
+                        + encode_assistant_metadata(assistant_activities, assistant_sources)
+                    )
+                    save_conversation_turn(
+                        thread_id=thread_id,
+                        user_id=int(user["id"]) if user is not None else None,
+                        role="assistant",
+                        content=assistant_content,
+                        search_enabled=search_enabled,
+                    )
+                except Exception:
+                    # The LangGraph checkpoint is still available as a
+                    # fallback if the ordered history log cannot be written.
+                    pass
             try:
                 attach_assistant_metadata(thread_id, seen_text, assistant_activities, assistant_sources)
             except Exception:
@@ -570,7 +790,9 @@ async def chat(
                     "ok": True,
                     "activities": assistant_activities,
                     "sources": assistant_sources,
-                    "final_text": seen_text_with_metadata,
+                    # Internal history metadata is persisted separately and
+                    # must never leak into the frontend's rendered text.
+                    "final_text": final_text,
                     "trip_plan": travel_plan,
                     "attachments": [
                         {

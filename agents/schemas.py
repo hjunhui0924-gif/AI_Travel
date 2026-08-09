@@ -33,6 +33,7 @@ class TravelQuery:
     locked_item_ids: list[str] = field(default_factory=list)
     date_is_assumed: bool = True
     duration_is_assumed: bool = True
+    duration_was_capped: bool = False
     attachment_notes: list[str] = field(default_factory=list)
     named_places: list[str] = field(default_factory=list)
 
@@ -49,6 +50,10 @@ class TransportOption:
     provider: str = ""
     seats: list[str] = field(default_factory=list)
     is_demo: bool = False
+    # Dates are separate from clock times so an overnight train/flight is
+    # unambiguous to the calendar and to the itinerary renderer.
+    depart_date: str = ""
+    arrive_date: str = ""
 
 
 @dataclass(slots=True)
@@ -59,6 +64,7 @@ class TimelineItem:
     date: str = ""
     item_id: str = ""
     item_type: str = "activity"
+    end_date: str = ""
 
 
 @dataclass(slots=True)
@@ -156,6 +162,10 @@ class PlanItem:
     estimated_cost: str = ""
     travel_minutes: int | None = None
     confidence: str = "unknown"
+    # ``date`` is the start date.  Keep an explicit end date for
+    # cross-midnight transport or other multi-day arrangements.
+    end_date: str = ""
+    is_demo: bool = False
 
 
 @dataclass(slots=True)
@@ -176,6 +186,10 @@ class TravelPlan:
     timezone: str
     start_date: str
     end_date: str
+    requested_days: int = 1
+    projected_days: int = 0
+    calendar_truncated: bool = False
+    projection_end_date: str = ""
     origin: str = ""
     destination: str = ""
     travelers: int = 1
@@ -186,12 +200,20 @@ class TravelPlan:
     constraints: list[TravelConstraint] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
+    alerts: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    adapter_status: dict[str, str] = field(default_factory=dict)
     sources: list[Evidence] = field(default_factory=list)
     search_enabled: bool = False
     status: str = "draft"
     created_at: str = ""
     updated_at: str = ""
     previous_version: int | None = None
+    # Locked/confirmed items whose original date is outside the newly
+    # projected calendar must remain addressable instead of disappearing
+    # during a replan.  Keep this field at the end for positional backwards
+    # compatibility with older TravelPlan constructors.
+    out_of_range_items: list[PlanItem] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -207,6 +229,7 @@ class TravelPlanResponse:
     alerts: list[str] = field(default_factory=list)
     extracted_context: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+    adapter_status: dict[str, str] = field(default_factory=dict)
     trip_plan: TravelPlan | None = None
     sources: list[Evidence] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
