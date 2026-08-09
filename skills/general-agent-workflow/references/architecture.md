@@ -20,12 +20,7 @@
 
 - Parses uploaded files into bounded text
 - Centralizes supported extensions and extraction limits
-- Provides the same parsing primitive for the MCP server
-
-`mcp_server/server.py`
-
-- Exposes backend-aligned tools over MCP
-- Should stay thin and reuse app logic instead of re-implementing it
+- Provides the parsing primitive used by the chat endpoint
 
 `static/*`
 

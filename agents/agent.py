@@ -3,8 +3,6 @@ import hashlib
 import os
 import re
 import sqlite3
-import urllib.parse
-import urllib.request
 from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import date, datetime
@@ -32,7 +30,6 @@ except Exception:
     OpenAIEmbeddingFunction = None
 
 from utils.oss_utils import delete_oss_object
-from utils.stock_utils import format_hs_stock_item, get_hs_index_item, get_hs_stock_item, has_juhe_stock_key
 from utils.weather_utils import current_cn_datetime, format_weather_text, has_amap_key
 from agents.schemas import TravelPlan
 from agents.travel_agent import plan_travel, render_travel_response
@@ -290,28 +287,6 @@ def _is_time_sensitive_query(query: str) -> bool:
     return any(keyword in lowered for keyword in keywords) or any(keyword in query for keyword in keywords)
 
 
-def _is_market_data_query(query: str) -> bool:
-    keywords = [
-        "上证",
-        "深证",
-        "a股",
-        "沪深",
-        "恒生",
-        "纳指",
-        "道指",
-        "指数",
-        "股价",
-        "行情",
-        "成交额",
-        "stock",
-        "index",
-        "market",
-        "price",
-    ]
-    lowered = query.lower()
-    return any(keyword in lowered for keyword in keywords) or any(keyword in query for keyword in keywords)
-
-
 def _extract_dates(text: str) -> list[date]:
     candidates = []
     patterns = [
@@ -529,230 +504,7 @@ def _select_relevant_chunks(query: str, chunks: list[dict], attachment: dict | N
     return _lexical_select_relevant_chunks(query, chunks)
 
 
-def _parse_tencent_quote(content: str) -> dict | None:
-    match = re.search(r'="([^"]+)"', content)
-    if not match:
-        return None
-    parts = match.group(1).split("~")
-    if len(parts) < 33:
-        return None
-
-    code = parts[2]
-    name = parts[1]
-    current = parts[3]
-    prev_close = parts[4]
-    open_price = parts[5]
-    volume = parts[6]
-    amount = parts[37] if len(parts) > 37 else parts[36] if len(parts) > 36 else ""
-    timestamp = parts[30] if len(parts) > 30 else ""
-    change = parts[31] if len(parts) > 31 else ""
-    change_pct = parts[32] if len(parts) > 32 else ""
-    high = parts[33] if len(parts) > 33 else ""
-    low = parts[34] if len(parts) > 34 else ""
-
-    return {
-        "name": name,
-        "code": code,
-        "current": current,
-        "prev_close": prev_close,
-        "open": open_price,
-        "volume": volume,
-        "amount": amount,
-        "timestamp": timestamp,
-        "change": change,
-        "change_pct": change_pct,
-        "high": high,
-        "low": low,
-    }
-
-
-def _fetch_tencent_quote(symbol: str) -> dict | None:
-    url = f"https://qt.gtimg.cn/q={urllib.parse.quote(symbol)}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://gu.qq.com/",
-        },
-    )
-    try:
-        content = urllib.request.urlopen(request, timeout=20).read().decode("gbk", errors="replace")
-    except Exception as exc:
-        _log_activity("tool", "行情接口请求失败", str(exc))
-        return None
-    return _parse_tencent_quote(content)
-
-
-def _market_symbol_from_query(query: str) -> str | None:
-    mapping = {
-        "上证指数": "sh000001",
-        "上证": "sh000001",
-        "上证综指": "sh000001",
-        "深证成指": "sz399001",
-        "深证": "sz399001",
-        "创业板指": "sz399006",
-        "恒生指数": "hkHSI",
-    }
-    for keyword, symbol in mapping.items():
-        if keyword in query:
-            return symbol
-    return None
-
-
-def _extract_stock_keyword(query: str) -> str:
-    cleaned = query
-    for token in ["今日", "今天", "最新", "实时", "行情", "股价", "股票", "A股", "a股"]:
-        cleaned = cleaned.replace(token, " ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned or query
-
-
-def _stock_gid_from_query(query: str) -> str | None:
-    direct_map = {
-        "南京银行": "sh601009",
-        "招商银行": "sh600036",
-        "工商银行": "sh601398",
-        "中国平安": "sh601318",
-        "贵州茅台": "sh600519",
-    }
-    for keyword, gid in direct_map.items():
-        if keyword in query:
-            return gid
-    match = re.search(r"\b([sS][hzHZ]\d{6})\b", query)
-    if match:
-        return match.group(1).lower()
-    match = re.search(r"\b(6\d{5}|0\d{5}|3\d{5})\b", query)
-    if match:
-        code = match.group(1)
-        if code.startswith("6"):
-            return f"sh{code}"
-        return f"sz{code}"
-    return None
-
-
-def _hs_index_type_from_query(query: str) -> str | None:
-    if "上证" in query or "上证指数" in query or "上证综指" in query:
-        return "0"
-    if "深证" in query or "深证成指" in query:
-        return "1"
-    return None
-
-
-def fetch_hs_stock_snapshot(query: str) -> str | None:
-    if not has_juhe_stock_key():
-        return None
-
-    index_type = _hs_index_type_from_query(query)
-    if index_type is not None:
-        _log_activity("tool", "调用聚合数据指数接口", f"type={index_type}", state="running")
-        try:
-            item = get_hs_index_item(index_type=index_type)
-        except Exception as exc:
-            _log_activity("tool", "聚合数据指数接口失败", str(exc))
-            return None
-        if not item:
-            _log_activity("tool", "聚合数据指数接口无匹配", f"type={index_type}")
-            return None
-        _log_activity(
-            "tool",
-            "聚合数据指数接口返回",
-            f"{item.get('name', '')} {item.get('nowPri', '')}（{item.get('date', '')} {item.get('time', '')}）".strip(),
-        )
-        _log_source_card(
-            title=f"{item.get('name', '')} 沪深指数快照",
-            url=f"https://web.juhe.cn/finance/stock/hs?type={index_type}",
-            summary=f"最新价 {item.get('nowPri', '')}，涨跌幅 {item.get('increase', '')}%",
-            source_date=item.get("date", ""),
-        )
-        return format_hs_stock_item(item)
-
-    gid = _stock_gid_from_query(query)
-    if not gid:
-        return None
-
-    _log_activity("tool", "调用聚合数据沪深接口", gid, state="running")
-    try:
-        item = get_hs_stock_item(gid=gid, stock_type="a", page=1)
-    except Exception as exc:
-        _log_activity("tool", "聚合数据沪深接口失败", str(exc))
-        return None
-
-    if not item:
-        _log_activity("tool", "聚合数据沪深接口无匹配", gid)
-        return None
-
-    _log_activity(
-        "tool",
-        "聚合数据沪深接口返回",
-        f"{item.get('name', '')} {item.get('nowPri', '')}（{item.get('date', '')} {item.get('time', '')}）".strip(),
-    )
-    _log_source_card(
-        title=f"{item.get('name', '')} 沪深股市快照",
-        url=f"https://web.juhe.cn/finance/stock/hs?gid={item.get('gid', '')}",
-        summary=f"最新价 {item.get('nowPri', '')}，涨跌幅 {item.get('increase', '')}%",
-        source_date=item.get("date", ""),
-    )
-    return format_hs_stock_item(item)
-
-
-def fetch_market_snapshot(query: str) -> str | None:
-    symbol = _market_symbol_from_query(query)
-    if not symbol:
-        return None
-
-    _log_activity("tool", "调用行情快照接口", symbol, state="running")
-    quote = _fetch_tencent_quote(symbol)
-    if not quote:
-        return None
-
-    source_date = quote["timestamp"][:8] if quote.get("timestamp") else ""
-    source_date_label = f"{source_date[:4]}-{source_date[4:6]}-{source_date[6:8]}" if len(source_date) == 8 else ""
-    source_time_label = ""
-    if quote.get("timestamp") and len(quote["timestamp"]) >= 14:
-        ts = quote["timestamp"]
-        source_time_label = f"{ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
-
-    _log_activity(
-        "tool",
-        "行情快照返回",
-        f"{quote['name']} {quote['current']}（{source_date_label} {source_time_label}）".strip(),
-    )
-    _log_source_card(
-        title=f"{quote['name']} 实时行情",
-        url=f"https://gu.qq.com/{symbol}",
-        summary=f"最新价 {quote['current']}，涨跌 {quote['change']}，涨跌幅 {quote['change_pct']}%",
-        source_date=source_date_label,
-    )
-
-    return "\n".join(
-        [
-            "行情快照结果:",
-            f"名称: {quote['name']}",
-            f"代码: {quote['code']}",
-            f"最新价: {quote['current']}",
-            f"昨收: {quote['prev_close']}",
-            f"今开: {quote['open']}",
-            f"涨跌: {quote['change']}",
-            f"涨跌幅: {quote['change_pct']}%",
-            f"最高: {quote['high']}",
-            f"最低: {quote['low']}",
-            f"成交量: {quote['volume']}",
-            f"成交额: {quote['amount']}",
-            f"数据时间: {source_date_label} {source_time_label}".strip(),
-            f"来源: https://gu.qq.com/{symbol}",
-        ]
-    )
-
-
 def perform_web_search(query: str) -> str:
-    hs_snapshot = None
-    if _is_market_data_query(query):
-        hs_snapshot = fetch_hs_stock_snapshot(query)
-
-    market_snapshot = None
-    if _is_market_data_query(query) and _is_time_sensitive_query(query) and not hs_snapshot:
-        market_snapshot = fetch_market_snapshot(query)
-
     weather_result = None
     if _is_weather_query(query) and has_amap_key():
         location = _extract_weather_location(query)
@@ -765,18 +517,11 @@ def perform_web_search(query: str) -> str:
         if weather_result and "失败" not in weather_result:
             _log_activity("search", "未使用网页搜索", "已命中天气专用接口")
             return weather_result
-        if hs_snapshot:
-            _log_activity("search", "未使用网页搜索", "已命中聚合数据沪深股市接口")
-            return hs_snapshot
-        if market_snapshot:
-            _log_activity("search", "未使用网页搜索", "已命中行情快照接口")
-            return market_snapshot
         _log_activity("search", "跳过联网搜索", "未配置 Tavily API Key")
         return "当前未配置 Tavily 搜索能力，无法执行联网搜索。"
 
     today = _today_cn()
     time_sensitive = _is_time_sensitive_query(query)
-    market_sensitive = _is_market_data_query(query)
 
     _log_activity(
         "think",
@@ -823,8 +568,6 @@ def perform_web_search(query: str) -> str:
             safe_item["url"] = normalized_url or url
             merged_results.append(safe_item)
 
-    if not merged_results and market_snapshot:
-        return market_snapshot
     if not merged_results:
         _log_activity("tool", "web_search 完成", "未找到结果")
         return "没有找到可用的联网搜索结果。"
@@ -870,21 +613,12 @@ def perform_web_search(query: str) -> str:
             f"搜索结果里没有识别到明确日期，无法确认是否与当前日期 {today.isoformat()} 同步。"
         )
 
-    if market_sensitive and staleness_warning:
-        staleness_warning += " 对于实时行情或指数类问题，不应把这些结果当作今日实时数据。"
-
     lines = [f"搜索关键词: {query}"]
     if time_sensitive:
         lines.append(f"当前日期: {today.isoformat()}")
     if weather_result and "失败" not in weather_result:
         lines.extend(["", weather_result])
         _log_activity("tool", "优先使用天气接口", "网页搜索结果仅作为补充来源")
-    if hs_snapshot:
-        lines.extend(["", hs_snapshot])
-        _log_activity("tool", "优先使用沪深股票接口", "网页搜索结果仅作为补充来源")
-    if market_snapshot:
-        lines.extend(["", market_snapshot])
-        _log_activity("tool", "优先使用行情快照", "网页搜索结果仅作为补充来源")
     if staleness_warning:
         lines.extend(["", f"时效警告: {staleness_warning}"])
         _log_activity("search", "识别到时效风险", staleness_warning)
@@ -949,9 +683,8 @@ BASE_SYSTEM_PROMPT = f"""
 5. 当需要结构化输出时，优先使用清晰的 Markdown。
 6. 对代码、表格、方案、总结，尽量给出可直接使用的结果。
 7. 只有在用户明确开启联网搜索，且问题需要最新外部信息时，才调用 web_search。
-8. 对于指数/股价/行情这类问题，优先使用工具返回的行情快照；如果快照不可用，再参考网页搜索。
-9. 如果搜索结果出现时效警告、旧日期或无法识别日期，必须明确告诉用户结果可能不是今天/当前的数据。
-10. 不要暴露内部私有推理，只输出结论、必要依据和工具结果。
+8. 如果搜索结果出现时效警告、旧日期或无法识别日期，必须明确告诉用户结果可能不是今天/当前的数据。
+9. 不要暴露内部私有推理，只输出结论、必要依据和工具结果。
 """
 
 SEARCH_DISABLED_APPENDIX = """

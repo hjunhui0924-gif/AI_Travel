@@ -1,6 +1,6 @@
 ---
 name: entity-normalizer
-description: Normalize user-provided names, places, stock symbols, and shorthand references in AI_Agent before calling APIs or web search. Use when Codex needs to improve recognition of aliases, abbreviations, region names, stock identifiers, or other ambiguous entities.
+description: Normalize user-provided places, transit codes, and shorthand references in AI_Agent before calling travel APIs or web search. Use when Codex needs to improve recognition of city, district, airport, station, attraction, or other ambiguous travel entities.
 ---
 
 # Entity Normalizer
@@ -8,9 +8,8 @@ description: Normalize user-provided names, places, stock symbols, and shorthand
 ## Targets
 
 - City names and districts
-- Stock names and codes
-- Index aliases
-- Product and company aliases
+- Airport and railway-station names/codes
+- Attraction, hotel, and restaurant aliases
 
 ## Workflow
 
@@ -21,7 +20,5 @@ description: Normalize user-provided names, places, stock symbols, and shorthand
 
 ## Examples
 
-- “上证” -> “上证指数”
-- “sh601009” stays unchanged
-- “南京银” -> “南京银行” if confidence is high
 - “浦东” -> normalized city/district context before weather or map queries
+- “虹桥” -> resolve to the relevant airport/station context before a transport query

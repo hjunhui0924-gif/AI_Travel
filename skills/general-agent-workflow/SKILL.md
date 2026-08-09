@@ -1,6 +1,6 @@
 ---
 name: general-agent-workflow
-description: Build or extend the AI_Agent project as a general-purpose chat assistant with file upload, document-aware answering, optional web search, and MCP-exposed tools. Use when Codex needs to modify the app's agent workflow, attachment parsing, search behavior, MCP server, or related frontend chat experience.
+description: Build or extend the AI_Agent project as a general-purpose chat assistant with file upload, document-aware answering, and optional web search. Use when Codex needs to modify the app's agent workflow, attachment parsing, search behavior, or related frontend chat experience.
 ---
 
 # General Agent Workflow
@@ -14,7 +14,7 @@ Preserve these product principles:
 1. Keep the UI close to a modern chat workspace: lightweight, file-friendly, and fast to send.
 2. Treat uploaded files as first-class context. Prefer extracting readable text and passing it to the model with clear file labels.
 3. Make web search explicit. The model should only search when the user enabled it and the question is time-sensitive or externally factual.
-4. Keep MCP tools aligned with the app's own backend capabilities so external clients and the web UI do not drift apart.
+4. Keep optional integrations aligned with the app's own backend capabilities so external clients and the web UI do not drift apart.
 
 ## Workflow
 
@@ -26,7 +26,6 @@ Before editing, inspect these files first:
 - `agents/agent.py`: prompt, tools, persistence, and chat orchestration
 - `utils/file_utils.py`: supported file formats and extraction limits
 - `static/index.html`, `static/main.js`, `static/style.css`: chat UI
-- `mcp_server/server.py`: tools exposed through MCP
 
 ### 2. Keep prompt construction explicit
 
@@ -53,10 +52,10 @@ If adjusting search behavior:
 
 - Do not silently force search on
 - Keep the search toggle state visible in the UI
-- Use the same underlying search helper for both the app agent and the MCP server where possible
+- Keep search behavior centralized so the app agent and external integrations do not drift where possible
 
-### 5. Keep MCP in sync
+### 5. Keep integrations in sync
 
-If you add or rename a core backend capability, decide whether it should also appear in `mcp_server/server.py`.
+If you add or rename a core backend capability, update the relevant public contract and integration documentation.
 
 Read [references/architecture.md](references/architecture.md) before larger refactors.

@@ -232,3 +232,13 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 非空但结构异常的 provider 响应会进入 `schema_changed/failed`；混合有效/异常行保留有效结果并进入 `partial` 诊断；未知三字母码要求配置映射，避免把机场码盲传为城市码。
 - 完整验证已完成：`python -m pytest -q` 为 **80 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。
 - 实时验证已完成：VariFlight 与 `flight_mcp` 单项检查均 `success`，返回 1 条航班且 `seat_count_known=1`；全量检查中高德、12306（579 条）、Tavily（5 条）和 VariFlight 成功，Flight MCP 以 alias 复用且未重复请求，Ctrip H5 仍为已知 `blocked/HTTP 432`，全量 `overall_status=needs_attention` 属于预期边界。
+
+## 13. 旧通用能力清理增量（2026-08-09）
+
+- 状态：已完成本轮清理，已通过本地回归和对抗式复查。
+- 目标：删除已经被垂直旅行规划后端替代、且不属于当前产品边界的股票/行情能力和独立通用 MCP 入口，降低维护面与误触发风险。
+- 已删除范围：`utils/stock_utils.py`、`agents/agent.py` 中的股票/行情分支、旧 `mcp_server/server.py`、`.mcp.json`、股票专用 `skills/market-query/SKILL.md` 以及仅供旧 MCP 入口使用的 `mcp` 直接依赖。
+- 文档同步：移除基础提示词中已删除的行情能力指引和通用 MCP 入口表述；将实体标准化/实时路由技能收敛到旅行领域；保留文件解析、天气和联网搜索能力。
+- 明确保留：旅行计划、日历/重规划、文件上传与可选 OSS 存储、高德/12306/VariFlight、Ctrip 风控探测、Flight MCP 兼容桥和静态前端。
+- 边界：本次清理不删除运行时数据库、上传数据、缓存、静态前端或任何授权交通 adapter；不改变前端交接接口。
+- 验证：`python -m pytest -q` 为 **80 passed**，仅有既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`python -c "import app"` 通过；`git diff --check` 通过；仓库内未发现股票能力或本地 `mcp_server` 入口的运行时引用，`.env` 中未再保留旧股票配置变量。授权航班桥中保留的外部 `flight_ticket_mcp_server` 是兼容 provider 名称，不属于本次删除目标。

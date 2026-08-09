@@ -1,6 +1,6 @@
 ---
 name: realtime-query-router
-description: Route real-time or date-sensitive user questions in AI_Agent to the most reliable tool path. Use when Codex needs to improve handling for queries involving today, latest, current, real-time, weather, market quotes, exchange rates, traffic, schedules, or any other information that can go stale quickly.
+description: Route real-time or date-sensitive travel questions in AI_Agent to the most reliable tool path. Use when Codex needs to improve handling for queries involving today, latest, current, real-time, weather, traffic, transport schedules, POI availability, or any other information that can go stale quickly.
 ---
 
 # Realtime Query Router
@@ -12,7 +12,7 @@ Use this skill when extending the project for time-sensitive questions.
 Prefer this routing order:
 
 1. Dedicated API or structured tool
-2. Domain-specific MCP tool
+2. Authorized domain adapter
 3. Web search fallback with date checks
 4. Clear uncertainty warning if freshness cannot be verified
 
@@ -20,8 +20,6 @@ Prefer this routing order:
 
 - Weather questions:
   Use `weather_lookup` first.
-- Market and quote questions:
-  Prefer dedicated quote tools or market snapshot tools.
 - “Today / latest / current / real-time” questions:
   Always inject current date context before tool selection.
 - Generic current-events questions:

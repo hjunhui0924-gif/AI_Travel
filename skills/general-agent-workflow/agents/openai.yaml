@@ -1,4 +1,4 @@
 interface:
   display_name: "General Agent"
   short_description: "Extend the AI_Agent workflow safely."
-  default_prompt: "Use this skill to update the AI_Agent app, file parsing, search, and MCP tooling."
+  default_prompt: "Use this skill to update the AI_Agent app, file parsing, search, and external integrations."
