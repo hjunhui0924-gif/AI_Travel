@@ -142,6 +142,7 @@ def get_flight_options(query: TravelQuery) -> list[TransportOption]:
                     ]
                     if part
                 ],
+                is_demo=bool(item.get("is_demo", False)),
             )
         )
     return results

@@ -22,10 +22,17 @@ class TravelQuery:
     destination: str = ""
     city: str = ""
     date: str = ""
+    start_date: str = ""
+    end_date: str = ""
     days: int = 1
+    travelers: int = 1
     budget: str = ""
     travel_mode: str = ""
     preferences: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    locked_item_ids: list[str] = field(default_factory=list)
+    date_is_assumed: bool = True
+    duration_is_assumed: bool = True
     attachment_notes: list[str] = field(default_factory=list)
     named_places: list[str] = field(default_factory=list)
 
@@ -41,6 +48,7 @@ class TransportOption:
     summary: str = ""
     provider: str = ""
     seats: list[str] = field(default_factory=list)
+    is_demo: bool = False
 
 
 @dataclass(slots=True)
@@ -48,6 +56,9 @@ class TimelineItem:
     time_label: str
     title: str
     detail: str = ""
+    date: str = ""
+    item_id: str = ""
+    item_type: str = "activity"
 
 
 @dataclass(slots=True)
@@ -58,6 +69,16 @@ class PoiRecommendation:
     address: str = ""
     summary: str = ""
     distance: str = ""
+    rating: str = ""
+    rating_source: str = ""
+    estimated_cost: str = ""
+    popularity_signal: str = ""
+    popularity_source: str = ""
+    opening_status: str = "unknown"
+    source_ids: list[str] = field(default_factory=list)
+    website_url: str = ""
+    freshness: str = "unknown"
+    is_placeholder: bool = False
 
 
 @dataclass(slots=True)
@@ -79,6 +100,101 @@ class RoutePlan:
 
 
 @dataclass(slots=True)
+class Evidence:
+    """A public source record; never store model private reasoning here."""
+
+    evidence_id: str
+    source_type: str
+    provider: str
+    title: str = ""
+    url: str = ""
+    snippet: str = ""
+    retrieved_at: str = ""
+    valid_until: str = ""
+    freshness: str = "unknown"
+    reliability: str = "unknown"
+    supports: list[str] = field(default_factory=list)
+    is_demo: bool = False
+
+
+@dataclass(slots=True)
+class TravelFact:
+    fact_id: str
+    fact_type: str
+    label: str
+    value: str = ""
+    confirmed: bool = False
+    source_ids: list[str] = field(default_factory=list)
+    notes: str = ""
+
+
+@dataclass(slots=True)
+class TravelConstraint:
+    constraint_id: str
+    kind: str
+    label: str
+    value: str = ""
+    hard: bool = False
+    satisfied: bool | None = None
+    source: str = "user"
+
+
+@dataclass(slots=True)
+class PlanItem:
+    item_id: str
+    item_type: str
+    title: str
+    date: str
+    start_time: str = ""
+    end_time: str = ""
+    location: str = ""
+    address: str = ""
+    detail: str = ""
+    status: str = "suggested"
+    locked: bool = False
+    source_ids: list[str] = field(default_factory=list)
+    estimated_cost: str = ""
+    travel_minutes: int | None = None
+    confidence: str = "unknown"
+
+
+@dataclass(slots=True)
+class PlanDay:
+    date: str
+    day_number: int
+    title: str = ""
+    summary: str = ""
+    items: list[PlanItem] = field(default_factory=list)
+    has_conflicts: bool = False
+
+
+@dataclass(slots=True)
+class TravelPlan:
+    plan_id: str
+    thread_id: str
+    version: int
+    timezone: str
+    start_date: str
+    end_date: str
+    origin: str = ""
+    destination: str = ""
+    travelers: int = 1
+    preferences: list[str] = field(default_factory=list)
+    summary: str = ""
+    days: list[PlanDay] = field(default_factory=list)
+    facts: list[TravelFact] = field(default_factory=list)
+    constraints: list[TravelConstraint] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    sources: list[Evidence] = field(default_factory=list)
+    search_enabled: bool = False
+    status: str = "draft"
+    created_at: str = ""
+    updated_at: str = ""
+    previous_version: int | None = None
+
+
+@dataclass(slots=True)
 class TravelPlanResponse:
     intent: TravelIntent
     summary: str
@@ -91,3 +207,6 @@ class TravelPlanResponse:
     alerts: list[str] = field(default_factory=list)
     extracted_context: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+    trip_plan: TravelPlan | None = None
+    sources: list[Evidence] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)

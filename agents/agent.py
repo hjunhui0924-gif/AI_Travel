@@ -6,6 +6,7 @@ import sqlite3
 import urllib.parse
 import urllib.request
 from contextvars import ContextVar
+from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -33,7 +34,15 @@ except Exception:
 from utils.oss_utils import delete_oss_object
 from utils.stock_utils import format_hs_stock_item, get_hs_index_item, get_hs_stock_item, has_juhe_stock_key
 from utils.weather_utils import current_cn_datetime, format_weather_text, has_amap_key
+from agents.schemas import TravelPlan
 from agents.travel_agent import plan_travel, render_travel_response
+from services.travel_store import (
+    delete_travel_thread,
+    get_current_plan,
+    list_travel_turns,
+    save_plan_version,
+    save_travel_turn,
+)
 
 load_dotenv()
 
@@ -57,6 +66,7 @@ CHROMA_DIR = RESOURCES_DIR / "chroma_runtime"
 
 _activity_log_var: ContextVar[list[dict] | None] = ContextVar("activity_log", default=None)
 _source_cards_var: ContextVar[list[dict] | None] = ContextVar("source_cards", default=None)
+_travel_plan_var: ContextVar[dict | None] = ContextVar("travel_plan", default=None)
 
 _chroma_client = None
 _chroma_embedding_function = None
@@ -89,6 +99,7 @@ def _source_cards() -> list[dict]:
 def _reset_runtime_buffers() -> None:
     _activity_log_var.set([])
     _source_cards_var.set([])
+    _travel_plan_var.set(None)
 
 
 def _log_activity(stage: str, title: str, detail: str = "", state: str = "completed") -> None:
@@ -105,15 +116,22 @@ def _log_activity(stage: str, title: str, detail: str = "", state: str = "comple
     )
 
 
-def _log_source_card(title: str, url: str, summary: str = "", source_date: str = "") -> None:
-    _source_cards().append(
-        {
-            "title": title,
-            "url": url,
-            "summary": summary,
-            "source_date": source_date,
-        }
-    )
+def _log_source_card(
+    title: str,
+    url: str,
+    summary: str = "",
+    source_date: str = "",
+    evidence_id: str = "",
+) -> None:
+    card = {
+        "title": title,
+        "url": url,
+        "summary": summary,
+        "source_date": source_date,
+    }
+    if evidence_id:
+        card["evidence_id"] = evidence_id
+    _source_cards().append(card)
 
 
 def consume_activity_log() -> list[dict]:
@@ -126,6 +144,12 @@ def consume_source_cards() -> list[dict]:
     items = list(_source_cards())
     _source_cards_var.set([])
     return items
+
+
+def consume_travel_plan() -> dict | None:
+    plan = _travel_plan_var.get()
+    _travel_plan_var.set(None)
+    return plan
 
 
 def _resolve_model_settings() -> dict:
@@ -1007,6 +1031,30 @@ def _build_display_text(user_text: str, attachments: list[dict], search_enabled:
     return f"{safe_text}\n\n{ACTIVITY_START}{metadata}{ACTIVITY_END}"
 
 
+def _build_current_travel_plan_block(plan: TravelPlan) -> str:
+    day_lines = []
+    for day in plan.days[:7]:
+        titles = [item.title for item in day.items[:6]]
+        day_lines.append(f"{day.date}: {'、'.join(titles) if titles else '暂无安排'}")
+    return (
+        f"\n\n当前已保存旅行计划（仅作对话上下文，不是私有推理）："
+        f"{plan.destination or '未定目的地'}，{plan.start_date} 至 {plan.end_date}，第 {plan.version} 版。\n"
+        + "\n".join(day_lines)
+        + "\n如用户提出旅行相关修改，应优先基于该计划重规划并保留已锁定项目。"
+    )
+
+
+def _message_mentions_travel_context(message: str) -> bool:
+    return any(keyword in message for keyword in ["行程", "路线", "安排", "旅行", "出发", "目的地"])
+
+
+def _message_mentions_replan(message: str) -> bool:
+    return any(
+        keyword in message
+        for keyword in ["下雨", "晚点", "不想走路", "少走路", "重新规划", "重排", "改成", "增加", "去掉", "取消", "预算变"]
+    )
+
+
 def _is_travel_query(message: str, attachments: list[dict]) -> bool:
     travel_keywords = [
         "\u65c5\u884c",
@@ -1025,6 +1073,14 @@ def _is_travel_query(message: str, attachments: list[dict]) -> bool:
         "\u8def\u7ebf",
         "\u9910\u5385",
         "\u5496\u5561\u9986",
+        "\u7f51\u7ea2",
+        "\u70ed\u95e8",
+        "\u6253\u5361",
+        "\u4e0b\u96e8",
+        "\u665a\u70b9",
+        "\u4e0d\u60f3\u8d70\u8def",
+        "\u5c11\u8d70\u8def",
+        "\u91cd\u65b0\u89c4\u5212",
     ]
     if any(keyword in message for keyword in travel_keywords):
         return True
@@ -1037,10 +1093,24 @@ def _is_travel_query(message: str, attachments: list[dict]) -> bool:
     return any(token in lowered or token in attachment_names for token in ["trip", "travel", "flight", "hotel", "ticket"])
 
 
-def _stream_travel_response(message: str, attachments: list[dict]):
+def _stream_travel_response(
+    message: str,
+    thread_id: str,
+    search_enabled: bool,
+    attachments: list[dict],
+    user_id: int | None = None,
+):
     _log_activity("think", "Travel intent detected", "Route request to travel orchestrator")
     _log_activity("tool", "Build travel context", "Extract origin, destination, date, preferences, attachments", state="running")
-    response = plan_travel(message, attachments)
+    current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
+    response = plan_travel(
+        message,
+        attachments,
+        thread_id=thread_id,
+        search_enabled=search_enabled,
+        current_plan=current_plan,
+        activity_logger=_log_activity,
+    )
     _log_activity("tool", "Build travel context", "Travel context ready")
 
     if response.transport_options:
@@ -1052,11 +1122,74 @@ def _stream_travel_response(message: str, attachments: list[dict]):
     if response.weather_summary:
         _log_activity("tool", "Attach weather summary", "weather context added")
 
+    saved_plan = response.trip_plan
+    if saved_plan is not None and thread_id:
+        try:
+            saved_plan = save_plan_version(
+                saved_plan,
+                user_id=user_id,
+                change_summary="重规划" if current_plan else "首次生成",
+            )
+            response.trip_plan = saved_plan
+            response.sources = saved_plan.sources
+            response.conflicts = saved_plan.conflicts
+            _travel_plan_var.set(asdict(saved_plan))
+            for evidence in saved_plan.sources:
+                if evidence.url:
+                    _log_source_card(
+                        title=evidence.title,
+                        url=evidence.url,
+                        summary=evidence.snippet,
+                        source_date=evidence.retrieved_at,
+                        evidence_id=evidence.evidence_id,
+                    )
+            save_travel_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                role="user",
+                content=message.strip() or "请结合附件生成旅行计划。",
+                attachments=[
+                    {
+                        "name": attachment.get("name", ""),
+                        "extension": attachment.get("extension", ""),
+                        "modality": attachment.get("modality", "text"),
+                        "image_url": attachment.get("image_url"),
+                    }
+                    for attachment in attachments
+                ],
+                search_enabled=search_enabled,
+            )
+        except Exception as exc:
+            _log_activity("storage", "旅行计划保存失败", str(exc))
+            if saved_plan is not None:
+                saved_plan.risks.append("计划尚未成功持久化，请稍后重试或保留本次结果。")
     rendered = render_travel_response(response)
-    yield AIMessageChunk(content=[{"type": "text", "text": rendered}]), {"travel": True}
+    if saved_plan is not None and thread_id:
+        try:
+            save_travel_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                role="assistant",
+                content=rendered,
+                search_enabled=search_enabled,
+                plan=saved_plan,
+            )
+        except Exception as exc:
+            _log_activity("storage", "旅行回复历史保存失败", str(exc))
+
+    yield AIMessageChunk(content=[{"type": "text", "text": rendered}]), {
+        "travel": True,
+        "trip_plan": asdict(saved_plan) if saved_plan is not None and thread_id else None,
+    }
 
 
-def stream_chat(message: str, thread_id: str, search_enabled: bool, attachments: list[dict]):
+def stream_chat(
+    message: str,
+    thread_id: str,
+    search_enabled: bool,
+    attachments: list[dict],
+    user_id: int | None = None,
+):
     _reset_runtime_buffers()
 
     _log_activity("think", "分析用户问题", message.strip() or "结合上传内容回答", state="running")
@@ -1077,11 +1210,22 @@ def stream_chat(message: str, thread_id: str, search_enabled: bool, attachments:
 
     _log_activity("think", "整理回答策略", "准备汇总上下文并生成最终回复")
 
-    if _is_travel_query(message, attachments):
-        return _stream_travel_response(message, attachments)
+    current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
+    if _is_travel_query(message, attachments) or (
+        current_plan and (_message_mentions_travel_context(message) or _message_mentions_replan(message))
+    ):
+        return _stream_travel_response(message, thread_id, search_enabled, attachments, user_id=user_id)
 
     prompt_text = build_user_prompt(message, attachments, search_enabled)
+    if current_plan:
+        current_plan_block = _build_current_travel_plan_block(current_plan)
+        prompt_text += current_plan_block
     user_content = _build_user_content(message, attachments, search_enabled)
+    if current_plan:
+        if isinstance(user_content, str):
+            user_content += current_plan_block
+        else:
+            user_content[0]["text"] += current_plan_block
     display_text = _build_display_text(message, attachments, search_enabled)
     visible_text = _strip_internal_sections(display_text)
     metadata_suffix = display_text[len(visible_text):] if display_text.startswith(visible_text) else ""
@@ -1137,18 +1281,47 @@ def _extract_assistant_metadata(text: str) -> dict:
         return {}
 
 
+def _travel_turn_messages(thread_id: str) -> list[dict]:
+    """Expose travel turns through the same history shape as LangGraph chat."""
+    result = []
+    for turn in list_travel_turns(thread_id):
+        attachments = turn.get("attachments") or []
+        if turn.get("role") == "user":
+            result.append(
+                {
+                    "role": "user",
+                    "content": str(turn.get("content") or ""),
+                    "attachments": attachments,
+                    "search_enabled": bool(turn.get("search_enabled")),
+                    "image_urls": [item.get("image_url") for item in attachments if item.get("image_url")],
+                }
+            )
+        elif turn.get("role") == "assistant":
+            result.append(
+                {
+                    "role": "assistant",
+                    "content": str(turn.get("content") or ""),
+                    "activities": [],
+                    "sources": [],
+                    "plan_id": turn.get("plan_id"),
+                    "plan_version": turn.get("plan_version"),
+                }
+            )
+    return result
+
+
 def get_messages(thread_id: str) -> list[dict]:
     cp = checkpoint.get({"configurable": {"thread_id": thread_id}})
     if not cp:
-        return []
+        return _travel_turn_messages(thread_id)
 
     channel_values = cp.get("channel_values")
     if not channel_values:
-        return []
+        return _travel_turn_messages(thread_id)
 
     messages = channel_values.get("messages", [])
     if not messages:
-        return []
+        return _travel_turn_messages(thread_id)
 
     result = []
     for msg in messages:
@@ -1187,6 +1360,15 @@ def get_messages(thread_id: str) -> list[dict]:
                     "sources": metadata.get("sources", []),
                 }
             )
+    travel_messages = _travel_turn_messages(thread_id)
+    if travel_messages:
+        # A travel turn is persisted outside the LangGraph execution state.
+        # Avoid duplicating it when a future checkpoint implementation starts
+        # replaying the same turn, while keeping legacy/general messages intact.
+        existing_contents = {(item.get("role"), item.get("content")) for item in result}
+        for item in travel_messages:
+            if (item.get("role"), item.get("content")) not in existing_contents:
+                result.append(item)
     return result
 
 
@@ -1269,3 +1451,4 @@ def delete_thread(thread_id: str):
             if attachment.get("storage") == "oss" and attachment.get("object_key"):
                 delete_oss_object(attachment["object_key"])
     checkpoint.delete_thread(thread_id)
+    delete_travel_thread(thread_id)

@@ -25,13 +25,14 @@ def _flight_mcp_mode() -> str:
     explicit_mode = os.getenv("FLIGHT_MCP_MODE", "").strip().lower()
     if explicit_mode:
         return explicit_mode
-    if _default_bridge_command():
+    enabled = os.getenv("FLIGHT_MCP_ENABLED", "").strip().lower()
+    if enabled in {"1", "true", "yes", "on"} and _default_bridge_command():
         return "auto"
     return ""
 
 
 def is_flight_mcp_enabled() -> bool:
-    return bool(os.getenv("FLIGHT_MCP_ENABLED") or _flight_mcp_mode())
+    return bool(_flight_mcp_mode())
 
 
 def _normalize_flight_items(payload: object) -> list[dict]:

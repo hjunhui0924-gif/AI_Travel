@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from adapters.ctrip_flight_adapter import probe_ctrip_flight_page
-from agents.schemas import TravelPlanResponse, TravelQuery
+from agents.schemas import (
+    Evidence,
+    PlanDay,
+    PlanItem,
+    PoiGroup,
+    PoiRecommendation,
+    RoutePlan,
+    TimelineItem,
+    TransportOption,
+    TravelConstraint,
+    TravelFact,
+    TravelPlan,
+    TravelPlanResponse,
+    TravelQuery,
+)
 from services.flight_service import get_flight_options
 from services.poi_recommender import recommend_pois
 from services.rail_service import get_rail_options
@@ -14,6 +31,8 @@ from services.trip_planner import build_timeline
 from services.weather_service import get_weather_summary
 
 
+CN_TZ = ZoneInfo("Asia/Shanghai")
+
 KNOWN_CITIES = [
     "北京", "上海", "广州", "深圳", "杭州", "苏州", "南京", "成都",
     "重庆", "武汉", "西安", "长沙", "厦门", "青岛", "湛江", "佛山",
@@ -21,17 +40,26 @@ KNOWN_CITIES = [
 
 RAIL_KEYWORDS = ["高铁", "火车", "动车", "12306", "车次", "车票", "余票"]
 FLIGHT_KEYWORDS = ["飞机", "航班", "机票"]
-NEARBY_KEYWORDS = ["附近", "周边", "景点", "好玩", "好吃", "餐厅", "咖啡馆", "推荐", "攻略"]
+NEARBY_KEYWORDS = ["附近", "周边", "景点", "好玩", "好吃", "餐厅", "咖啡馆", "推荐", "攻略", "网红", "热门", "打卡"]
+REPLAN_KEYWORDS = [
+    "重新规划", "重排", "改行程", "改路线", "调整行程", "调整路线", "下雨",
+    "晚点", "不想走路", "少走路", "增加", "加上", "去掉", "删除", "预算变",
+    "换成", "改成", "取消", "景点关闭",
+]
 
 
 def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
+def _now_cn() -> datetime:
+    return datetime.now(CN_TZ)
+
+
 def _has_cross_city_route(message: str, origin: str, destination: str) -> bool:
     if origin and destination and origin != destination:
         return True
-    return bool(re.search(r"从.{1,8}到.{1,8}", message))
+    return bool(re.search(r"从.{1,12}到.{1,12}", message))
 
 
 def _detect_intent(message: str, origin: str, destination: str) -> str:
@@ -39,7 +67,7 @@ def _detect_intent(message: str, origin: str, destination: str) -> str:
     has_flight = _contains_any(message, FLIGHT_KEYWORDS)
     has_nearby = _contains_any(message, NEARBY_KEYWORDS)
     has_compare = _contains_any(message, ["对比", "比较", "哪个更好", "还是"])
-    has_replan = "改" in message and _contains_any(message, ["行程", "路线", "方案", "晚点", "下雨"])
+    has_replan = _contains_any(message, REPLAN_KEYWORDS)
     has_cross_city = _has_cross_city_route(message, origin, destination)
 
     if has_replan:
@@ -50,14 +78,8 @@ def _detect_intent(message: str, origin: str, destination: str) -> str:
         return "rail_query"
     if has_cross_city and has_flight and not has_nearby:
         return "flight_query"
-    if has_cross_city and has_nearby:
-        return "trip_plan"
     if has_cross_city:
         return "trip_plan"
-    if has_rail and not has_nearby:
-        return "rail_query"
-    if has_flight and not has_nearby:
-        return "flight_query"
     if has_nearby and (has_rail or has_flight):
         return "trip_plan"
     if has_nearby:
@@ -65,11 +87,13 @@ def _detect_intent(message: str, origin: str, destination: str) -> str:
     return "trip_plan"
 
 
-def _extract_cities(message: str) -> tuple[str, str]:
-    route_match = re.search(r"从(.{1,8}?)到(.{1,8}?)(?:[\s，。,.\?？]|$)", message)
-    if route_match:
-        return route_match.group(1).strip(), route_match.group(2).strip()
+def _clean_location(value: str) -> str:
+    cleaned = (value or "").strip(" \t，。,.；;：:")
+    cleaned = re.sub(r"(?:玩|游玩|旅游|旅行|住|住宿|计划|安排).*$", "", cleaned).strip()
+    return cleaned
 
+
+def _extract_cities(message: str) -> tuple[str, str]:
     hits_with_pos = []
     for city in KNOWN_CITIES:
         index = message.find(city)
@@ -81,29 +105,160 @@ def _extract_cities(message: str) -> tuple[str, str]:
     if len(hits) == 1:
         return "", hits[0]
 
-    route_match_alt = re.search(r"([^\s，。,.\?？]{1,8}?)到([^\s，。,.\?？]{1,8}?)(?:[\s，。,.\?？]|$)", message)
+    route_match = re.search(r"从\s*(.{1,12}?)\s*到\s*(.{1,18}?)(?:[，。,.;；\s]|$)", message)
+    if route_match:
+        return _clean_location(route_match.group(1)), _clean_location(route_match.group(2))
+
+    route_match_alt = re.search(r"([^\s，。,.;；]{1,12}?)到([^\s，。,.;；]{1,18}?)(?:[\s，。,.;；]|$)", message)
     if route_match_alt:
-        return route_match_alt.group(1).strip(), route_match_alt.group(2).strip()
+        return _clean_location(route_match_alt.group(1)), _clean_location(route_match_alt.group(2))
     return "", ""
 
 
-def _extract_date(message: str) -> str:
-    match = re.search(r"(20\d{2}-\d{1,2}-\d{1,2})", message)
-    if match:
-        return match.group(1)
+_CN_NUMBERS = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
 
-    now = datetime.now()
-    if "明天" in message:
-        return (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+def _parse_number(value: str, default: int = 0) -> int:
+    text = str(value or "").strip()
+    if text.isdigit():
+        return int(text)
+    if text in _CN_NUMBERS:
+        return _CN_NUMBERS[text]
+    if len(text) == 2 and text[0] == "十":
+        return 10 + _CN_NUMBERS.get(text[1], 0)
+    if len(text) == 2 and text[1] == "十":
+        return _CN_NUMBERS.get(text[0], 0) * 10
+    if len(text) == 3 and text[1] == "十":
+        return _CN_NUMBERS.get(text[0], 0) * 10 + _CN_NUMBERS.get(text[2], 0)
+    return default
+
+
+def _date_from_match(match: re.Match[str]) -> date | None:
+    try:
+        groups = match.groups()
+        if len(groups) == 3:
+            year, month, day = map(int, groups)
+        else:
+            month, day = map(int, groups)
+            year = _now_cn().year
+        value = date(year, month, day)
+        if len(groups) == 2 and value < _now_cn().date() - timedelta(days=30):
+            value = date(year + 1, month, day)
+        return value
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_explicit_dates(text: str) -> list[date]:
+    patterns = [
+        r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})日?",
+        r"(\d{1,2})月(\d{1,2})日?",
+    ]
+    result: list[date] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            value = _date_from_match(match)
+            if value and value not in result:
+                result.append(value)
+    return sorted(result)
+
+
+def _extract_days(text: str) -> int:
+    match = re.search(
+        r"(?<!月)(?<![-/])(?:玩|游玩|停留|旅行|旅游)?\s*(\d+|[一二两三四五六七八九十百]+)\s*[天日]",
+        text,
+    )
+    if match:
+        return max(1, min(31, _parse_number(match.group(1), 1)))
+    nights = re.search(r"(\d+|[一二两三四五六七八九十]+)\s*晚", text)
+    if nights:
+        return max(1, min(31, _parse_number(nights.group(1), 1) + 1))
+    return 1
+
+
+def _has_explicit_duration(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?<!月)(?<![-/])(?:玩|游玩|停留|旅行|旅游)?\s*(\d+|[一二两三四五六七八九十百]+)\s*[天日]",
+            text,
+        )
+        or re.search(r"(\d+|[一二两三四五六七八九十]+)\s*晚", text)
+    )
+
+
+def _extract_date_range(message: str) -> tuple[str, str, bool, int]:
+    explicit_dates = _extract_explicit_dates(message)
+    days = _extract_days(message)
+    assumed = not bool(explicit_dates) and not _contains_any(message, ["明天", "后天", "下周", "今天"])
+    today = _now_cn().date()
     if "后天" in message:
-        return (now + timedelta(days=2)).strftime("%Y-%m-%d")
-    if "下周" in message:
-        return (now + timedelta(days=7)).strftime("%Y-%m-%d")
-    return now.strftime("%Y-%m-%d")
+        start = today + timedelta(days=2)
+        assumed = False
+    elif "明天" in message:
+        start = today + timedelta(days=1)
+        assumed = False
+    elif "下周" in message:
+        start = today + timedelta(days=7)
+        assumed = False
+    elif explicit_dates:
+        start = explicit_dates[0]
+        if len(explicit_dates) >= 2:
+            days = max(1, (explicit_dates[-1] - start).days + 1)
+    else:
+        start = today
+    end = start + timedelta(days=max(days, 1) - 1)
+    return start.isoformat(), end.isoformat(), assumed, max(days, 1)
+
+
+def _extract_travelers(message: str) -> int:
+    match = re.search(r"(\d+|[一二两三四五六七八九十]+)\s*(?:个|位)?\s*(?:人|位成人|大人)", message)
+    if not match:
+        return 1
+    return max(1, min(30, _parse_number(match.group(1), 1)))
+
+
+def _extract_preferences(message: str) -> list[str]:
+    mapping = [
+        ("亲子", ["亲子", "带孩子", "小朋友"]),
+        ("美食", ["美食", "好吃", "吃货", "餐厅"]),
+        ("咖啡", ["咖啡", "咖啡馆"]),
+        ("拍照", ["拍照", "出片", "打卡"]),
+        ("自然", ["自然", "山水", "公园"]),
+        ("历史文化", ["历史", "古迹", "博物馆", "文化"]),
+        ("夜游", ["夜景", "夜游", "晚上"]),
+        ("慢游", ["慢游", "轻松", "不赶"]),
+        ("少走路", ["不想走路", "少走路", "步行少"]),
+    ]
+    result = []
+    for label, keywords in mapping:
+        if any(keyword in message for keyword in keywords):
+            result.append(label)
+    return result
+
+
+def _extract_constraints(message: str, preferences: list[str]) -> list[str]:
+    constraints = []
+    if "少走路" in preferences:
+        constraints.append("步行距离尽量短")
+    if _contains_any(message, ["预算", "便宜", "省钱"]):
+        budget_match = re.search(r"预算[^0-9一二两三四五六七八九十百]*(\d+(?:\.\d+)?\s*[万千百元块]?)", message)
+        constraints.append(f"预算 {budget_match.group(1)}" if budget_match else "控制预算")
+    if _contains_any(message, ["不要早起", "不早起"]):
+        constraints.append("避免过早出发")
+    if _contains_any(message, ["必须", "一定"]):
+        constraints.append("用户标记了硬性要求，需二次确认")
+    return constraints
+
+
+def _extract_date(message: str) -> str:
+    return _extract_date_range(message)[0]
 
 
 def _build_flight_diagnostics(query: TravelQuery) -> list[str]:
-    if query.travel_mode != "flight":
+    if query.travel_mode != "flight" or os.getenv("FLIGHT_CTRIP_PROBE_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return []
 
     airport_map = {"上海": "SHA", "杭州": "HGH", "北京": "BJS", "广州": "CAN", "深圳": "SZX", "湛江": "ZHA"}
@@ -122,6 +277,8 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
     attachment_notes = extract_attachment_notes(attachments)
     named_places = extract_named_places(attachments, message=message)
     city = destination or origin
+    start_date, end_date, date_is_assumed, days = _extract_date_range(message)
+    preferences = _extract_preferences(message)
 
     travel_mode = ""
     if _contains_any(message, FLIGHT_KEYWORDS):
@@ -129,18 +286,53 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
     elif _contains_any(message, RAIL_KEYWORDS):
         travel_mode = "rail"
 
-    return TravelQuery(
+    query = TravelQuery(
         raw_text=message,
         intent=intent,
         origin=origin,
         destination=destination,
         city=city,
-        date=_extract_date(message),
-        preferences=[],
-        travel_mode=travel_mode,
+        date=start_date,
+        start_date=start_date,
+        end_date=end_date,
+        days=days,
+        travelers=_extract_travelers(message),
+        preferences=preferences,
+        constraints=_extract_constraints(message, preferences),
+        duration_is_assumed=not _has_explicit_duration(message),
         attachment_notes=attachment_notes,
         named_places=named_places,
     )
+    query.date_is_assumed = date_is_assumed
+    return query
+
+
+def _inherit_previous_requirement(query: TravelQuery, current_plan: TravelPlan | None) -> TravelQuery:
+    if current_plan is None:
+        return query
+    if not query.origin:
+        query.origin = current_plan.origin
+    if not query.destination:
+        query.destination = current_plan.destination
+    query.city = query.destination or query.city or current_plan.destination
+    if not query.start_date or query.date_is_assumed:
+        query.start_date = current_plan.start_date
+        query.date = current_plan.start_date
+        if query.duration_is_assumed:
+            query.end_date = current_plan.end_date
+            query.days = max(1, (date.fromisoformat(query.end_date) - date.fromisoformat(query.start_date)).days + 1)
+        else:
+            query.end_date = (
+                date.fromisoformat(query.start_date) + timedelta(days=max(query.days, 1) - 1)
+            ).isoformat()
+        query.date_is_assumed = False
+    if not query.preferences:
+        query.preferences = list(current_plan.preferences)
+    if query.travelers == 1 and current_plan.travelers > 1 and "人" not in query.raw_text:
+        query.travelers = current_plan.travelers
+    inherited_constraints = [constraint.label for constraint in current_plan.constraints]
+    query.constraints = list(dict.fromkeys([*inherited_constraints, *query.constraints]))
+    return query
 
 
 def _should_include_explore(query: TravelQuery) -> bool:
@@ -152,26 +344,264 @@ def _should_include_weather(query: TravelQuery) -> bool:
 
 
 def _build_summary(query: TravelQuery) -> str:
+    destination = query.destination or query.city or "目的地"
     if query.intent == "nearby_explore":
-        return f"已为 {query.destination or query.city or '目标地点'} 生成周边探索建议。"
+        return f"已为 {destination} 生成周边探索建议，并整理成可加入日历的候选安排。"
     if query.intent == "transport_compare":
-        return f"已整理 {query.origin or '出发地'} 到 {query.destination or '目的地'} 的出行方案，适合做第一轮交通比较。"
+        return f"已整理 {query.origin or '出发地'} 到 {destination} 的出行方案，适合做第一轮交通比较。"
     if query.intent == "flight_query":
         return "已进入航班查询模式。"
     if query.intent == "rail_query":
         return "已进入高铁查询模式，优先返回 12306 方向的车次与座席信息。"
     if query.intent == "trip_replan":
-        return f"已按照 {query.destination or query.city or '目的地'} 的重新规划场景生成一版新方案。"
-    return f"已为 {query.destination or query.city or '目的地'} 生成一版出行与游玩结合的初步方案。"
+        return f"已按照你的新要求重新规划 {destination} 的行程，并保留已锁定安排。"
+    return f"已为 {destination} 生成一版出行与游玩结合的初步方案。"
 
 
-def plan_travel(message: str, attachments: list[dict]) -> TravelPlanResponse:
-    query = build_travel_query(message, attachments)
+def _transport_evidence(options: list[TransportOption]) -> list[Evidence]:
+    result = []
+    for index, option in enumerate(options, start=1):
+        provider = option.provider or "unknown"
+        source_type = "rail_realtime" if option.mode == "rail" else "flight_realtime"
+        result.append(
+            Evidence(
+                evidence_id=f"transport_{index:03d}_{option.mode}",
+                source_type=source_type,
+                provider=provider,
+                title=option.title,
+                url="https://kyfw.12306.cn/" if option.mode == "rail" else "",
+                snippet=f"{option.depart_time} -> {option.arrive_time} {option.duration}".strip(),
+                retrieved_at=_now_cn().isoformat(timespec="seconds"),
+                freshness="current_query",
+                reliability="adapter_result",
+                supports=["transport_candidate"],
+                is_demo=option.is_demo,
+            )
+        )
+    return result
+
+
+def _route_evidence(routes: list[RoutePlan]) -> list[Evidence]:
+    return [
+        Evidence(
+            evidence_id=f"route_{index:03d}",
+            source_type="map_route",
+            provider="Amap",
+            title=f"{route.origin} -> {route.destination}",
+            url="https://www.amap.com/",
+            snippet=f"{route.mode} {route.duration} {route.distance}".strip(),
+            retrieved_at=_now_cn().isoformat(timespec="seconds"),
+            freshness="current_query",
+            reliability="primary_adapter",
+            supports=["route", "duration", "distance"],
+        )
+        for index, route in enumerate(routes, start=1)
+    ]
+
+
+def _stable_item_id(item_type: str, title: str, day: str) -> str:
+    raw = f"{item_type}|{title}|{day}".encode("utf-8", errors="ignore")
+    return f"item_{hashlib.sha1(raw).hexdigest()[:12]}"
+
+
+def _new_plan_item(
+    *,
+    item_type: str,
+    title: str,
+    day: str,
+    detail: str = "",
+    start_time: str = "",
+    end_time: str = "",
+    location: str = "",
+    address: str = "",
+    source_ids: list[str] | None = None,
+    estimated_cost: str = "",
+    confidence: str = "unknown",
+) -> PlanItem:
+    return PlanItem(
+        item_id=_stable_item_id(item_type, title, day),
+        item_type=item_type,
+        title=title,
+        date=day,
+        start_time=start_time,
+        end_time=end_time,
+        location=location,
+        address=address,
+        detail=detail,
+        source_ids=list(dict.fromkeys(source_ids or [])),
+        estimated_cost=estimated_cost,
+        confidence=confidence,
+    )
+
+
+def _date_sequence(start_date: str, end_date: str) -> list[str]:
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError:
+        return [start_date]
+    if end < start:
+        return [start.isoformat()]
+    span = min((end - start).days + 1, 31)
+    return [(start + timedelta(days=index)).isoformat() for index in range(span)]
+
+
+def _build_structured_plan(
+    query: TravelQuery,
+    *,
+    thread_id: str,
+    search_enabled: bool,
+    transport_options: list[TransportOption],
+    route_plans: list[RoutePlan],
+    poi_items: list[PoiRecommendation],
+    poi_groups: list[PoiGroup],
+    sources: list[Evidence],
+    conflicts: list[str],
+    risks: list[str],
+    current_plan: TravelPlan | None,
+) -> TravelPlan:
+    day_dates = _date_sequence(query.start_date, query.end_date)
+    days = [PlanDay(date=value, day_number=index + 1) for index, value in enumerate(day_dates)]
+
+    if transport_options and days:
+        option = transport_options[0]
+        days[0].items.append(
+            _new_plan_item(
+                item_type="transport",
+                title=f"前往 {query.destination or '目的地'}：{option.title}",
+                day=days[0].date,
+                start_time=option.depart_time,
+                end_time=option.arrive_time,
+                detail=f"{option.mode}；{option.duration or '时长待补充'}；{option.summary or ''}".strip("；"),
+                source_ids=[item.evidence_id for item in sources if item.source_type.endswith("realtime") and item.title == option.title],
+                estimated_cost=option.price,
+                confidence="source_backed",
+            )
+        )
+
+    for index, route in enumerate(route_plans):
+        day = days[min(index, len(days) - 1)]
+        day.items.append(
+            _new_plan_item(
+                item_type="route",
+                title=f"{route.origin} -> {route.destination}",
+                day=day.date,
+                detail=f"{route.mode}，约 {route.duration or '时长待补充'}，{route.distance or '距离待补充'}。{route.summary}".strip(),
+                location=route.destination,
+                address=route.destination_address,
+                source_ids=[item.evidence_id for item in sources if item.source_type == "map_route" and item.title == f"{route.origin} -> {route.destination}"],
+                confidence="source_backed",
+            )
+        )
+
+    for index, poi in enumerate(poi_items[: min(16, max(4, len(days) * 4))]):
+        day = days[index % len(days)]
+        item_type = "food" if any(token in poi.category for token in ["餐", "美食", "咖啡"]) else "attraction"
+        detail_parts = [poi.summary]
+        if poi.popularity_signal:
+            detail_parts.append(poi.popularity_signal)
+        day.items.append(
+            _new_plan_item(
+                item_type=item_type,
+                title=poi.name,
+                day=day.date,
+                detail="；".join(part for part in detail_parts if part),
+                location=poi.name,
+                address=poi.address,
+                source_ids=poi.source_ids,
+                estimated_cost=poi.estimated_cost,
+                confidence="source_backed" if poi.source_ids else "unverified",
+            )
+        )
+
+    locked_items: list[PlanItem] = []
+    if current_plan:
+        locked_items = [
+            item
+            for plan_day in current_plan.days
+            for item in plan_day.items
+            if item.locked or item.status in {"confirmed", "booked"}
+        ]
+    for item in locked_items:
+        if item.date not in {day.date for day in days}:
+            conflicts.append(f"已锁定项目“{item.title}”不在新的日期范围内，未自动移动。")
+            continue
+        target_day = next(day for day in days if day.date == item.date)
+        if not any(existing.item_id == item.item_id for existing in target_day.items):
+            target_day.items.append(item)
+
+    for day in days:
+        day.items.sort(key=lambda item: (item.start_time or "99:99", item.item_type, item.title))
+        titles = [item.title for item in day.items]
+        day.title = f"第 {day.day_number} 天"
+        day.summary = "、".join(titles[:4]) if titles else "暂无已确认的具体安排，可继续告诉我想去的地方。"
+        day.has_conflicts = bool(conflicts)
+
+    facts = [
+        TravelFact(
+            fact_id=f"fact_attachment_{index}",
+            fact_type="attachment_clue",
+            label="附件线索",
+            value=value,
+            confirmed=False,
+            notes="来自用户附件，需用户确认后才视为锁定事实。",
+        )
+        for index, value in enumerate(query.attachment_notes, start=1)
+    ]
+    constraints = [
+        TravelConstraint(
+            constraint_id=f"constraint_{index}",
+            kind="preference" if not any(token in item for token in ["预算", "必须"]) else "requirement",
+            label=item,
+            value=item,
+            hard="必须" in item,
+            satisfied=None,
+        )
+        for index, item in enumerate(query.constraints, start=1)
+    ]
+    if query.date_is_assumed:
+        risks.append("未明确出发日期，当前按今天起算；请确认日期后再查看交通方案。")
+    if len(day_dates) >= 31 and query.end_date > day_dates[-1]:
+        risks.append("行程超过 31 天，日历暂只展开前 31 天。")
+
+    return TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date=day_dates[0] if day_dates else query.start_date,
+        end_date=day_dates[-1] if day_dates else query.end_date,
+        origin=query.origin,
+        destination=query.destination or query.city,
+        travelers=query.travelers,
+        preferences=list(query.preferences),
+        summary=_build_summary(query),
+        days=days,
+        facts=facts,
+        constraints=constraints,
+        conflicts=list(dict.fromkeys(conflicts)),
+        risks=list(dict.fromkeys(risks)),
+        sources=list(dict((item.evidence_id, item) for item in sources).values()),
+        search_enabled=search_enabled,
+        status="needs_attention" if conflicts or risks else "draft",
+    )
+
+
+def plan_travel(
+    message: str,
+    attachments: list[dict],
+    *,
+    thread_id: str = "",
+    search_enabled: bool = False,
+    current_plan: TravelPlan | None = None,
+    activity_logger=None,
+) -> TravelPlanResponse:
+    query = _inherit_previous_requirement(build_travel_query(message, attachments), current_plan)
     has_cross_city_route = bool(query.origin and query.destination and query.origin != query.destination)
 
     should_fetch_transport = query.intent in {"rail_query", "flight_query", "transport_compare", "trip_plan", "trip_replan"}
-    rail_options = []
-    flight_options = []
+    rail_options: list[TransportOption] = []
+    flight_options: list[TransportOption] = []
     if should_fetch_transport:
         if query.intent == "flight_query" and query.travel_mode == "flight":
             flight_options = get_flight_options(query)
@@ -184,22 +614,63 @@ def plan_travel(message: str, attachments: list[dict]) -> TravelPlanResponse:
 
     include_explore = _should_include_explore(query)
     route_plans = get_route_plans(query) if include_explore else []
-    poi_items, poi_groups = recommend_pois(query) if include_explore else ([], [])
+    poi_items, poi_groups, poi_sources, poi_errors = (
+        recommend_pois(query, search_enabled=search_enabled, activity_logger=activity_logger)
+        if include_explore
+        else ([], [], [], [])
+    )
     timeline = build_timeline(query, transport_options, route_plans, poi_items, poi_groups) if include_explore else []
     weather_summary = get_weather_summary(query.destination or query.city, forecast=True) if _should_include_weather(query) else ""
     diagnostics = _build_flight_diagnostics(query)
 
     alerts: list[str] = []
+    risks: list[str] = list(poi_errors)
+    conflicts: list[str] = []
+    if any(option.is_demo for option in transport_options):
+        risks.append("当前交通列表含演示数据，只用于联调展示，不可用于购票或判断真实班次。")
     if not rail_options and query.travel_mode == "rail":
         alerts.append("当前未获取到高铁实时结果，可能是站点、日期或 12306 查询受限。")
     if not flight_options and query.travel_mode == "flight":
-        alerts.append("本次未获取到可用航班结果，可能是 FlightTicketMCP 查询超时、站点或机场参数不匹配，或该日期下暂无航班数据。")
+        alerts.append("本次未获取到可用航班结果；请把它视为未查询到，不是无航班或可预订结果。")
     if has_cross_city_route and should_fetch_transport and not transport_options:
-        alerts.append("当前识别到跨城出行需求，但暂未拿到高铁或航班候选结果，可继续补充更具体日期、城市站点或改查单一交通方式。")
+        risks.append("已识别到跨城出行，但暂未拿到高铁或航班候选，不能把交通时间当作已确认事实。")
     if has_cross_city_route and include_explore and not route_plans:
-        alerts.append("当前为跨城出行场景，优先以高铁、航班等主交通方案为主，市内段路线建议会在确定酒店或具体目的地后生成。")
+        risks.append("市内路线暂未取得，建议确认酒店或具体目的地后再细化。")
     if query.attachment_notes and include_explore:
-        alerts.append("已结合附件线索生成初步方案，后续可继续细化为酒店、景点、会议联动行程。")
+        alerts.append("已结合附件线索生成初步方案；附件中的票据/预约信息仍需你确认后锁定。")
+    if search_enabled and poi_errors:
+        alerts.append("联网搜索部分失败或候选未通过地图验证，已保留可验证的地图结果。")
+
+    sources = _transport_evidence(transport_options) + _route_evidence(route_plans) + poi_sources
+    if weather_summary:
+        sources.append(
+            Evidence(
+                evidence_id="weather_001",
+                source_type="weather",
+                provider="Amap",
+                title=f"{query.destination or query.city} 天气参考",
+                url="https://www.amap.com/",
+                snippet=weather_summary[:500],
+                retrieved_at=_now_cn().isoformat(timespec="seconds"),
+                freshness="current_query",
+                reliability="primary_adapter",
+                supports=["weather_context"],
+            )
+        )
+
+    plan = _build_structured_plan(
+        query,
+        thread_id=thread_id,
+        search_enabled=search_enabled,
+        transport_options=transport_options,
+        route_plans=route_plans,
+        poi_items=poi_items,
+        poi_groups=poi_groups,
+        sources=sources,
+        conflicts=conflicts,
+        risks=risks,
+        current_plan=current_plan,
+    )
 
     return TravelPlanResponse(
         intent=query.intent,
@@ -213,11 +684,19 @@ def plan_travel(message: str, attachments: list[dict]) -> TravelPlanResponse:
         alerts=alerts,
         extracted_context=query.attachment_notes,
         diagnostics=diagnostics,
+        trip_plan=plan,
+        sources=plan.sources,
+        conflicts=plan.conflicts,
     )
 
 
 def render_travel_response(response: TravelPlanResponse) -> str:
     lines = [response.summary]
+    if response.trip_plan:
+        lines.append(
+            f"\n计划日期：{response.trip_plan.start_date} 至 {response.trip_plan.end_date}"
+            f"（第 {response.trip_plan.version or 1} 版草案）"
+        )
 
     if response.extracted_context:
         lines.extend(["", "## 附件线索"])
@@ -227,7 +706,7 @@ def render_travel_response(response: TravelPlanResponse) -> str:
         lines.extend(["", "## 交通方案"])
         for option in response.transport_options:
             lines.append(
-                f"- [{option.mode}] {option.title} | {option.depart_time} -> {option.arrive_time} | "
+                f"- [{'演示' if option.is_demo else option.mode}] {option.title} | {option.depart_time} -> {option.arrive_time} | "
                 f"{option.duration or '时长待补充'} | {option.price or '价格待补充'}"
             )
             if option.summary:
@@ -260,6 +739,10 @@ def render_travel_response(response: TravelPlanResponse) -> str:
         lines.extend(["", "## 周边探索"])
         for poi in response.poi_recommendations:
             label = f"{poi.name}（{poi.category}）"
+            if poi.rating:
+                label += f" 评分 {poi.rating}"
+            if poi.popularity_signal:
+                label += f"；{poi.popularity_signal}"
             if poi.area:
                 label += f" - {poi.area}"
             lines.append(f"- {label}")
@@ -272,5 +755,11 @@ def render_travel_response(response: TravelPlanResponse) -> str:
     if response.alerts:
         lines.extend(["", "## 提醒"])
         lines.extend([f"- {item}" for item in response.alerts])
+    if response.trip_plan and response.trip_plan.risks:
+        lines.extend(["", "## 计划风险"])
+        lines.extend([f"- {item}" for item in response.trip_plan.risks])
+    if response.trip_plan and response.trip_plan.conflicts:
+        lines.extend(["", "## 计划冲突"])
+        lines.extend([f"- {item}" for item in response.trip_plan.conflicts])
 
     return "\n".join(lines).strip()

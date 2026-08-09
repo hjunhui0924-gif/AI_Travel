@@ -121,6 +121,7 @@ def _normalize_flight_item(item: dict, origin: str, destination: str, provider: 
         "airline": _normalize_airline(item),
         "cabin": _normalize_cabin(item),
         "airport": _normalize_airport(item),
+        "is_demo": bool(item.get("is_demo", False)),
     }
 
 
@@ -138,6 +139,7 @@ def _dummy_response(origin: str, destination: str, date: str) -> list[dict]:
             "provider": "FlightTicketMCP-bridge-fallback",
             "airline": "China Eastern",
             "cabin": "Economy",
+            "is_demo": True,
         }
     ]
 
@@ -213,7 +215,8 @@ def _search_via_auto(origin: str, destination: str, date: str) -> list[dict]:
 
     if flights:
         return flights
-    return _dummy_response(origin, destination, date)
+    # An empty result is safer than inventing a bookable-looking flight.
+    return []
 
 
 def main() -> int:
@@ -234,8 +237,10 @@ def main() -> int:
             flights = search_ctrip_h5_flights(origin, destination, date)
         elif mode == "auto":
             flights = _search_via_auto(origin, destination, date)
-        else:
+        elif mode == "dummy" and os.getenv("FLIGHT_ALLOW_DEMO_DATA", "").strip().lower() in {"1", "true", "yes", "on"}:
             flights = _dummy_response(origin, destination, date)
+        else:
+            raise ValueError("unsupported or disabled flight bridge mode")
 
         sys.stdout.write(json.dumps(flights, ensure_ascii=True))
         return 0

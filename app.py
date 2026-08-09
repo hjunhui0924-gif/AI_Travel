@@ -1,5 +1,7 @@
 import json
 import re
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -7,11 +9,13 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.messages import AIMessage, AIMessageChunk
+from pydantic import BaseModel
 
 from agents.agent import (
     attach_assistant_metadata,
     consume_activity_log,
     consume_source_cards,
+    consume_travel_plan,
     delete_thread,
     encode_assistant_metadata,
     get_messages,
@@ -30,6 +34,14 @@ from services.auth_service import (
     is_thread_owned_by_user,
     list_threads_for_user,
     update_thread_activity,
+)
+from agents.travel_agent import plan_travel, render_travel_response
+from services.travel_store import (
+    get_current_plan,
+    get_plan_version,
+    list_plan_versions,
+    save_plan_version,
+    save_travel_turn,
 )
 from utils.file_utils import UnsupportedFileTypeError, parse_uploads
 
@@ -89,6 +101,28 @@ def _auth_json_response(user: dict, session_token: str) -> JSONResponse:
 def _is_guest_thread_id(thread_id: str) -> bool:
     cleaned = (thread_id or "").strip().lower()
     return cleaned.startswith("guest_") and bool(re.fullmatch(r"guest_[0-9a-f]+", cleaned))
+
+
+def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    user = get_user_by_session_token(token)
+    if user is None:
+        if not _is_guest_thread_id(thread_id):
+            raise HTTPException(status_code=401, detail="请先登录。")
+        return None
+    if not is_thread_owned_by_user(int(user["id"]), thread_id):
+        raise HTTPException(status_code=404, detail="无权访问该会话。")
+    return user
+
+
+class TravelReplanRequest(BaseModel):
+    message: str
+    search_enabled: bool = False
+
+
+class TravelItemUpdateRequest(BaseModel):
+    locked: bool | None = None
+    status: str | None = None
 
 
 @app.get("/")
@@ -205,6 +239,201 @@ def clear_history(thread_id: str, request: Request):
         return {"status": "error", "message": str(exc)}
 
 
+@app.get("/travel/plans/{thread_id}")
+def get_travel_plan(thread_id: str, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
+        return {
+            "status": "success",
+            "plan": asdict(plan) if plan else None,
+            "versions": list_plan_versions(thread_id, user_id=int(user["id"]) if user else None),
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/travel/plans/{thread_id}/calendar")
+def get_travel_calendar(thread_id: str, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
+        if plan is None:
+            return {"status": "success", "plan_id": None, "version": None, "days": []}
+        return {
+            "status": "success",
+            "plan_id": plan.plan_id,
+            "version": plan.version,
+            "timezone": plan.timezone,
+            "days": [
+                {
+                    "date": day.date,
+                    "day_number": day.day_number,
+                    "title": day.title,
+                    "summary": day.summary,
+                    "item_count": len(day.items),
+                    "has_conflicts": day.has_conflicts,
+                }
+                for day in plan.days
+            ],
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/travel/plans/{thread_id}/days/{date_text}")
+def get_travel_day(thread_id: str, date_text: str, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "该会话还没有旅行计划。"}, status_code=404)
+        day = next((item for item in plan.days if item.date == date_text), None)
+        if day is None:
+            return JSONResponse({"status": "error", "message": "该日期不在当前旅行计划中。"}, status_code=404)
+        return {"status": "success", "plan_id": plan.plan_id, "version": plan.version, "day": asdict(day)}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/travel/plans/{thread_id}/versions/{version}")
+def get_travel_plan_version(thread_id: str, version: int, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        plan = get_plan_version(thread_id, version, user_id=int(user["id"]) if user else None)
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "计划版本不存在。"}, status_code=404)
+        return {"status": "success", "plan": asdict(plan)}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.patch("/travel/plans/{thread_id}/items/{item_id}")
+def update_travel_item(
+    thread_id: str,
+    item_id: str,
+    payload: TravelItemUpdateRequest,
+    request: Request,
+):
+    allowed_statuses = {"suggested", "confirmed", "booked", "skipped", "cancelled"}
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        current_plan = get_current_plan(thread_id, user_id=user_id)
+        if current_plan is None:
+            return JSONResponse({"status": "error", "message": "该会话还没有旅行计划。"}, status_code=404)
+        if payload.locked is None and payload.status is None:
+            return JSONResponse({"status": "error", "message": "请提供 locked 或 status。"}, status_code=400)
+        if payload.status is not None and payload.status not in allowed_statuses:
+            return JSONResponse({"status": "error", "message": "不支持的计划项状态。"}, status_code=400)
+
+        updated_plan = deepcopy(current_plan)
+        target = None
+        for day in updated_plan.days:
+            for item in day.items:
+                if item.item_id == item_id:
+                    target = item
+                    break
+            if target is not None:
+                break
+        if target is None:
+            return JSONResponse({"status": "error", "message": "计划项不存在。"}, status_code=404)
+
+        if payload.status is not None:
+            target.status = payload.status
+            if payload.status in {"confirmed", "booked"}:
+                target.locked = True
+            elif payload.locked is None:
+                target.locked = False
+        if payload.locked is not None:
+            target.locked = payload.locked
+            if payload.status is None:
+                target.status = "confirmed" if payload.locked else "suggested"
+
+        saved_plan = save_plan_version(
+            updated_plan,
+            user_id=user_id,
+            change_summary=f"更新计划项：{target.title}",
+        )
+        return {
+            "status": "success",
+            "plan": asdict(saved_plan),
+            "item": asdict(next(item for day in saved_plan.days for item in day.items if item.item_id == item_id)),
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except PermissionError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=403)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.post("/travel/plans/{thread_id}/replan")
+def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        current_plan = get_current_plan(thread_id, user_id=user_id)
+        if current_plan is None:
+            return JSONResponse({"status": "error", "message": "该会话还没有可重规划的旅行计划。"}, status_code=404)
+        if not payload.message.strip():
+            return JSONResponse({"status": "error", "message": "请描述想怎么调整行程。"}, status_code=400)
+
+        response = plan_travel(
+            payload.message.strip(),
+            [],
+            thread_id=thread_id,
+            search_enabled=payload.search_enabled,
+            current_plan=current_plan,
+        )
+        if response.trip_plan is None:
+            return JSONResponse({"status": "error", "message": "本次没有生成新的旅行计划。"}, status_code=502)
+        saved_plan = save_plan_version(
+            response.trip_plan,
+            user_id=user_id,
+            change_summary=payload.message.strip()[:120],
+        )
+        response.trip_plan = saved_plan
+        response.sources = saved_plan.sources
+        response.conflicts = saved_plan.conflicts
+        rendered = render_travel_response(response)
+        save_travel_turn(
+            thread_id=thread_id,
+            user_id=user_id,
+            role="user",
+            content=payload.message.strip(),
+            search_enabled=payload.search_enabled,
+        )
+        save_travel_turn(
+            thread_id=thread_id,
+            user_id=user_id,
+            role="assistant",
+            content=rendered,
+            search_enabled=payload.search_enabled,
+            plan=saved_plan,
+        )
+        return {
+            "status": "success",
+            "plan": asdict(saved_plan),
+            "final_text": rendered,
+            "sources": [asdict(source) for source in saved_plan.sources],
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except PermissionError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=403)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
 @app.post("/chat")
 async def chat(
     request: Request,
@@ -254,13 +483,17 @@ async def chat(
             seen_text = ""
             assistant_activities = []
             assistant_sources = []
+            travel_plan = None
 
-            for chunk, _metadata in stream_chat(
+            for chunk, metadata in stream_chat(
                 message=message,
                 thread_id=thread_id,
                 search_enabled=search_enabled,
                 attachments=attachments,
+                user_id=int(user["id"]) if user is not None else None,
             ):
+                if isinstance(metadata, dict) and metadata.get("trip_plan"):
+                    travel_plan = metadata["trip_plan"]
                 for activity in consume_activity_log():
                     assistant_activities.append(activity)
                     yield _sse_event("activity", activity)
@@ -300,6 +533,22 @@ async def chat(
                 assistant_sources.append(source)
                 yield _sse_event("source", source)
 
+            context_plan = consume_travel_plan()
+            if context_plan:
+                travel_plan = travel_plan or context_plan
+            if travel_plan:
+                for source in travel_plan.get("sources", []):
+                    if not isinstance(source, dict):
+                        continue
+                    source_key = source.get("evidence_id") or source.get("url") or source.get("title")
+                    if any(
+                        (item.get("evidence_id") or item.get("url") or item.get("title")) == source_key
+                        for item in assistant_sources
+                    ):
+                        continue
+                    assistant_sources.append(source)
+                    yield _sse_event("source", source)
+
             seen_text_with_metadata = seen_text + encode_assistant_metadata(assistant_activities, assistant_sources)
             try:
                 attach_assistant_metadata(thread_id, seen_text, assistant_activities, assistant_sources)
@@ -322,6 +571,7 @@ async def chat(
                     "activities": assistant_activities,
                     "sources": assistant_sources,
                     "final_text": seen_text_with_metadata,
+                    "trip_plan": travel_plan,
                     "attachments": [
                         {
                             "name": attachment["name"],
