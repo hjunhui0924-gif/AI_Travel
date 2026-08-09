@@ -140,14 +140,15 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ### Phase 5：外部环境联调与失败降级
 
-- 状态：已完成；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，Flight MCP 当前未配置可用数据源。
+- 状态：已完成本轮联调与审查；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，VariFlight 已完成真实航班查询联调，当前仅待提交。
 - 目标：确认 `.env` 中的凭证不仅存在，而且真实请求、响应解析和业务降级链路可用。
 - 高德证据：地理编码、天气、文本 POI、周边 POI、步行路线、驾车路线和公交路线均返回成功；请求加入节流/重试/缓存。
 - 12306 证据：广州南 -> 深圳北，动态未来日期返回 579 条原始车次；加入站点字典缓存、单请求超时和 45 秒总超时后，本次健康检查约 1.3 秒完成。
 - Tavily 证据：真实搜索返回 5 条发现结果；搜索仍只有在 `search_enabled=true` 时允许进入旅行发现层。
 - Ctrip 证据：`https://m.ctrip.com/html5/flight/sha-hgh-day-8.html` 返回 HTTP 432，正文为 `whaleguard block`；当前 H5 爬虫不可作为生产航班源，不再尝试绕过风控。
-- Flight MCP 证据：当前 `.env` 未设置 `FLIGHT_MCP_ENABLED/FLIGHT_MCP_MODE`；强制启用已安装的 `package` 模式进行真实查询无法得到航班结果，最终被 45 秒 bridge 总超时截断，不能视为可用航班结果。
-- 解决方案：航班正式接入必须配置已授权的 Flight MCP 命令/HTTP 服务或官方/合作方 API；未配置或失败时返回 `not_configured/failed` 和提醒，不显示价格、班次或可预订暗示。Ctrip H5 只保留探测能力。
+- Flight MCP 旧路径证据：未配置或 package/command/http provider 失败时仍返回明确的 `not_configured/failed`，不显示价格、班次或可预订暗示；Ctrip H5 只保留探测能力。
+- VariFlight 证据：当前 `.env` 已配置 `FLIGHT_MCP_ENABLED=true`、`FLIGHT_MCP_MODE=variflight` 及授权凭证；`python -m services.integration_health --live --only variflight` 与 `--only flight_mcp` 均已返回成功，上海（SHA）到杭州（HGH）样例返回 1 条可售航班且 provider 库存数量可解析。
+- 解决方案：生产航班只走已授权的 VariFlight/Flight MCP/官方合作 API；任何 provider 失败都进入结构化诊断，VariFlight 的价格、舱位和 `seat_count` 仅代表查询时的候选信息，不代表锁座或出票。
 
 ## 9. 每阶段必须检查的坑
 
@@ -218,3 +219,16 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 首次旅行计划路径明确传 `expected_version=0`；日期外锁定项保存在 `out_of_range_items`，同日重复项目经过全局 ID 去重；航班、铁路和路线 partial/failed 状态会保留可用结果并进入 diagnostics。
 
 最终验证证据（后端基线 + 外部联调修复）：`python -m pytest -q` 为 **58 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。`FRONTEND_HANDOFF.md` 的 TravelPlan `adapter_status/diagnostics` 契约仍然有效。
+
+## 12. VariFlight 航班接入增量（2026-08-09）
+
+- 状态：已完成本轮实现、完整验证、对抗式审查并提交到当前分支。
+- `.env` 已提供 `VARIFLIGHT_API_KEY` 与 `VARIFLIGHT_API_URL`；密钥不得写入日志、文档、测试输出或提交记录。
+- 正式请求使用 VariFlight MCP HTTP 的 `getFlightPriceByCities`，输入城市 IATA 码和 `Asia/Shanghai` 下的出发日期；机场码会先转换为城市码。
+- 已验证的真实样例是上海（SHA）到杭州（HGH），返回航班号、跨午夜起降时间、价格、舱位和 provider 返回的可售数量。
+- `seat_count` 只表示选中票价舱位的 provider 可售数量；`null` 表示未知，不代表锁座、出票或预订保证。已暴露到 `TransportOption` 和持久化 `PlanItem`。
+- provider 错误、HTTP/鉴权错误、网络错误和响应结构变化不得降级为空航班；应进入 `failed/not_configured` 诊断。已知零库存舱位不作为可售候选。
+- Ctrip H5 继续只做风控探测，不绕过 WhaleGuard；Flight MCP 的旧 command/http/package 路径保持兼容，VariFlight 模式直接走授权 HTTP adapter；显式旧模式优先，不会因凭证存在而静默抢占。
+- 非空但结构异常的 provider 响应会进入 `schema_changed/failed`；混合有效/异常行保留有效结果并进入 `partial` 诊断；未知三字母码要求配置映射，避免把机场码盲传为城市码。
+- 完整验证已完成：`python -m pytest -q` 为 **80 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。
+- 实时验证已完成：VariFlight 与 `flight_mcp` 单项检查均 `success`，返回 1 条航班且 `seat_count_known=1`；全量检查中高德、12306（579 条）、Tavily（5 条）和 VariFlight 成功，Flight MCP 以 alias 复用且未重复请求，Ctrip H5 仍为已知 `blocked/HTTP 432`，全量 `overall_status=needs_attention` 属于预期边界。

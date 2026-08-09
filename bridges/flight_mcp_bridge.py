@@ -15,6 +15,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from adapters.ctrip_flight_adapter import search_ctrip_h5_flights
+from adapters.variflight_adapter import search_variflight_flights
 
 
 class FlightBridgeError(RuntimeError):
@@ -246,6 +247,8 @@ def main() -> int:
             flights = _search_via_installed_package(origin, destination, date)
         elif mode == "ctrip_h5":
             flights = search_ctrip_h5_flights(origin, destination, date)
+        elif mode == "variflight":
+            flights = search_variflight_flights(origin, destination, date)
         elif mode == "auto":
             flights = _search_via_auto(origin, destination, date)
         elif mode == "dummy" and os.getenv("FLIGHT_ALLOW_DEMO_DATA", "").strip().lower() in {"1", "true", "yes", "on"}:

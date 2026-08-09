@@ -40,3 +40,42 @@ def test_live_health_check_exposes_ctrip_block(monkeypatch):
     assert len(checks) == 1
     assert checks[0].status == "blocked"
     assert checks[0].details["http_status"] == 432
+
+
+def test_live_health_check_reports_variflight_results(monkeypatch):
+    monkeypatch.setenv("VARIFLIGHT_API_KEY", "test-key")
+    monkeypatch.setattr(
+        integration_health,
+        "search_variflight_flights",
+        lambda *args: [{"flight_no": "MU6549"}, {"flight_no": "CZ3969"}],
+    )
+
+    checks = integration_health.run_integration_health_checks(live=True, only={"variflight"})
+
+    assert len(checks) == 1
+    assert checks[0].provider == "variflight"
+    assert checks[0].status == "success"
+    assert checks[0].details["count"] == 2
+
+
+def test_health_check_does_not_query_variflight_twice_for_flight_mcp_alias(monkeypatch):
+    calls = []
+    monkeypatch.setenv("VARIFLIGHT_API_KEY", "test-key")
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "variflight")
+
+    def fake_search(*args):
+        calls.append(args)
+        return [{"flight_no": "MU6549", "seat_count": 10}]
+
+    monkeypatch.setattr(integration_health, "search_variflight_flights", fake_search)
+
+    checks = integration_health.run_integration_health_checks(
+        live=True,
+        only={"variflight", "flight_mcp"},
+    )
+
+    assert len(calls) == 1
+    assert {check.provider: check.status for check in checks} == {
+        "variflight": "success",
+        "flight_mcp": "alias",
+    }

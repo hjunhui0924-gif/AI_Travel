@@ -7,6 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from adapters.variflight_adapter import (
+    is_variflight_configured,
+    search_variflight_flights,
+)
+
 
 class FlightQueryError(RuntimeError):
     pass
@@ -33,7 +38,13 @@ def _flight_mcp_mode() -> str:
 
 
 def is_flight_mcp_enabled() -> bool:
-    return bool(_flight_mcp_mode())
+    mode = _flight_mcp_mode()
+    if mode == "variflight":
+        # An explicitly selected provider is not usable until its own
+        # credentials are valid.  This lets the planner expose
+        # ``not_configured`` instead of a misleading provider failure.
+        return is_variflight_configured()
+    return bool(mode)
 
 
 def _normalize_flight_items(payload: object) -> list[dict]:
@@ -165,6 +176,9 @@ def search_flights(origin: str, destination: str, date: str) -> list[dict]:
         return []
 
     mode = _flight_mcp_mode()
+    if mode == "variflight":
+        return search_variflight_flights(origin, destination, date)
+
     if mode in {"command", "auto", "package", "http", "dummy", "ctrip_h5"}:
         bridge_mode = "auto" if mode == "command" else mode
         return _search_flights_via_command(origin, destination, date, bridge_mode=bridge_mode)

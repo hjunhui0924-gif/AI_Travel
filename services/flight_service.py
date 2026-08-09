@@ -125,12 +125,17 @@ def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
     if not query.origin or not query.destination or not query.date:
         return FlightOptionsResult()
 
-    provider_options = search_flights(query.origin, query.destination, query.date) or []
+    provider_options = search_flights(query.origin, query.destination, query.date)
+    if provider_options is None:
+        provider_options = []
+    provider_errors = list(getattr(provider_options, "errors", []) or [])
     if not isinstance(provider_options, (list, tuple)):
         provider_options = []
     raw_options = [item for item in provider_options if isinstance(item, dict)]
 
-    errors = [] if len(raw_options) == len(provider_options) else ["malformed provider row"]
+    errors = list(provider_errors)
+    if len(raw_options) != len(provider_options):
+        errors.append("malformed provider row")
     results = FlightOptionsResult(errors=errors)
     for item in _select_recommended_flights(raw_options, limit=5):
         try:
@@ -161,6 +166,7 @@ def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
                     is_demo=bool(item.get("is_demo", False)),
                     depart_date=depart_date,
                     arrive_date=arrive_date,
+                    seat_count=item.get("seat_count"),
                 )
             )
         except Exception:

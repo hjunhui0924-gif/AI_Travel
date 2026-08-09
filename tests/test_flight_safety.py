@@ -86,3 +86,37 @@ def test_flight_command_timeout_is_reported_and_process_tree_is_terminated(monke
         flight_mcp_adapter._search_flights_via_command("SHA", "HGH", "2026-09-02")
 
     assert terminated == [12345]
+
+
+def test_variflight_mode_uses_the_authorized_http_adapter(monkeypatch):
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "variflight")
+    monkeypatch.setenv("VARIFLIGHT_API_KEY", "test-key")
+    monkeypatch.setenv("VARIFLIGHT_API_URL", "https://example.test/mcp")
+    monkeypatch.setattr(
+        flight_mcp_adapter,
+        "search_variflight_flights",
+        lambda origin, destination, date: [
+            {"flight_no": "MU6549", "origin": origin, "destination": destination, "date": date}
+        ],
+    )
+
+    results = flight_mcp_adapter.search_flights("SHA", "HGH", "2026-08-16")
+
+    assert results[0]["flight_no"] == "MU6549"
+
+
+def test_variflight_mode_is_not_enabled_without_provider_credentials(monkeypatch):
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "variflight")
+    monkeypatch.delenv("VARIFLIGHT_API_KEY", raising=False)
+
+    assert flight_mcp_adapter.is_flight_mcp_enabled() is False
+    assert flight_mcp_adapter.search_flights("SHA", "HGH", "2026-08-16") == []
+
+
+def test_explicit_legacy_flight_mode_wins_over_variflight_credentials(monkeypatch):
+    monkeypatch.setenv("FLIGHT_MCP_ENABLED", "true")
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "package")
+    monkeypatch.setenv("VARIFLIGHT_API_KEY", "test-key")
+    monkeypatch.setenv("VARIFLIGHT_API_URL", "https://example.test/mcp")
+
+    assert flight_mcp_adapter._flight_mcp_mode() == "package"

@@ -54,6 +54,10 @@ class TransportOption:
     # unambiguous to the calendar and to the itinerary renderer.
     depart_date: str = ""
     arrive_date: str = ""
+    # Provider-reported available seats for a selected fare, when supplied.
+    # ``None`` means the provider did not expose a reliable seat count.
+    seat_count: int | None = None
+    source_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -166,6 +170,10 @@ class PlanItem:
     # cross-midnight transport or other multi-day arrangements.
     end_date: str = ""
     is_demo: bool = False
+    # Provider-reported available seats for a selected transport fare.  This
+    # is informational only; it never means a seat was held or a ticket was
+    # issued.
+    seat_count: int | None = None
 
 
 @dataclass(slots=True)
@@ -214,6 +222,9 @@ class TravelPlan:
     # during a replan.  Keep this field at the end for positional backwards
     # compatibility with older TravelPlan constructors.
     out_of_range_items: list[PlanItem] = field(default_factory=list)
+    # Keep the provider-backed transport candidates alongside the selected
+    # calendar item so HTTP consumers never need to parse rendered text.
+    transport_options: list[TransportOption] = field(default_factory=list)
 
 
 @dataclass(slots=True)

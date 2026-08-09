@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from adapters.amap_adapter import plan_route, search_pois, search_pois_around_location
 from adapters.ctrip_flight_adapter import probe_ctrip_flight_page
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
+from adapters.variflight_adapter import is_variflight_configured, search_variflight_flights
 from adapters.rail_12306_adapter import query_left_tickets
 from services.travel_search import _default_searcher
 from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
@@ -31,8 +32,9 @@ from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CN_TZ = ZoneInfo("Asia/Shanghai")
-LIVE_OK_STATUSES = {"success", "not_configured", "not_requested"}
-PROVIDERS = ("amap", "rail_12306", "tavily", "ctrip_h5", "flight_mcp")
+LIVE_OK_STATUSES = {"success", "alias", "not_configured", "not_requested"}
+PROVIDERS = ("amap", "rail_12306", "tavily", "ctrip_h5", "variflight", "flight_mcp")
+DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "ctrip_h5", "variflight")
 
 
 def _now_label() -> str:
@@ -46,6 +48,7 @@ def _safe_error(exc: Exception) -> str:
         "TAVILY_API_KEY",
         "FLIGHT_MCP_HTTP_URL",
         "FLIGHT_MCP_COMMAND",
+        "VARIFLIGHT_API_KEY",
     ):
         secret = os.getenv(name, "")
         if secret:
@@ -256,10 +259,42 @@ def _check_flight_mcp() -> tuple[str, str, dict[str, Any]]:
     }
 
 
+def _flight_mcp_uses_variflight() -> bool:
+    return os.getenv("FLIGHT_MCP_MODE", "").strip().lower() == "variflight"
+
+
+def _check_variflight() -> tuple[str, str, dict[str, Any]]:
+    if not is_variflight_configured():
+        return "not_configured", "未配置 VariFlight API Key 或有效 API URL。", {}
+    query_date, origin, destination = _flight_query_parameters()
+    options = search_variflight_flights(origin, destination, query_date)
+    errors = list(getattr(options, "errors", []) or [])
+    if errors:
+        status = "partial" if options else "failed"
+        message = "VariFlight 部分航班行解析失败。" if options else "VariFlight 航班响应结构无有效行。"
+    else:
+        status = "success" if options else "empty"
+        message = (
+            f"VariFlight 返回 {len(options)} 条可售航班候选。"
+            if options
+            else "VariFlight 请求成功但没有可售航班候选。"
+        )
+    details = {
+        "date": query_date,
+        "origin": origin,
+        "destination": destination,
+        "count": len(options),
+        "seat_count_known": sum(item.get("seat_count") is not None for item in options),
+    }
+    if errors:
+        details["errors"] = errors
+    return status, message, details
+
+
 def run_integration_health_checks(
     *, live: bool = False, only: set[str] | None = None
 ) -> list[IntegrationCheck]:
-    selected = set(only or PROVIDERS)
+    selected = set(DEFAULT_PROVIDERS if only is None else only)
     checks: list[IntegrationCheck] = []
     if "amap" in selected:
         checks.append(
@@ -293,14 +328,39 @@ def run_integration_health_checks(
                 _check_ctrip if live else lambda: ("not_requested", "未执行实时携程 H5 检查。", {}),
             )
         )
-    if "flight_mcp" in selected:
+    if "variflight" in selected:
         checks.append(
             _run(
-                "flight_mcp",
-                is_flight_mcp_enabled(),
-                _check_flight_mcp if live else lambda: ("not_requested", "未执行实时 Flight MCP 检查。", {}),
+                "variflight",
+                is_variflight_configured(),
+                _check_variflight if live else lambda: ("not_requested", "未执行实时 VariFlight 检查。", {}),
             )
         )
+    if "flight_mcp" in selected:
+        if "variflight" in selected and _flight_mcp_uses_variflight():
+            checks.append(
+                IntegrationCheck(
+                    provider="flight_mcp",
+                    status=("alias" if is_flight_mcp_enabled() else "not_configured")
+                    if live
+                    else "not_requested",
+                    configured=is_flight_mcp_enabled(),
+                    message=(
+                        "Flight MCP 复用本轮 VariFlight 检查，未重复请求。"
+                        if live and is_flight_mcp_enabled()
+                        else "未执行实时 Flight MCP 检查。"
+                    ),
+                    details={"alias_of": "variflight", "request_skipped": True},
+                )
+            )
+        else:
+            checks.append(
+                _run(
+                    "flight_mcp",
+                    is_flight_mcp_enabled(),
+                    _check_flight_mcp if live else lambda: ("not_requested", "未执行实时 Flight MCP 检查。", {}),
+                )
+            )
     return checks
 
 

@@ -16,7 +16,7 @@
 ## 主要能力
 
 - 旅行问答工作台：围绕“从哪里出发、什么时候走、到哪里、怎么去”来组织回答
-- 机票查询链路：支持通过 Flight MCP Bridge / Ctrip 适配层接入航班数据
+- 机票查询链路：支持通过 VariFlight、Flight MCP Bridge 接入授权航班数据；携程 H5 仅保留探测能力
 - 高铁查询链路：支持 12306 方向的高铁信息整理
 - 路线规划：支持地点解析、城市内路径建议与周边推荐
 - 天气辅助：支持高德天气查询，为出行建议补充天气上下文
@@ -82,6 +82,7 @@ AI_Agent/
 │   ├── amap_adapter.py
 │   ├── ctrip_flight_adapter.py
 │   ├── flight_mcp_adapter.py
+│   ├── variflight_adapter.py
 │   └── rail_12306_adapter.py
 ├── bridges/
 │   └── flight_mcp_bridge.py
@@ -175,6 +176,12 @@ http://127.0.0.1:8000
 - `FLIGHT_MCP_TIMEOUT_SECONDS`
 - `FLIGHT_BRIDGE_MODE`
 - `FLIGHT_MCP_HTTP_URL`
+- `VARIFLIGHT_API_KEY`
+- `VARIFLIGHT_API_URL`
+- `VARIFLIGHT_HTTP_TIMEOUT_SECONDS`
+- `VARIFLIGHT_MAX_RETRIES`
+- `VARIFLIGHT_RETRY_BACKOFF_SECONDS`
+- `VARIFLIGHT_CITY_CODE_ALIASES_JSON`
 
 ### 观测
 
@@ -195,6 +202,7 @@ http://127.0.0.1:8000
 支持的接入方式包括：
 
 - 本地 `bridges/flight_mcp_bridge.py`
+- VariFlight 官方航班 MCP HTTP provider
 - Flight MCP 兼容命令
 - 兼容 HTTP 返回的航班服务
 - 本地演示 dummy 数据（仅测试，默认禁止）
@@ -203,13 +211,21 @@ http://127.0.0.1:8000
 
 ```env
 FLIGHT_MCP_ENABLED=true
-FLIGHT_MCP_MODE=command
-FLIGHT_MCP_COMMAND=python bridges\\flight_mcp_bridge.py
-FLIGHT_BRIDGE_MODE=package
-FLIGHT_MCP_TIMEOUT_SECONDS=45
+FLIGHT_MCP_MODE=variflight
+VARIFLIGHT_API_KEY=your_key
+VARIFLIGHT_API_URL=https://mcp.variflight.com/api/v1/mcp/data
+VARIFLIGHT_HTTP_TIMEOUT_SECONDS=20
+VARIFLIGHT_MAX_RETRIES=1
 ```
 
-航班数据源必须是已授权且能稳定返回结构化数据的 Flight MCP、HTTP 服务或命令适配器。
+`FLIGHT_MCP_MODE=variflight` must be explicit; a VariFlight key will not silently
+override an existing command/package/http provider. Unknown three-letter codes
+are rejected instead of being sent as city codes. Extend the built-in map with
+`VARIFLIGHT_CITY_CODE_ALIASES_JSON`, for example `{"LJG":"LJG"}`.
+
+`variflight` 模式通过 VariFlight 的 `getFlightPriceByCities` 接口查询航班方案、价格、舱位和 provider 返回的可售数量；它要求城市/机场能转换为 IATA 城市码。结果仍然只是实时查询候选，不代表已经锁座、出票或自动订票。
+
+航班数据源必须是已授权且能稳定返回结构化数据的 VariFlight、Flight MCP、HTTP 服务或命令适配器。
 携程 H5 探测仅用于判断页面是否可访问；当前实测会受到 `whaleguard`/HTTP 432 风控，不能作为生产航班数据源，也不能通过继续伪装请求来绕过风控。
 
 ## 外部服务联调
@@ -227,6 +243,7 @@ python -m services.integration_health --live --only amap
 python -m services.integration_health --live --only rail_12306
 python -m services.integration_health --live --only tavily
 python -m services.integration_health --live --only ctrip_h5
+python -m services.integration_health --live --only variflight
 python -m services.integration_health --live --only flight_mcp
 ```
 

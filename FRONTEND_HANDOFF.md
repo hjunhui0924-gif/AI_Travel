@@ -166,6 +166,7 @@ data: {
   "preferences": ["美食", "慢游"],
   "summary": "...",
   "days": [],
+  "transport_options": [],
   "out_of_range_items": [],
   "facts": [],
   "constraints": [],
@@ -225,6 +226,39 @@ data: {
   "travel_minutes": null,
   "confidence": "source_backed",
   "end_date": "2026-09-03",
+  "is_demo": false,
+  "seat_count": 10
+  }
+  ```
+
+`seat_count` is the provider-reported available quantity for the selected
+fare. `null` means no reliable count was supplied. It is informational only:
+it does not hold a seat, issue a ticket, or guarantee booking.
+
+### `TravelPlan.transport_options`
+
+The complete provider-backed candidate list is structured here; do not parse
+the rendered chat text. Each option includes `mode`, `title`, `depart_date`,
+`arrive_date`, `depart_time`, `arrive_time`, `duration`, `price`, `provider`,
+`seats` (airline/cabin/airport labels), `seat_count`, `source_ids`, and
+`is_demo`. `source_ids` point to `TravelPlan.sources`. A non-null
+`seat_count` is still only a query-time provider quantity and never a booking
+or ticket guarantee.
+
+```json
+{
+  "mode": "flight",
+  "title": "MU6549",
+  "depart_date": "2026-08-16",
+  "arrive_date": "2026-08-17",
+  "depart_time": "23:30",
+  "arrive_time": "00:40",
+  "duration": "1h10m",
+  "price": "230",
+  "provider": "VariFlight",
+  "seats": ["MU", "经济舱", "上海浦东(PVG) T1 -> 杭州萧山(HGH) T3"],
+  "seat_count": 10,
+  "source_ids": ["transport_001_flight"],
   "is_demo": false
 }
 ```

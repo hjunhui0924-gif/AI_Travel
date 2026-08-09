@@ -2,7 +2,7 @@ import json
 import sqlite3
 import pytest
 
-from agents.schemas import PlanDay, PlanItem, TravelPlan
+from agents.schemas import PlanDay, PlanItem, TransportOption, TravelPlan
 from services.travel_store import PlanVersionConflict, TravelPlanStore
 
 
@@ -28,6 +28,7 @@ def make_plan(thread_id: str = "guest_store_test") -> TravelPlan:
                         date="2026-09-02",
                         status="confirmed",
                         locked=True,
+                        seat_count=6,
                     )
                 ],
             ),
@@ -38,7 +39,18 @@ def make_plan(thread_id: str = "guest_store_test") -> TravelPlan:
 
 def test_plan_versions_and_nested_items_survive_round_trip(tmp_path):
     store = TravelPlanStore(tmp_path / "travel.db")
-    first = store.save_plan_version(make_plan(), user_id=7, change_summary="首次生成")
+    plan = make_plan()
+    plan.transport_options = [
+        TransportOption(
+            mode="flight",
+            title="MU6549",
+            provider="VariFlight",
+            price="230",
+            seat_count=10,
+            source_ids=["transport_001_flight"],
+        )
+    ]
+    first = store.save_plan_version(plan, user_id=7, change_summary="首次生成")
     first.days[0].items[0].detail = "不要自动替换"
     second = store.save_plan_version(first, user_id=7, change_summary="调整偏好")
 
@@ -48,6 +60,8 @@ def test_plan_versions_and_nested_items_survive_round_trip(tmp_path):
     assert second.previous_version == 1
     assert store.get_current_plan("guest_store_test", user_id=7).version == 2
     assert store.get_plan_version("guest_store_test", 1, user_id=7).days[0].items[0].locked is True
+    assert store.get_plan_version("guest_store_test", 1, user_id=7).days[0].items[0].seat_count == 6
+    assert store.get_plan_version("guest_store_test", 1, user_id=7).transport_options[0].seat_count == 10
     assert [item["version"] for item in store.list_versions("guest_store_test", user_id=7)] == [2, 1]
 
 

@@ -26,6 +26,7 @@ from agents.schemas import (
     Evidence,
     PlanDay,
     PlanItem,
+    TransportOption,
     TravelConstraint,
     TravelFact,
     TravelPlan,
@@ -116,6 +117,7 @@ def _rebuild_plan_item(raw_item: object, day: str) -> PlanItem | None:
             "confidence": "unknown",
             "end_date": "",
             "is_demo": False,
+            "seat_count": None,
         },
     )
     item_values["source_ids"] = _list_value(item_values.get("source_ids"))
@@ -208,6 +210,33 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
                 )
             )
 
+    transport_options = []
+    for raw_option in payload.get("transport_options") or []:
+        if isinstance(raw_option, dict):
+            option_values = _field_values(
+                TransportOption,
+                raw_option,
+                {
+                    "mode": "flight",
+                    "title": "",
+                    "depart_time": "",
+                    "arrive_time": "",
+                    "duration": "",
+                    "price": "",
+                    "summary": "",
+                    "provider": "",
+                    "seats": [],
+                    "is_demo": False,
+                    "depart_date": "",
+                    "arrive_date": "",
+                    "seat_count": None,
+                    "source_ids": [],
+                },
+            )
+            option_values["seats"] = _list_value(option_values.get("seats"))
+            option_values["source_ids"] = _list_value(option_values.get("source_ids"))
+            transport_options.append(TransportOption(**option_values))
+
     sources = []
     for raw_source in payload.get("sources") or []:
         if isinstance(raw_source, dict):
@@ -265,6 +294,7 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             "preferences": [],
             "summary": "",
             "out_of_range_items": [],
+            "transport_options": [],
             "conflicts": [],
             "risks": [],
             "alerts": [],
@@ -287,6 +317,7 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
     values["facts"] = facts
     values["constraints"] = constraints
     values["sources"] = sources
+    values["transport_options"] = transport_options
     # A malformed/old row should not make a thread impossible to open.
     return TravelPlan(**values)
 

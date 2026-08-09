@@ -1,4 +1,5 @@
 from agents import travel_agent
+from adapters.variflight_adapter import VariFlightError
 from agents.schemas import Evidence, PlanDay, PlanItem, PoiRecommendation, TransportOption, TravelPlan
 from services import poi_recommender
 from services.rail_service import RailOptionsResult
@@ -199,6 +200,7 @@ def test_overnight_transport_keeps_arrival_date_on_plan_item(monkeypatch):
         arrive_time="01:20",
         duration="2小时10分",
         provider="12306",
+        seat_count=6,
     )
     monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [overnight])
@@ -216,10 +218,27 @@ def test_overnight_transport_keeps_arrival_date_on_plan_item(monkeypatch):
     item = response.trip_plan.days[0].items[0]
     assert item.date == "2026-09-02"
     assert item.end_date == "2026-09-03"
+    assert item.seat_count == 6
     assert response.trip_plan.days[1].items[0].item_type == "transport_arrival"
     assert response.trip_plan.days[1].items[0].start_time == "01:20"
     assert response.timeline[0].date == "2026-09-02"
     assert response.timeline[0].end_date == "2026-09-03"
+
+
+def test_flight_failure_detail_keeps_provider_diagnostics_structured():
+    error = VariFlightError(
+        "provider rejected request",
+        failure_kind="unauthorized",
+        http_status=401,
+        provider_code="AUTH001",
+    )
+
+    detail = travel_agent._flight_failure_detail(error)
+
+    assert "kind=unauthorized" in detail
+    assert "http_status=401" in detail
+    assert "provider_code=AUTH001" in detail
+    assert "provider rejected request" not in detail
 
 
 def test_replan_replaces_same_id_suggestion_with_locked_snapshot(monkeypatch):

@@ -384,13 +384,21 @@ def _transport_evidence(options: list[TransportOption]) -> list[Evidence]:
     for index, option in enumerate(options, start=1):
         provider = option.provider or "unknown"
         source_type = "rail_realtime" if option.mode == "rail" else "flight_realtime"
+        evidence_id = f"transport_{index:03d}_{option.mode}"
+        option.source_ids = [evidence_id]
         result.append(
             Evidence(
-                evidence_id=f"transport_{index:03d}_{option.mode}",
+                evidence_id=evidence_id,
                 source_type=source_type,
                 provider=provider,
                 title=option.title,
-                url="https://kyfw.12306.cn/" if option.mode == "rail" else "",
+                url=(
+                    "https://kyfw.12306.cn/"
+                    if option.mode == "rail"
+                    else "https://mcp.variflight.com/"
+                    if provider.lower() == "variflight"
+                    else ""
+                ),
                 snippet=(
                     f"{option.depart_date or ''} {option.depart_time} -> "
                     f"{option.arrive_date or ''} {option.arrive_time} {option.duration}"
@@ -403,6 +411,22 @@ def _transport_evidence(options: list[TransportOption]) -> list[Evidence]:
             )
         )
     return result
+
+
+def _flight_failure_detail(exc: Exception) -> str:
+    """Expose safe provider diagnostics without copying response bodies or keys."""
+
+    parts = [f"flight adapter failed: {type(exc).__name__}"]
+    failure_kind = str(getattr(exc, "failure_kind", "") or "")
+    http_status = getattr(exc, "http_status", 0)
+    provider_code = str(getattr(exc, "provider_code", "") or "")
+    if failure_kind:
+        parts.append(f"kind={failure_kind}")
+    if http_status:
+        parts.append(f"http_status={http_status}")
+    if provider_code:
+        parts.append(f"provider_code={provider_code}")
+    return " ".join(parts)
 
 
 def _route_evidence(routes: list[RoutePlan]) -> list[Evidence]:
@@ -443,6 +467,7 @@ def _new_plan_item(
     confidence: str = "unknown",
     end_date: str = "",
     is_demo: bool = False,
+    seat_count: int | None = None,
 ) -> PlanItem:
     return PlanItem(
         item_id=_stable_item_id(item_type, title, day),
@@ -459,6 +484,7 @@ def _new_plan_item(
         confidence=confidence,
         end_date=end_date,
         is_demo=is_demo,
+        seat_count=seat_count,
     )
 
 
@@ -535,6 +561,7 @@ def _build_structured_plan(
                 confidence="source_backed",
                 end_date=arrival_date if arrival_date != target_day.date else "",
                 is_demo=option.is_demo,
+                seat_count=option.seat_count,
             )
         )
         if arrival_date != target_day.date:
@@ -681,6 +708,7 @@ def _build_structured_plan(
         preferences=list(query.preferences),
         summary=_build_summary(query),
         days=days,
+        transport_options=list(transport_options),
         out_of_range_items=out_of_range_items,
         facts=facts,
         constraints=constraints,
@@ -764,7 +792,7 @@ def plan_travel(
                 )
         except Exception as exc:
             adapter_status["flight"] = "failed"
-            diagnostics.append(f"flight adapter failed: {type(exc).__name__}")
+            diagnostics.append(_flight_failure_detail(exc))
             alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
     else:
         adapter_status["flight"] = "not_requested"
@@ -933,6 +961,8 @@ def render_travel_response(response: TravelPlanResponse) -> str:
             if option.summary:
                 lines.append(f"  {option.summary}")
             if option.seats:
+                if option.seat_count is not None:
+                    lines.append(f"  provider seat count: {option.seat_count} (informational; not held)")
                 lines.append(f"  座席/说明: {' / '.join(option.seats)}")
 
     if response.route_plans:

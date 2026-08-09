@@ -1,4 +1,5 @@
 from agents.schemas import TravelQuery
+from adapters.variflight_adapter import VariFlightResults
 from services import flight_service, route_service
 
 
@@ -37,6 +38,55 @@ def test_one_malformed_flight_row_does_not_discard_valid_rows(monkeypatch):
     assert [item.title for item in results] == ["GOOD"]
     assert results.partial is True
     assert results.errors == ["row:dict"]
+
+
+def test_flight_option_preserves_provider_seat_count(monkeypatch):
+    monkeypatch.setattr(
+        flight_service,
+        "search_flights",
+        lambda *args: [
+            {
+                "flight_no": "MU6549",
+                "depart_time": "23:30",
+                "arrive_time": "00:40",
+                "depart_date": "2026-09-02",
+                "arrive_date": "2026-09-03",
+                "price": "230",
+                "seat_count": 10,
+                "cabin": "经济舱",
+                "provider": "VariFlight",
+            }
+        ],
+    )
+
+    results = flight_service.get_flight_options(_query())
+
+    assert len(results) == 1
+    assert results[0].seat_count == 10
+
+
+def test_partial_variflight_rows_reach_flight_result_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        flight_service,
+        "search_flights",
+        lambda *args: VariFlightResults(
+            [
+                {
+                    "flight_no": "MU6549",
+                    "depart_time": "10:00",
+                    "arrive_time": "11:00",
+                    "price": "230",
+                }
+            ],
+            errors=["provider_rows_schema_changed:1"],
+        ),
+    )
+
+    results = flight_service.get_flight_options(_query())
+
+    assert len(results) == 1
+    assert results.partial is True
+    assert results.errors == ["provider_rows_schema_changed:1"]
 
 
 def test_route_mode_failure_does_not_block_other_modes(monkeypatch):
