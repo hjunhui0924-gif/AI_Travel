@@ -1,8 +1,12 @@
 import json
 import os
+import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from functools import lru_cache
+from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -11,6 +15,68 @@ load_dotenv()
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
 AMAP_BASE = "https://restapi.amap.com"
+_AMAP_RATE_LOCK = threading.Lock()
+_AMAP_LAST_REQUEST_AT = 0.0
+
+
+class AmapApiError(RuntimeError):
+    """A structured error returned by an AMap Web Service request."""
+
+    def __init__(self, path: str, info: str, infocode: str = "", status: str = ""):
+        self.path = path
+        self.info = info or "高德接口调用失败"
+        self.infocode = str(infocode or "")
+        self.status = str(status or "")
+        super().__init__(
+            f"{self.info}"
+            + (f" (infocode={self.infocode})" if self.infocode else "")
+            + (f" endpoint={path}" if path else "")
+        )
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 60.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 5) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _pace_amap_request() -> None:
+    """Avoid bursts that turn a valid key into a per-key QPS failure."""
+
+    global _AMAP_LAST_REQUEST_AT
+    interval = _env_float("AMAP_MIN_REQUEST_INTERVAL_SECONDS", 0.25, maximum=5.0)
+    if interval <= 0:
+        return
+    with _AMAP_RATE_LOCK:
+        now = time.monotonic()
+        delay = interval - (now - _AMAP_LAST_REQUEST_AT)
+        if delay > 0:
+            time.sleep(delay)
+        _AMAP_LAST_REQUEST_AT = time.monotonic()
+
+
+def _is_retryable_amap_error(error: AmapApiError) -> bool:
+    message = f"{error.info} {error.infocode}".upper()
+    return any(
+        marker in message
+        for marker in (
+            "QPS",
+            "TIMEOUT",
+            "TEMPORARY",
+            "SERVICE_NOT_AVAILABLE",
+            "NETWORK",
+        )
+    )
 
 
 def current_cn_datetime() -> dict:
@@ -36,14 +102,47 @@ def _amap_get(path: str, params: dict) -> dict:
     query = urllib.parse.urlencode({**params, "key": key})
     url = f"{AMAP_BASE}{path}?{query}"
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read().decode("utf-8", errors="replace")
-    payload = json.loads(data)
-    if payload.get("status") != "1":
-        raise RuntimeError(payload.get("info", "高德接口调用失败"))
-    return payload
+    timeout = _env_float("AMAP_HTTP_TIMEOUT_SECONDS", 20.0, minimum=1.0)
+    retries = _env_int("AMAP_MAX_RETRIES", 1)
+    backoff = _env_float("AMAP_RETRY_BACKOFF_SECONDS", 0.6, maximum=10.0)
+    last_error: Exception | None = None
+
+    for attempt in range(retries + 1):
+        _pace_amap_request()
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(data)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise RuntimeError(f"高德接口请求失败: {type(exc).__name__}") from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("高德接口返回格式无效")
+
+        if payload.get("status") == "1":
+            return payload
+
+        api_error = AmapApiError(
+            path,
+            str(payload.get("info") or "高德接口调用失败"),
+            str(payload.get("infocode") or ""),
+            str(payload.get("status") or ""),
+        )
+        last_error = api_error
+        if not _is_retryable_amap_error(api_error) or attempt >= retries:
+            raise api_error
+        time.sleep(backoff * (attempt + 1))
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("高德接口请求失败")
 
 
+@lru_cache(maxsize=256)
 def geocode_location(location: str) -> dict:
     direct_adcode_map = {
         "上海": "310000",

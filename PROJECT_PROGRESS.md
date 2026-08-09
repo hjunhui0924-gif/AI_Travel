@@ -66,6 +66,10 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 航班 bridge 的 auto 路径已移除默认 dummy fallback；Flight MCP 现在必须显式启用。
 - 已新增旅行搜索发现层和证据对象；搜索关闭时不会创建 Tavily searcher 或调用网页搜索。
 - 自动化测试目录已建立，覆盖存储、日期、搜索开关、POI 无结果、重规划、锁定项、航班 demo 隔离、API 和 SSE。
+- `utils/weather_utils.py` 已增加高德 API 错误码、有限重试、请求节流和地址缓存；同一轮路线规划不会重复突发请求高德。
+- `adapters/rail_12306_adapter.py` 已缓存站点字典，并为会话初始化和余票查询增加单请求超时与整条查询总超时，避免 12306 风控/网络异常拖住整次规划。
+- `adapters/ctrip_flight_adapter.py`、`bridges/flight_mcp_bridge.py` 已识别 Ctrip H5 的 whaleguard/HTTP 432/页面结构变化，并把失败原因传给上层；不会把被拦截结果伪装成空航班或 dummy 航班。
+- 新增 `services/integration_health.py`：使用 `python -m services.integration_health --live` 检查高德、12306、Tavily、Ctrip H5 和 Flight MCP，输出不含密钥的结构化状态。
 
 ## 6. 领域模型约定
 
@@ -134,6 +138,17 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 状态：已完成，交接文档已更新，Critical/Important 问题已修复并完成最终验证
 - 目标：独立代码审查、修复 Critical/Important 问题，生成包含接口和 JSON 示例的前端交接文档。
 
+### Phase 5：外部环境联调与失败降级
+
+- 状态：已完成；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，Flight MCP 当前未配置可用数据源。
+- 目标：确认 `.env` 中的凭证不仅存在，而且真实请求、响应解析和业务降级链路可用。
+- 高德证据：地理编码、天气、文本 POI、周边 POI、步行路线、驾车路线和公交路线均返回成功；请求加入节流/重试/缓存。
+- 12306 证据：广州南 -> 深圳北，动态未来日期返回 579 条原始车次；加入站点字典缓存、单请求超时和 45 秒总超时后，本次健康检查约 1.3 秒完成。
+- Tavily 证据：真实搜索返回 5 条发现结果；搜索仍只有在 `search_enabled=true` 时允许进入旅行发现层。
+- Ctrip 证据：`https://m.ctrip.com/html5/flight/sha-hgh-day-8.html` 返回 HTTP 432，正文为 `whaleguard block`；当前 H5 爬虫不可作为生产航班源，不再尝试绕过风控。
+- Flight MCP 证据：当前 `.env` 未设置 `FLIGHT_MCP_ENABLED/FLIGHT_MCP_MODE`；强制启用已安装的 `package` 模式进行真实查询无法得到航班结果，最终被 45 秒 bridge 总超时截断，不能视为可用航班结果。
+- 解决方案：航班正式接入必须配置已授权的 Flight MCP 命令/HTTP 服务或官方/合作方 API；未配置或失败时返回 `not_configured/failed` 和提醒，不显示价格、班次或可预订暗示。Ctrip H5 只保留探测能力。
+
 ## 9. 每阶段必须检查的坑
 
 - 是否把一次性回答误当成持久化计划。
@@ -149,6 +164,8 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 是否允许旧 checkpoint 通过任意 guest cookie 首次绑定，或让过期 capability 继续访问。
 - 是否把同日同名项目生成相同 `item_id`，导致 PATCH 地址不唯一。
 - 是否在后端契约未稳定前修改前端文件。
+- 是否把 Ctrip H5 被风控后的空列表当作“当天没有航班”；应展示 `blocked/failed` 诊断并切换到授权航班源。
+- 是否让 12306/高德的单个网络调用无限等待或在同一计划内重复请求；应遵守 adapter 的节流、缓存和总超时配置。
 
 ## 10. 变更日志
 
@@ -175,6 +192,8 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 增加登录用户主动迁移旧 checkpoint 的 `POST /threads/migrate-legacy`，仅接受用户显式提交且仍存在的 `guest_...` 随机线程 ID，不自动认领 `default` 等歧义历史。
 - 增加 `TravelPlan.out_of_range_items` 和日历 `out_of_range_item_count`，保留日期范围外的 confirmed/locked/booked 项并支持 PATCH。
 - 首次旅行计划保存显式传 `expected_version=0`；航班单条结果、路线各模式失败互不阻断；同日重复项目自动生成唯一 `item_id`。
+- 完成真实外部联调：高德七类子检查通过，12306 广州南到深圳北返回 579 条车次，Tavily 返回 5 条搜索结果；Ctrip H5 确认 HTTP 432/whaleguard，Flight MCP package 受 45 秒总超时保护后明确失败。
+- 新增高德节流、有限重试和地址缓存；12306 站点缓存、单请求/总超时；航班 bridge 错误透传和进程树清理；新增 `services/integration_health.py` 和外部 adapter 回归测试。
 
 ## 11. 对抗式审查修复记录（2026-08-09）
 
@@ -198,4 +217,4 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - guest capability 服务端校验 30 天创建/最近使用 TTL；空线程过期后生成新 token，带持久化数据的过期线程不重绑。
 - 首次旅行计划路径明确传 `expected_version=0`；日期外锁定项保存在 `out_of_range_items`，同日重复项目经过全局 ID 去重；航班、铁路和路线 partial/failed 状态会保留可用结果并进入 diagnostics。
 
-最终验证证据：`python -m pytest -q` 为 **52 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services app.py tests` 通过；`git diff --check` 通过，仅报告 Windows 换行转换提示。`FRONTEND_HANDOFF.md` 已按最终接口契约更新。
+最终验证证据（后端基线 + 外部联调修复）：`python -m pytest -q` 为 **58 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。`FRONTEND_HANDOFF.md` 的 TravelPlan `adapter_status/diagnostics` 契约仍然有效。

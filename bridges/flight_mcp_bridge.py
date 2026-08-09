@@ -17,6 +17,10 @@ if str(BASE_DIR) not in sys.path:
 from adapters.ctrip_flight_adapter import search_ctrip_h5_flights
 
 
+class FlightBridgeError(RuntimeError):
+    """A configured flight provider failed without a safe result."""
+
+
 def _read_payload() -> dict[str, Any]:
     raw = sys.stdin.read().strip()
     if not raw:
@@ -182,9 +186,11 @@ def _search_via_installed_package(origin: str, destination: str, date: str) -> l
         payload = searchFlightRoutes(departure_code, destination_code, date)
 
     if not isinstance(payload, dict):
-        return []
+        raise FlightBridgeError("FlightTicketMCP returned a non-object payload")
     if payload.get("status") != "success":
-        return []
+        error_code = payload.get("error_code") or "PROVIDER_ERROR"
+        message = payload.get("message") or "FlightTicketMCP returned an error"
+        raise FlightBridgeError(f"{error_code}: {message}")
 
     items = []
     for key in ("flights", "items", "results", "data"):
@@ -200,9 +206,11 @@ def _search_via_installed_package(origin: str, destination: str, date: str) -> l
 
 
 def _search_via_auto(origin: str, destination: str, date: str) -> list[dict]:
+    errors: list[str] = []
     try:
         flights = _search_via_installed_package(origin, destination, date)
-    except Exception:
+    except Exception as exc:
+        errors.append(f"package:{type(exc).__name__}:{exc}")
         flights = []
 
     if flights:
@@ -210,11 +218,14 @@ def _search_via_auto(origin: str, destination: str, date: str) -> list[dict]:
 
     try:
         flights = search_ctrip_h5_flights(origin, destination, date)
-    except Exception:
+    except Exception as exc:
+        errors.append(f"ctrip_h5:{type(exc).__name__}:{exc}")
         flights = []
 
     if flights:
         return flights
+    if errors:
+        raise FlightBridgeError("; ".join(errors))
     # An empty result is safer than inventing a bookable-looking flight.
     return []
 
@@ -248,7 +259,9 @@ def main() -> int:
         error_payload = {
             "error": str(exc),
             "provider": "flight_mcp_bridge",
+            "status": "failed",
         }
+        print(str(exc), file=sys.stderr)
         sys.stdout.write(json.dumps(error_payload, ensure_ascii=True))
         return 1
 

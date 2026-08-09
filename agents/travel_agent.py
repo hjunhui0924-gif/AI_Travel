@@ -277,7 +277,12 @@ def _build_flight_diagnostics(query: TravelQuery) -> list[str]:
         return []
 
     probe = probe_ctrip_flight_page(origin_code, destination_code, query.date)
-    return [f"ctrip_probe ok={probe.ok} blocked={probe.blocked} message={probe.message} url={probe.url}"]
+    return [
+        "ctrip_probe "
+        f"ok={probe.ok} blocked={probe.blocked} "
+        f"http_status={probe.http_status} failure_kind={probe.failure_kind} "
+        f"message={probe.message} url={probe.url}"
+    ]
 
 
 def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:

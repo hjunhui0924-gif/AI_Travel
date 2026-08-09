@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -53,37 +54,75 @@ def _search_flights_via_command(
     date: str,
     bridge_mode: str = "auto",
 ) -> list[dict]:
-    command = os.getenv("FLIGHT_MCP_COMMAND", "").strip() or _default_bridge_command()
+    configured_command = os.getenv("FLIGHT_MCP_COMMAND", "").strip()
+    command = configured_command or _default_bridge_command()
     if not command:
         raise FlightQueryError("FLIGHT_MCP_COMMAND is empty")
 
-    timeout_seconds = int(os.getenv("FLIGHT_MCP_TIMEOUT_SECONDS", "120"))
+    timeout_seconds = int(os.getenv("FLIGHT_MCP_TIMEOUT_SECONDS", "45"))
     env = os.environ.copy()
     if bridge_mode:
         env["FLIGHT_BRIDGE_MODE"] = bridge_mode
 
-    completed = subprocess.run(
-        command,
-        input=json.dumps(
-            {
-                "origin": origin,
-                "destination": destination,
-                "date": date,
-            },
-            ensure_ascii=True,
-        ),
-        capture_output=True,
-        text=True,
-        shell=True,
-        timeout=timeout_seconds,
-        env=env,
+    # The bundled bridge is a trusted local Python file, so execute it
+    # directly.  Custom commands remain operator-configured shell commands.
+    if configured_command:
+        command_args = command
+        use_shell = True
+    else:
+        command_args = [sys.executable, str(DEFAULT_BRIDGE_PATH)]
+        use_shell = False
+
+    process_kwargs = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "shell": use_shell,
+        "env": env,
+    }
+    if os.name == "nt":
+        process_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        process_kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(command_args, **process_kwargs)
+    request_payload = json.dumps(
+        {
+            "origin": origin,
+            "destination": destination,
+            "date": date,
+        },
+        ensure_ascii=True,
     )
+    try:
+        stdout, stderr = process.communicate(input=request_payload, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise FlightQueryError(f"Flight MCP command timed out after {timeout_seconds} seconds") from exc
 
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        raise FlightQueryError(stderr or f"Flight MCP command failed with exit code {completed.returncode}")
+    if process.returncode != 0:
+        stderr = (stderr or "").strip()
+        stdout = (stdout or "").strip()
+        message = ""
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                message = str(payload.get("error") or payload.get("message") or "")
+        raise FlightQueryError(
+            message
+            or stderr
+            or f"Flight MCP command failed with exit code {process.returncode}"
+        )
 
-    stdout = (completed.stdout or "").strip()
+    stdout = (stdout or "").strip()
     if not stdout:
         return []
 
@@ -93,6 +132,32 @@ def _search_flights_via_command(
         raise FlightQueryError(f"Flight MCP returned invalid JSON: {exc}") from exc
 
     return _normalize_flight_items(payload)
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Terminate only the process group created for this provider call."""
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
 
 
 def search_flights(origin: str, destination: str, date: str) -> list[dict]:

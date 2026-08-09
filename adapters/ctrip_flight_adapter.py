@@ -30,6 +30,28 @@ class CtripFlightProbeResult:
     url: str = ""
     title: str = ""
     message: str = ""
+    http_status: int = 0
+    failure_kind: str = ""
+
+
+class CtripFlightError(RuntimeError):
+    """A non-bookable Ctrip H5 response, usually caused by anti-bot controls."""
+
+    def __init__(self, message: str, *, failure_kind: str = "failed", http_status: int = 0):
+        self.failure_kind = failure_kind
+        self.http_status = http_status
+        super().__init__(message)
+
+
+def _detect_block_reason(html: str, status_code: int) -> str:
+    lowered = (html or "").lower()
+    if "whaleguard" in lowered:
+        return "whaleguard"
+    if "captcha" in lowered or "\u9a8c\u8bc1\u7801" in html or "\u5b89\u5168\u9a8c\u8bc1" in html:
+        return "captcha"
+    if status_code >= 400:
+        return f"http_{status_code}"
+    return ""
 
 
 def _build_h5_route_url(origin_code: str, destination_code: str, date_text: str) -> str:
@@ -230,9 +252,22 @@ def search_ctrip_h5_flights(origin_code: str, destination_code: str, date_text: 
     normalized_destination = _normalize_airport_code(destination_code)
     url = _build_h5_route_url(normalized_origin, normalized_destination, date_text)
     response = requests.get(url, headers=_mobile_headers(), timeout=30)
+    blocked_reason = _detect_block_reason(response.text, response.status_code)
+    if blocked_reason in {"whaleguard", "captcha"}:
+        raise CtripFlightError(
+            f"Ctrip H5 blocked the request ({blocked_reason})",
+            failure_kind="blocked",
+            http_status=response.status_code,
+        )
     response.raise_for_status()
 
     state = _extract_state(response.text)
+    if not state:
+        raise CtripFlightError(
+            "Ctrip H5 response does not contain the expected flight state",
+            failure_kind="schema_changed",
+            http_status=response.status_code,
+        )
     list_data = state.get("listData") or {}
     flights = list_data.get("flights") or []
 
@@ -253,22 +288,49 @@ def probe_ctrip_flight_page(origin_code: str, destination_code: str, date_text: 
     try:
         response = requests.get(url, headers=_mobile_headers(), timeout=30)
         html = response.text
+        blocked_reason = _detect_block_reason(html, response.status_code)
         state = _extract_state(html)
         flights = ((state.get("listData") or {}).get("flights")) or []
-        blocked = response.status_code >= 400 or not state
-        message = f"parsed {len(flights)} flights from ctrip h5" if flights else "ctrip h5 returned no flights"
+        blocked = blocked_reason in {"whaleguard", "captcha"}
+        failure_kind = ""
+        if blocked:
+            failure_kind = "blocked"
+        elif response.status_code >= 400:
+            failure_kind = blocked_reason or "http_error"
+        elif not state:
+            failure_kind = "schema_changed"
+        elif not flights:
+            failure_kind = "empty"
+        message = (
+            f"parsed {len(flights)} flights from ctrip h5"
+            if flights
+            else f"ctrip h5 returned no flights ({failure_kind or 'unknown'})"
+        )
         return CtripFlightProbeResult(
             ok=bool(flights),
-            blocked=blocked and not flights,
+            blocked=blocked,
             html_excerpt=html[:2000],
             url=response.url,
             title="Ctrip H5 Flight Page",
             message=message,
+            http_status=response.status_code,
+            failure_kind=failure_kind,
         )
     except Exception as exc:
+        if isinstance(exc, CtripFlightError):
+            return CtripFlightProbeResult(
+                ok=False,
+                blocked=exc.failure_kind == "blocked",
+                url=url,
+                title="Ctrip H5 Flight Page",
+                message=str(exc),
+                http_status=exc.http_status,
+                failure_kind=exc.failure_kind,
+            )
         return CtripFlightProbeResult(
             ok=False,
             blocked=False,
             message=str(exc),
             url=url,
+            failure_kind="network_error",
         )

@@ -197,7 +197,7 @@ http://127.0.0.1:8000
 - 本地 `bridges/flight_mcp_bridge.py`
 - Flight MCP 兼容命令
 - 兼容 HTTP 返回的航班服务
-- 本地演示 dummy 数据
+- 本地演示 dummy 数据（仅测试，默认禁止）
 
 示例配置：
 
@@ -206,8 +206,31 @@ FLIGHT_MCP_ENABLED=true
 FLIGHT_MCP_MODE=command
 FLIGHT_MCP_COMMAND=python bridges\\flight_mcp_bridge.py
 FLIGHT_BRIDGE_MODE=package
-FLIGHT_MCP_TIMEOUT_SECONDS=120
+FLIGHT_MCP_TIMEOUT_SECONDS=45
 ```
+
+航班数据源必须是已授权且能稳定返回结构化数据的 Flight MCP、HTTP 服务或命令适配器。
+携程 H5 探测仅用于判断页面是否可访问；当前实测会受到 `whaleguard`/HTTP 432 风控，不能作为生产航班数据源，也不能通过继续伪装请求来绕过风控。
+
+## 外部服务联调
+
+不要只检查 `.env` 里是否存在 Key。项目提供了不输出密钥和响应正文的健康检查：
+
+```bash
+python -m services.integration_health --live
+```
+
+也可以单独检查：
+
+```bash
+python -m services.integration_health --live --only amap
+python -m services.integration_health --live --only rail_12306
+python -m services.integration_health --live --only tavily
+python -m services.integration_health --live --only ctrip_h5
+python -m services.integration_health --live --only flight_mcp
+```
+
+高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。携程 H5 被拦截时，应配置授权的 Flight MCP、官方或合作方航班 API；在此之前航班能力保持 `not_configured` 或 `failed`。
 
 ## 文件支持
 
