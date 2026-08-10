@@ -53,6 +53,12 @@ from services.travel_store import (
     save_travel_turn,
 )
 from utils.file_utils import UnsupportedFileTypeError, parse_uploads
+from services.answer_citations import (
+    deduplicate_sources,
+    parse_answer_citations,
+    strip_citation_markers_for_stream,
+    validate_answer_segments,
+)
 
 load_dotenv()
 
@@ -558,7 +564,14 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
         response.trip_plan = saved_plan
         response.sources = saved_plan.sources
         response.conflicts = saved_plan.conflicts
-        rendered = render_travel_response(response)
+        source_dicts = deduplicate_sources([asdict(source) for source in saved_plan.sources])
+        parsed_answer = parse_answer_citations(
+            render_travel_response(response),
+            source_dicts,
+            citations_enabled=payload.search_enabled,
+        )
+        rendered = parsed_answer.final_text
+        answer_segments = parsed_answer.answer_segments
         save_travel_turn(
             thread_id=thread_id,
             user_id=user_id,
@@ -570,7 +583,13 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
             thread_id=thread_id,
             user_id=user_id,
             role="assistant",
-            content=rendered,
+            content=rendered
+            + encode_assistant_metadata(
+                [],
+                source_dicts,
+                answer_segments,
+                search_enabled=payload.search_enabled,
+            ),
             search_enabled=payload.search_enabled,
             plan=saved_plan,
         )
@@ -578,7 +597,8 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
             "status": "success",
             "plan": asdict(saved_plan),
             "final_text": rendered,
-            "sources": [asdict(source) for source in saved_plan.sources],
+            "sources": source_dicts,
+            "answer_segments": answer_segments,
         }
     except HTTPException as exc:
         return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
@@ -658,11 +678,22 @@ async def chat(
     def stream_generator():
         try:
             has_output = False
-            seen_text = ""
+            raw_seen_text = ""
+            emitted_text = ""
             assistant_activities = []
             assistant_sources = []
+            assistant_answer_segments = []
             travel_plan = None
             is_travel_response = False
+
+            def safe_text_delta(raw_text: str) -> str:
+                nonlocal emitted_text
+                safe_text = strip_citation_markers_for_stream(raw_text)
+                if not safe_text.startswith(emitted_text):
+                    return ""
+                delta = safe_text[len(emitted_text):]
+                emitted_text = safe_text
+                return delta
 
             for chunk, metadata in stream_chat(
                 message=message,
@@ -675,12 +706,14 @@ async def chat(
                     travel_plan = metadata["trip_plan"]
                 if isinstance(metadata, dict) and metadata.get("travel"):
                     is_travel_response = True
+                if isinstance(metadata, dict) and isinstance(metadata.get("answer_segments"), list):
+                    if metadata["answer_segments"]:
+                        assistant_answer_segments = metadata["answer_segments"]
                 for activity in consume_activity_log():
                     assistant_activities.append(activity)
                     yield _sse_event("activity", activity)
                 for source in consume_source_cards():
                     assistant_sources.append(source)
-                    yield _sse_event("source", source)
 
                 if not isinstance(chunk, (AIMessageChunk, AIMessage)):
                     continue
@@ -691,28 +724,33 @@ async def chat(
 
                 if isinstance(chunk, AIMessageChunk):
                     has_output = True
-                    seen_text += text
-                    yield _sse_event("text", {"delta": text})
+                    raw_seen_text += text
+                    delta = safe_text_delta(raw_seen_text)
+                    if delta:
+                        yield _sse_event("text", {"delta": delta})
                     continue
 
-                if not text.startswith(seen_text):
+                if not text.startswith(raw_seen_text):
                     has_output = True
-                    seen_text = text
-                    yield _sse_event("text", {"delta": text})
+                    raw_seen_text = text
+                    delta = safe_text_delta(raw_seen_text)
+                    if delta:
+                        yield _sse_event("text", {"delta": delta})
                     continue
 
-                delta = text[len(seen_text):]
+                delta = text[len(raw_seen_text):]
                 if delta:
                     has_output = True
-                    seen_text = text
-                    yield _sse_event("text", {"delta": delta})
+                    raw_seen_text = text
+                    safe_delta = safe_text_delta(raw_seen_text)
+                    if safe_delta:
+                        yield _sse_event("text", {"delta": safe_delta})
 
             for activity in consume_activity_log():
                 assistant_activities.append(activity)
                 yield _sse_event("activity", activity)
             for source in consume_source_cards():
                 assistant_sources.append(source)
-                yield _sse_event("source", source)
 
             context_plan = consume_travel_plan()
             if context_plan:
@@ -728,10 +766,41 @@ async def chat(
                     ):
                         continue
                     assistant_sources.append(source)
-                    yield _sse_event("source", source)
 
-            seen_text_with_metadata = seen_text + encode_assistant_metadata(assistant_activities, assistant_sources)
-            final_text = seen_text or "暂时没有生成结果，请再试一次。"
+            assistant_sources = deduplicate_sources(assistant_sources)
+            for source in assistant_sources:
+                yield _sse_event("source", source)
+            parsed_answer = parse_answer_citations(
+                raw_seen_text,
+                assistant_sources,
+                citations_enabled=search_enabled,
+            )
+            final_text = parsed_answer.final_text or "暂时没有生成结果，请再试一次。"
+            parsed_segments = parsed_answer.answer_segments
+            if not parsed_segments and final_text:
+                parsed_segments = [{"text": final_text, "source_ids": []}]
+
+            validated_segments = validate_answer_segments(
+                assistant_answer_segments,
+                final_text,
+                assistant_sources,
+                citations_enabled=search_enabled,
+            )
+            answer_segments = (
+                validated_segments
+                if assistant_answer_segments and validated_segments
+                else parsed_segments
+            )
+            if final_text.startswith(emitted_text) and final_text != emitted_text:
+                yield _sse_event("text", {"delta": final_text[len(emitted_text):]})
+                emitted_text = final_text
+
+            seen_text_with_metadata = final_text + encode_assistant_metadata(
+                assistant_activities,
+                assistant_sources,
+                answer_segments,
+                search_enabled=search_enabled,
+            )
 
             if not is_travel_response:
                 try:
@@ -757,7 +826,12 @@ async def chat(
                     )
                     assistant_content = seen_text_with_metadata or (
                         "暂时没有生成结果，请再试一次。"
-                        + encode_assistant_metadata(assistant_activities, assistant_sources)
+                        + encode_assistant_metadata(
+                            assistant_activities,
+                            assistant_sources,
+                            answer_segments,
+                            search_enabled=search_enabled,
+                        )
                     )
                     save_conversation_turn(
                         thread_id=thread_id,
@@ -771,7 +845,14 @@ async def chat(
                     # fallback if the ordered history log cannot be written.
                     pass
             try:
-                attach_assistant_metadata(thread_id, seen_text, assistant_activities, assistant_sources)
+                attach_assistant_metadata(
+                    thread_id,
+                    raw_seen_text,
+                    assistant_activities,
+                    assistant_sources,
+                    answer_segments,
+                    search_enabled=search_enabled,
+                )
             except Exception:
                 pass
 
@@ -793,6 +874,7 @@ async def chat(
                     # Internal history metadata is persisted separately and
                     # must never leak into the frontend's rendered text.
                     "final_text": final_text,
+                    "answer_segments": answer_segments,
                     "trip_plan": travel_plan,
                     "attachments": [
                         {

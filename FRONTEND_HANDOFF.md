@@ -380,7 +380,7 @@ JSON 请求：
 }
 ```
 
-成功返回：`{status:"success", plan: TravelPlan, final_text: string, sources: Evidence[]}`。这是普通 JSON 请求，不是 SSE。后端会保留已确认/锁定项、增加新版本，并把无法满足的日期变化写入 `conflicts`。
+成功返回：`{status:"success", plan: TravelPlan, final_text: string, answer_segments: {text:string,source_ids:string[]}[], sources: Evidence[]}`。这是普通 JSON 请求，不是 SSE。后端会保留已确认/锁定项、增加新版本，并把无法满足的日期变化写入 `conflicts`。
 
 ## 8. adapter_status 与前端展示
 
@@ -416,3 +416,58 @@ JSON 请求：
 - 不隐藏 `risks`、`conflicts`、`adapter_status` 或 `is_demo`。
 - 不在前端保存或展示大众点评评价正文。
 - 不修改 `static/` 现有文件作为本阶段后端交接的一部分；接入时请另行评估 UI 改造范围。
+## 11. Sentence-level web citations (new)
+
+The backend now exposes citations as structured data. The frontend must not
+parse citation markers from Markdown and must not guess which source supports
+which sentence.
+
+### SSE `event: done`
+
+```json
+{
+  "final_text": "第一句。 第二句。",
+  "answer_segments": [
+    {"text": "第一句。", "source_ids": ["web_abc123"]},
+    {"text": " 第二句。", "source_ids": []}
+  ],
+  "sources": [
+    {
+      "evidence_id": "web_abc123",
+      "source_type": "web_search",
+      "provider": "Tavily",
+      "title": "公开页面",
+      "url": "https://example.com/article",
+      "summary": "..."
+    }
+  ]
+}
+```
+
+Render each `answer_segments` item in order. Show the link/chain icon only
+when `source_ids` is non-empty; the number beside it is the number of valid
+source IDs. Resolve IDs against `done.sources` and show only those source
+cards in the right-side panel. Clicking a source opens its `http`/`https` URL
+in a new tab with `noopener,noreferrer`.
+
+The same `answer_segments` field is present on assistant messages from
+`GET /history/{thread_id}` and on the JSON response from
+`POST /travel/plans/{thread_id}/replan`. `source` SSE events are emitted after
+the response sources have been sanitized and deduplicated, but before `done`;
+treat `done.sources` as the authoritative complete list.
+
+Source-card payloads from SSE use `summary`; `Evidence` objects in
+`TravelPlan` and the replan response use `snippet`. Both are source summaries,
+not full web-page content. A frontend source card may display
+`summary ?? snippet`, and must only make an `http`/`https` URL clickable.
+
+Only `source_type="web_search"` sources are eligible for sentence citations.
+Map POI, weather, rail, flight, and route sources remain available as source
+cards/structured plan evidence but must not be rendered as web-search sentence
+icons. When no source supports a sentence, keep `source_ids: []` and show no
+icon.
+
+The model's internal `[[cite:web_...]]` markers are removed by the backend and
+must never be displayed. Streaming `text.delta` events are already sanitized;
+`done.final_text` is the canonical clean text. `search_enabled=false` must
+never produce a web-search citation.

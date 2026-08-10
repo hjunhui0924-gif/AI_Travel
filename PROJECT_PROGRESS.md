@@ -242,3 +242,45 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 明确保留：旅行计划、日历/重规划、文件上传与可选 OSS 存储、高德/12306/VariFlight、Ctrip 风控探测、Flight MCP 兼容桥和静态前端。
 - 边界：本次清理不删除运行时数据库、上传数据、缓存、静态前端或任何授权交通 adapter；不改变前端交接接口。
 - 验证：`python -m pytest -q` 为 **80 passed**，仅有既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`python -c "import app"` 通过；`git diff --check` 通过；仓库内未发现股票能力或本地 `mcp_server` 入口的运行时引用，`.env` 中未再保留旧股票配置变量。授权航班桥中保留的外部 `flight_ticket_mcp_server` 是兼容 provider 名称，不属于本次删除目标。
+## 14. 句子级联网搜索引用（2026-08-10）
+
+### 目标
+
+让前端能够把“回答中的某一句话由哪些联网网页支撑”准确地呈现为句末链条图标，并在右侧来源栏只展示该句话对应的网页；普通模型知识、天气、高德、12306、航班等来源不能被误标为网页搜索引用。
+
+### 当前实现
+
+- 新增 `services/answer_citations.py`，统一负责内部标记解析、句子范围切分、来源 ID 校验、流式隐藏、历史恢复和来源去重。
+- 普通 `web_search` 结果生成稳定的 `web_<hash>` `evidence_id`，工具上下文向模型暴露 `Citation ID`；联网回答按约定在直接依据句末输出 `[[cite:web_xxx]]`。
+- `/chat` 的 `text.delta` 已过滤内部标记；`done` 新增 `answer_segments`，其中每项为 `{text, source_ids}`；`done.final_text` 是干净文本。
+- 旅行规划和重规划的“网页发现 + 地图验证”结果也支持引用，但只给网页热度/网红信号对应的文本加引用；地图评分、交通、天气不混用网页引用。
+- 普通聊天、旅行聊天、`POST /travel/plans/{thread_id}/replan` 和 `GET /history/{thread_id}` 使用同一字段契约；助手历史保存时不保留内部标记。
+- `FRONTEND_HANDOFF.md` 已增加引用字段、SSE、历史和重规划示例以及前端安全边界。
+
+### 必须保持的边界
+
+- `search_enabled=false` 时不得创建或展示 `web_search` 句子引用。
+- 后端只接受当前响应 `sources` 中、`source_type="web_search"` 且 URL 为 `http/https` 的 `evidence_id`；模型不能凭空造 URL 或引用非网页 adapter。
+- 前端以 `done.sources` 为完整来源列表，以 `answer_segments` 为句子关联；不能从 Markdown、摘要或来源标题猜测关联。
+- 内部 `[[cite:...]]` 不得进入 UI、历史正文或用户可见日志；来源链接新标签页打开时使用 `noopener,noreferrer`。
+- 大众点评继续过滤；搜索摘要只是展示/发现依据，不能被当作已验证评分或营业事实。
+
+### 对抗式审查与修复记录
+
+- 第一轮审查重点检查了非法/未知 ID、跨类型来源、流式分片、重复来源、旧 checkpoint、历史正文、多文本 content block、句子边界和异常 URL。
+- 已修复：历史恢复严格继承 `search_enabled`，缺失或非布尔值按保守规则处理；来源 SSE 事件只在最终清理、去重后发送；来源标题/摘要会移除内部标记，非 `http/https` URL 不可点击；旧 assistant 片段合并后重新校验 `answer_segments`；未闭合标记会在可识别分隔符后保留后续正文；闭合引号和分号不再错误截断句子；`urlsplit` 异常会安全降级。
+- 已新增回归覆盖：连续标点、引号/分号、换行/异常括号/未闭合引用、冲突 `evidence_id`、来源卡清理、字符串形式的 `search_enabled=false`、历史空白、多文本 checkpoint 和来源 SSE。
+
+### 本阶段状态与验证
+
+- 状态：已完成，等待提交本阶段变更。
+- 全量测试：`python -m pytest -q` → **95 passed**，1 个既有 FastAPI/Starlette 弃用警告。
+- 编译检查：`python -m compileall -q agents services adapters bridges app.py tests` → 通过。
+- 导入检查：`python -c "import app"` → 通过。
+- 差异检查：`git diff --check` → 通过；仅有 Windows LF/CRLF 转换提示。
+
+### 后续工作
+
+- 前端按 `FRONTEND_HANDOFF.md` 接入 `answer_segments`、`done.sources`、TravelPlan 日历和重规划接口；不得从 Markdown 猜测引用关系。
+- 如需统一来源卡字段，前端按 `summary ?? snippet` 展示摘要；来源链接必须二次确认协议为 `http/https`。
+- 本阶段没有修改 `static/index.html`、`static/main.js`、`static/style.css`。

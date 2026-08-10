@@ -31,6 +31,7 @@ from services.route_service import get_route_plans
 from services.trip_extractor import extract_attachment_notes, extract_named_places
 from services.trip_planner import build_timeline
 from services.weather_service import get_weather_summary
+from services.answer_citations import citation_marker
 
 
 CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -940,6 +941,11 @@ def plan_travel(
 
 def render_travel_response(response: TravelPlanResponse) -> str:
     lines = [response.summary]
+    web_source_ids = {
+        source.evidence_id
+        for source in response.sources
+        if source.source_type == "web_search" and citation_marker(source.evidence_id)
+    }
     if response.trip_plan:
         lines.append(
             f"\n计划日期：{response.trip_plan.start_date} 至 {response.trip_plan.end_date}"
@@ -990,13 +996,23 @@ def render_travel_response(response: TravelPlanResponse) -> str:
         lines.extend(["", "## 周边探索"])
         for poi in response.poi_recommendations:
             label = f"{poi.name}（{poi.category}）"
+            web_markers = ""
             if poi.rating:
                 label += f" 评分 {poi.rating}"
             if poi.popularity_signal:
-                label += f"；{poi.popularity_signal}"
+                web_markers = "".join(
+                    citation_marker(source_id)
+                    for source_id in poi.source_ids
+                    if source_id in web_source_ids
+                )
             if poi.area:
                 label += f" - {poi.area}"
             lines.append(f"- {label}")
+            if poi.popularity_signal:
+                popularity_line = f"  {poi.popularity_signal}"
+                if web_markers:
+                    popularity_line += f"。{web_markers}"
+                lines.append(popularity_line)
             if poi.summary:
                 lines.append(f"  {poi.summary}")
 

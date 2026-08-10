@@ -60,10 +60,15 @@ def _is_denied_source(url: str) -> bool:
     return host in DENIED_SOURCE_HOSTS or host.endswith(".dianping.com")
 
 
-def _evidence_id(*, url: str, title: str, anchor: str, query: str) -> str:
+def web_evidence_id(*, url: str, title: str, anchor: str, query: str) -> str:
     key = _normalize_url(url) or "|".join((anchor, query, title))
     digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:12]
     return f"web_{digest}"
+
+
+# Backwards-compatible internal name for callers written before the public
+# source-ID seam was introduced.
+_evidence_id = web_evidence_id
 
 
 def _default_searcher():
@@ -160,7 +165,7 @@ def discover_travel_places(
                 continue
             if normalized_url:
                 seen_urls.add(normalized_url)
-            evidence_id = _evidence_id(url=normalized_url, title=title, anchor=anchor, query=query)
+            evidence_id = web_evidence_id(url=normalized_url, title=title, anchor=anchor, query=query)
             result.sources.append(
                 {
                     "evidence_id": evidence_id,

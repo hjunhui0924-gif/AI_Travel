@@ -42,6 +42,13 @@ from services.travel_store import (
     save_travel_turn,
 )
 from services.travel_search import _is_denied_source, _normalize_url
+from services.travel_search import web_evidence_id
+from services.answer_citations import (
+    deduplicate_sources,
+    parse_answer_citations,
+    strip_citation_markers,
+    validate_answer_segments,
+)
 
 load_dotenv()
 
@@ -66,6 +73,7 @@ CHROMA_DIR = RESOURCES_DIR / "chroma_runtime"
 _activity_log_var: ContextVar[list[dict] | None] = ContextVar("activity_log", default=None)
 _source_cards_var: ContextVar[list[dict] | None] = ContextVar("source_cards", default=None)
 _travel_plan_var: ContextVar[dict | None] = ContextVar("travel_plan", default=None)
+_web_search_allowed_var: ContextVar[bool | None] = ContextVar("web_search_allowed", default=None)
 
 _chroma_client = None
 _chroma_embedding_function = None
@@ -99,6 +107,7 @@ def _reset_runtime_buffers() -> None:
     _activity_log_var.set([])
     _source_cards_var.set([])
     _travel_plan_var.set(None)
+    _web_search_allowed_var.set(None)
 
 
 def _log_activity(stage: str, title: str, detail: str = "", state: str = "completed") -> None:
@@ -121,6 +130,10 @@ def _log_source_card(
     summary: str = "",
     source_date: str = "",
     evidence_id: str = "",
+    source_type: str = "",
+    provider: str = "",
+    retrieved_at: str = "",
+    supports: list[str] | None = None,
 ) -> None:
     card = {
         "title": title,
@@ -130,6 +143,14 @@ def _log_source_card(
     }
     if evidence_id:
         card["evidence_id"] = evidence_id
+    if source_type:
+        card["source_type"] = source_type
+    if provider:
+        card["provider"] = provider
+    if retrieved_at:
+        card["retrieved_at"] = retrieved_at
+    if supports:
+        card["supports"] = list(supports)
     _source_cards().append(card)
 
 
@@ -505,6 +526,10 @@ def _select_relevant_chunks(query: str, chunks: list[dict], attachment: dict | N
 
 
 def perform_web_search(query: str) -> str:
+    if _web_search_allowed_var.get() is False:
+        _log_activity("search", "跳过联网搜索", "当前请求未授予联网搜索权限")
+        return "当前请求未开启联网搜索，无法执行网页搜索。"
+
     weather_result = None
     if _is_weather_query(query) and has_amap_key():
         location = _extract_weather_location(query)
@@ -586,6 +611,12 @@ def perform_web_search(query: str) -> str:
                 "url": url,
                 "summary": summary,
                 "latest_date": latest_date,
+                "evidence_id": web_evidence_id(
+                    url=url,
+                    title=title,
+                    anchor="",
+                    query=query,
+                ),
             }
         )
 
@@ -630,8 +661,18 @@ def perform_web_search(query: str) -> str:
         lines.append(f"   日期线索: {date_label}")
         lines.append(f"   摘要: {item['summary'] or '无摘要'}")
         lines.append(f"   链接: {item['url'] or '无链接'}")
+        lines.append(f"   Citation ID: {item['evidence_id']}")
         if item["url"]:
-            _log_source_card(item["title"], item["url"], item["summary"][:160], date_label)
+            _log_source_card(
+                item["title"],
+                item["url"],
+                item["summary"][:160],
+                date_label,
+                evidence_id=item["evidence_id"],
+                source_type="web_search",
+                provider="Tavily",
+                supports=["web_search_result"],
+            )
 
     _log_activity("tool", "web_search 完成", f"返回 {min(len(processed), 6)} 条候选结果")
     return "\n".join(lines)
@@ -694,6 +735,13 @@ SEARCH_DISABLED_APPENDIX = """
 SEARCH_ENABLED_APPENDIX = """
 当前这轮对话已开启联网搜索。
 如果用户在问最新、今天、实时、当前值，必须优先参考工具返回中的日期线索，过滤过旧结果。
+
+When the web_search tool returns a ``Citation ID: web_...``, use the exact
+internal marker ``[[cite:web_...]]`` immediately after each sentence that is
+directly supported by that web result. Repeat the marker when a sentence has
+more than one supporting result. Never invent citation IDs, cite map/weather/
+rail/flight adapter data with this marker, output the marker as a URL, or
+mention this internal protocol to the user.
 """
 
 agent_without_search = create_agent(
@@ -974,6 +1022,10 @@ def _stream_travel_response(
                         summary=evidence.snippet,
                         source_date=evidence.retrieved_at,
                         evidence_id=evidence.evidence_id,
+                        source_type=evidence.source_type,
+                        provider=evidence.provider,
+                        retrieved_at=evidence.retrieved_at,
+                        supports=evidence.supports,
                     )
             try:
                 save_travel_turn(
@@ -994,14 +1046,28 @@ def _stream_travel_response(
                 )
             except Exception as exc:
                 _log_activity("storage", "旅行请求历史保存失败", str(exc))
-    rendered = render_travel_response(response)
+    rendered_with_markers = render_travel_response(response)
+    source_dicts = deduplicate_sources([asdict(source) for source in response.sources])
+    parsed_answer = parse_answer_citations(
+        rendered_with_markers,
+        source_dicts,
+        citations_enabled=search_enabled,
+    )
+    rendered = parsed_answer.final_text
+    answer_segments = parsed_answer.answer_segments
     if saved_plan is not None and thread_id:
         try:
             save_travel_turn(
                 thread_id=thread_id,
                 user_id=user_id,
                 role="assistant",
-                content=rendered,
+                content=rendered
+                + encode_assistant_metadata(
+                    [],
+                    source_dicts,
+                    answer_segments,
+                    search_enabled=search_enabled,
+                ),
                 search_enabled=search_enabled,
                 plan=saved_plan,
             )
@@ -1011,6 +1077,7 @@ def _stream_travel_response(
     yield AIMessageChunk(content=[{"type": "text", "text": rendered}]), {
         "travel": True,
         "trip_plan": asdict(saved_plan) if saved_plan is not None and thread_id else None,
+        "answer_segments": answer_segments,
     }
 
 
@@ -1022,6 +1089,7 @@ def stream_chat(
     user_id: int | None = None,
 ):
     _reset_runtime_buffers()
+    _web_search_allowed_var.set(bool(search_enabled))
 
     _log_activity("think", "分析用户问题", message.strip() or "结合上传内容回答", state="running")
     if attachments:
@@ -1090,16 +1158,65 @@ def _extract_metadata(text: str) -> dict:
         return {}
 
 
-def encode_assistant_metadata(activities: list[dict], sources: list[dict]) -> str:
+def _metadata_bool(metadata: dict, key: str, default: bool = False) -> bool:
+    """Parse persisted metadata conservatively; strings are not truthy flags."""
+
+    if key not in metadata:
+        return default
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _turn_search_enabled(metadata: dict, turn: dict | None = None) -> bool:
+    fallback = (turn or {}).get("search_enabled", False)
+    if isinstance(fallback, bool):
+        default = fallback
+    elif isinstance(fallback, str):
+        default = fallback.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        default = False
+    return _metadata_bool(metadata, "search_enabled", default)
+
+
+def encode_assistant_metadata(
+    activities: list[dict],
+    sources: list[dict],
+    answer_segments: list[dict] | None = None,
+    search_enabled: bool | None = None,
+) -> str:
     payload = {
         "activities": activities or [],
         "sources": sources or [],
+        "answer_segments": answer_segments or [],
     }
+    if search_enabled is not None:
+        payload["search_enabled"] = bool(search_enabled)
     return f"\n\n{ASSISTANT_META_START}{json.dumps(payload, ensure_ascii=False)}{ASSISTANT_META_END}"
 
 
 def _strip_assistant_metadata(text: str) -> str:
-    return re.sub(rf"\s*{re.escape(ASSISTANT_META_START)}[\s\S]*?{re.escape(ASSISTANT_META_END)}", "", text).strip()
+    value = str(text or "")
+    # encode_assistant_metadata adds exactly two newlines as a separator. Remove
+    # that separator with the metadata block, but do not strip the answer body:
+    # leading/trailing spaces can be meaningful for an exact history replay.
+    cleaned = re.sub(
+        rf"(?:\r?\n){{2}}{re.escape(ASSISTANT_META_START)}[\s\S]*?{re.escape(ASSISTANT_META_END)}",
+        "",
+        value,
+    )
+    cleaned = re.sub(
+        rf"{re.escape(ASSISTANT_META_START)}[\s\S]*?{re.escape(ASSISTANT_META_END)}",
+        "",
+        cleaned,
+    )
+    cleaned = strip_citation_markers(cleaned)
+    return cleaned if cleaned.strip() else ""
 
 
 def _extract_assistant_metadata(text: str) -> dict:
@@ -1138,12 +1255,20 @@ def _stored_turn_messages(turns: list[dict]) -> list[dict]:
             cleaned_content = _strip_assistant_metadata(content)
             if not cleaned_content:
                 continue
+            citations_enabled = _turn_search_enabled(metadata, turn)
             result.append(
                 {
                     "role": "assistant",
                     "content": cleaned_content,
                     "activities": metadata.get("activities", []),
                     "sources": metadata.get("sources", []),
+                    "search_enabled": citations_enabled,
+                    "answer_segments": validate_answer_segments(
+                        metadata.get("answer_segments", []),
+                        cleaned_content,
+                        metadata.get("sources", []),
+                        citations_enabled=citations_enabled,
+                    ),
                     "plan_id": turn.get("plan_id"),
                     "plan_version": turn.get("plan_version"),
                 }
@@ -1166,7 +1291,7 @@ def _checkpoint_message_item(msg) -> dict | None:
             "role": "user",
             "content": _strip_internal_sections(content),
             "attachments": attachments,
-            "search_enabled": bool(metadata.get("search_enabled")),
+            "search_enabled": _metadata_bool(metadata, "search_enabled"),
             "image_urls": [item.get("image_url") for item in attachments if item.get("image_url")],
         }
     if isinstance(msg, AIMessage):
@@ -1174,11 +1299,19 @@ def _checkpoint_message_item(msg) -> dict | None:
         cleaned_content = _strip_assistant_metadata(content)
         if not cleaned_content:
             return None
+        citations_enabled = _metadata_bool(metadata, "search_enabled")
         return {
             "role": "assistant",
             "content": cleaned_content,
             "activities": metadata.get("activities", []),
             "sources": metadata.get("sources", []),
+            "search_enabled": citations_enabled,
+            "answer_segments": validate_answer_segments(
+                metadata.get("answer_segments", []),
+                cleaned_content,
+                metadata.get("sources", []),
+                citations_enabled=_metadata_bool(metadata, "search_enabled"),
+            ),
         }
     return None
 
@@ -1196,6 +1329,40 @@ def _history_datetime(value: object) -> datetime:
 
 def _history_timestamp_is_known(value: datetime) -> bool:
     return value != datetime.min.replace(tzinfo=CN_TZ)
+
+
+def _merge_assistant_history_item(target: dict, item: dict) -> None:
+    """Merge legacy assistant fragments without breaking text/segment alignment."""
+
+    item_content = str(item.get("content") or "")
+    target_content = str(target.get("content") or "")
+    target_sources = [*(target.get("sources") or []), *(item.get("sources") or [])]
+    target["sources"] = target_sources
+    target["activities"] = [
+        *(target.get("activities") or []),
+        *(item.get("activities") or []),
+    ]
+
+    combined_content = target_content
+    if item_content and item_content not in target_content:
+        combined_content = f"{target_content}\n\n{item_content}" if target_content else item_content
+    target["content"] = combined_content
+
+    citations_enabled = bool(target.get("search_enabled", False)) and bool(
+        item.get("search_enabled", False)
+    )
+    candidate_segments = list(target.get("answer_segments") or [])
+    if item_content and item_content not in target_content and target_content:
+        candidate_segments.append({"text": "\n\n", "source_ids": []})
+    if item_content and item_content not in target_content:
+        candidate_segments.extend(item.get("answer_segments") or [])
+    target["search_enabled"] = citations_enabled
+    target["answer_segments"] = validate_answer_segments(
+        candidate_segments,
+        combined_content,
+        target_sources,
+        citations_enabled=citations_enabled,
+    )
 
 
 def _legacy_checkpoint_events(thread_id: str) -> list[tuple[datetime, int, dict]]:
@@ -1286,10 +1453,7 @@ def _merge_legacy_history(
         if source == "checkpoint" and _sequence in matched_checkpoint_sequences:
             continue
         if item.get("role") == "assistant" and result and result[-1].get("role") == "assistant":
-            if item.get("content") not in result[-1].get("content", ""):
-                result[-1]["content"] = f"{result[-1]['content']}\n\n{item['content']}".strip()
-            result[-1].setdefault("activities", []).extend(item.get("activities", []))
-            result[-1].setdefault("sources", []).extend(item.get("sources", []))
+            _merge_assistant_history_item(result[-1], item)
         else:
             result.append(item)
     return result
@@ -1332,7 +1496,7 @@ def get_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
                     "role": "user",
                     "content": _strip_internal_sections(content),
                     "attachments": attachments,
-                    "search_enabled": bool(metadata.get("search_enabled")),
+                    "search_enabled": _metadata_bool(metadata, "search_enabled"),
                     "image_urls": [item.get("image_url") for item in attachments if item.get("image_url")],
                 }
             )
@@ -1341,20 +1505,24 @@ def get_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
             cleaned_content = _strip_assistant_metadata(content)
             if not cleaned_content:
                 continue
+            citations_enabled = _metadata_bool(metadata, "search_enabled")
+            history_item = {
+                "role": "assistant",
+                "content": cleaned_content,
+                "activities": metadata.get("activities", []),
+                "sources": metadata.get("sources", []),
+                "search_enabled": citations_enabled,
+                "answer_segments": validate_answer_segments(
+                    metadata.get("answer_segments", []),
+                    cleaned_content,
+                    metadata.get("sources", []),
+                    citations_enabled=citations_enabled,
+                ),
+            }
             if result and result[-1].get("role") == "assistant":
-                if cleaned_content not in result[-1]["content"]:
-                    result[-1]["content"] = f"{result[-1]['content']}\n\n{cleaned_content}".strip()
-                result[-1]["activities"].extend(metadata.get("activities", []))
-                result[-1]["sources"].extend(metadata.get("sources", []))
+                _merge_assistant_history_item(result[-1], history_item)
                 continue
-            result.append(
-                {
-                    "role": "assistant",
-                    "content": cleaned_content,
-                    "activities": metadata.get("activities", []),
-                    "sources": metadata.get("sources", []),
-                }
-            )
+            result.append(history_item)
     travel_messages = _travel_turn_messages(thread_id, user_id=user_id)
     if travel_messages:
         # A travel turn is persisted outside the LangGraph execution state.
@@ -1367,7 +1535,14 @@ def get_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
     return result
 
 
-def attach_assistant_metadata(thread_id: str, assistant_text: str, activities: list[dict], sources: list[dict]) -> None:
+def attach_assistant_metadata(
+    thread_id: str,
+    assistant_text: str,
+    activities: list[dict],
+    sources: list[dict],
+    answer_segments: list[dict] | None = None,
+    search_enabled: bool | None = None,
+) -> None:
     if not assistant_text:
         return
 
@@ -1381,22 +1556,38 @@ def attach_assistant_metadata(thread_id: str, assistant_text: str, activities: l
     if not messages:
         return
 
-    metadata = encode_assistant_metadata(activities, sources)
+    metadata = encode_assistant_metadata(
+        activities,
+        sources,
+        answer_segments,
+        search_enabled=search_enabled,
+    )
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
             continue
         content = _extract_text_content(msg.content)
         if not content or ASSISTANT_META_START in content:
             continue
-        if assistant_text.strip() and assistant_text.strip() not in content:
+        clean_content = strip_citation_markers(content)
+        if assistant_text.strip() and assistant_text.strip() not in content and assistant_text.strip() not in clean_content:
             continue
         if isinstance(msg.content, str):
-            msg.content = f"{msg.content}{metadata}"
+            msg.content = f"{clean_content}{metadata}"
         elif isinstance(msg.content, list):
-            for item in msg.content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    item["text"] = f"{item.get('text', '')}{metadata}"
-                    break
+            text_items = [
+                item
+                for item in msg.content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            if not text_items:
+                continue
+            # LangChain may store one assistant answer in multiple text blocks.
+            # Put the complete sanitized answer and metadata in the first block,
+            # then clear later text blocks to prevent duplicate history content
+            # or leaked citation markers.
+            text_items[0]["text"] = f"{clean_content}{metadata}"
+            for item in text_items[1:]:
+                item["text"] = ""
         checkpoint.put(config, cp["checkpoint"], cp.get("metadata", {}), cp.get("new_versions", {}))
         return
 

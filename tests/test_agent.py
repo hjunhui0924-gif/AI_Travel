@@ -44,6 +44,9 @@ def test_general_web_search_filters_dianping_content_and_source_cards(monkeypatc
     assert "不应暴露的餐厅评价" not in result
     assert "杭州官方活动" in result
     assert all("dianping.com" not in source.get("url", "") for source in sources)
+    assert "Citation ID: web_" in result
+    assert sources[0]["evidence_id"].startswith("web_")
+    assert sources[0]["source_type"] == "web_search"
 
 
 def test_general_web_search_invalid_payload_is_explicit_error(monkeypatch):
