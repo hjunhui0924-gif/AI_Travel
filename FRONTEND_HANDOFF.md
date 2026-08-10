@@ -24,8 +24,9 @@
 - 首次访问 guest 线程时，后端设置 `ai_agent_guest` HttpOnly capability cookie；前端不需要也不能读取它。
 - 生产 HTTPS 部署时设置环境变量 `AI_AGENT_COOKIE_SECURE=true`（或 `APP_ENV=production`/`ENVIRONMENT=production`），后端会为登录和 guest cookie 设置 `Secure`；本地 HTTP 开发默认不设置该标志。
 - 后续请求必须由浏览器自动携带该 cookie。没有 cookie、cookie 错误或线程已归属其他用户时，旅行接口返回 404。
-- guest capability 由服务端同时校验创建时间和最近使用时间，超过 30 天后旧 token 不再有效；空线程可重新获得新 capability，已有计划/回合的过期线程不会被静默重新绑定。
-- 登录用户不要继续向同一接口发送 guest 线程 ID；登录后应切换到账户线程。
+- guest capability 由服务端同时校验创建时间和最近使用时间，超过 7 天后旧 token 不再有效；空线程可重新获得新 capability，已有计划/回合的过期线程不会被静默重新绑定。
+- 登录成功若返回 `claimed_thread`，说明当前 guest 线程已通过 capability 校验并归属该账号；前端可以继续使用这个原始 `guest_...` ID，直到用户主动新建/切换账户线程。未返回 `claimed_thread` 时，登录用户应切换到账户线程，不能使用未归属的 guest ID。
+- 登录/注册弹窗只应由用户主动点击账户菜单触发；首次进入页面不自动弹出，游客可以不登录直接使用。
 
 ## 3. 认证接口
 
@@ -124,7 +125,7 @@
 
 ### `POST /threads/migrate-legacy`
 
-登录用户主动迁移自己仍持有的旧 checkpoint 会话。请求必须显式提供旧线程 ID；后端不会把所有无归属旧历史自动分配给当前用户，也不会接受不在旧 checkpoint 列表中的 ID。为避免旧的 `default` 等共享命名造成越权，当前接口只接受 `guest_...` 随机命名空间；其他旧 ID 需要人工恢复。
+登录用户主动迁移自己仍持有的旧 checkpoint 会话。请求必须显式提供旧线程 ID；后端不会把所有无归属旧历史自动分配给当前用户，也不会接受不在旧 checkpoint 列表中的 ID。旧 checkpoint 创建时没有 capability 绑定，因此该兼容接口不能验证旧 HttpOnly token；它只接受长度足够、随机性较高的 `guest_...` 命名空间，并拒绝 `default` 等共享/歧义 ID。其他旧 ID 需要人工恢复。新创建的游客线程不走此接口，必须使用当前 guest capability 合并。
 
 ```json
 {"thread_ids":["guest_old_uuid"]}
@@ -193,7 +194,7 @@ data: {
 - 旅行请求完成时 `done.trip_plan` 为结构化 TravelPlan；普通聊天为 `null`。
 - `done.final_text` 是可直接展示的文本，不包含内部 metadata 标记。前端不要从它解析日历。
 - `done.answer_segments` 是句子级引用的权威结构；有内容时按它渲染，不能为空或缺失时回退到 `done.final_text`。不要把两者同时完整渲染造成重复文本。
-- 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
+- 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。鉴权/输入错误可以返回具体提示；服务内部异常只返回稳定的通用提示，详细异常只写服务端日志。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
 
 附件限制：图片支持 `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`；文档支持 `.pdf`、`.txt`、`.md`、`.csv`、`.docx`、`.doc`、`.xlsx`、`.xls`。单个文件最大 10MB。`.doc` 只返回兼容性提示，不保证可靠解析。图片附件的 `image_url` 可能是内联 `data:` URL 或有时效的 OSS URL，不应假设它永久有效；历史消息中的图片通过用户消息的 `attachments`/`image_urls` 返回，而 `done.attachments` 当前只列出文本附件。
 

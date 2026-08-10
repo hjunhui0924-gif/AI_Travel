@@ -22,7 +22,6 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from adapters.amap_adapter import plan_route, search_pois, search_pois_around_location
-from adapters.ctrip_flight_adapter import probe_ctrip_flight_page
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
 from adapters.variflight_adapter import is_variflight_configured, search_variflight_flights
 from adapters.rail_12306_adapter import query_left_tickets
@@ -33,8 +32,8 @@ from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CN_TZ = ZoneInfo("Asia/Shanghai")
 LIVE_OK_STATUSES = {"success", "alias", "not_configured", "not_requested"}
-PROVIDERS = ("amap", "rail_12306", "tavily", "ctrip_h5", "variflight", "flight_mcp")
-DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "ctrip_h5", "variflight")
+PROVIDERS = ("amap", "rail_12306", "tavily", "variflight", "flight_mcp")
+DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "variflight")
 
 
 def _now_label() -> str:
@@ -219,31 +218,6 @@ def _flight_query_parameters() -> tuple[str, str, str]:
     return query_date, origin, destination
 
 
-def _check_ctrip() -> tuple[str, str, dict[str, Any]]:
-    query_date, origin, destination = _flight_query_parameters()
-    probe = probe_ctrip_flight_page(origin, destination, query_date)
-    if probe.ok:
-        status = "success"
-        message = probe.message
-    elif probe.blocked:
-        status = "blocked"
-        message = probe.message or "Ctrip H5 请求被风控拦截。"
-    elif probe.failure_kind == "empty":
-        status = "empty"
-        message = probe.message
-    else:
-        status = "failed"
-        message = probe.message or "Ctrip H5 探测失败。"
-    return status, message, {
-        "date": query_date,
-        "origin": origin,
-        "destination": destination,
-        "http_status": probe.http_status,
-        "failure_kind": probe.failure_kind,
-        "url": probe.url,
-    }
-
-
 def _check_flight_mcp() -> tuple[str, str, dict[str, Any]]:
     if not is_flight_mcp_enabled():
         return "not_configured", "未显式启用 Flight MCP，应用不会执行真实航班查询。", {}
@@ -318,14 +292,6 @@ def run_integration_health_checks(
                 "tavily",
                 bool(os.getenv("TAVILY_API_KEY")),
                 _check_tavily if live else lambda: ("not_requested", "未执行实时 Tavily 检查。", {}),
-            )
-        )
-    if "ctrip_h5" in selected:
-        checks.append(
-            _run(
-                "ctrip_h5",
-                True,
-                _check_ctrip if live else lambda: ("not_requested", "未执行实时携程 H5 检查。", {}),
             )
         )
     if "variflight" in selected:

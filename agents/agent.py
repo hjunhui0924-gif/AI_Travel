@@ -1631,10 +1631,16 @@ def list_threads() -> list[dict]:
     return sessions
 
 
+def delete_checkpoint_thread(thread_id: str) -> None:
+    """Delete LangGraph execution state for a thread."""
+
+    checkpoint.delete_thread(thread_id)
+
+
 def delete_thread(thread_id: str, user_id: int | None = None):
     for message in get_messages(thread_id, user_id=user_id):
         for attachment in message.get("attachments", []):
             if attachment.get("storage") == "oss" and attachment.get("object_key"):
                 delete_oss_object(attachment["object_key"])
-    checkpoint.delete_thread(thread_id)
+    delete_checkpoint_thread(thread_id)
     delete_travel_thread(thread_id, user_id=user_id)

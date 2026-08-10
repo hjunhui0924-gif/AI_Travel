@@ -11,7 +11,12 @@ from starlette.requests import Request
 import app as app_module
 from agents import agent as agent_module
 from agents.schemas import PlanDay, PlanItem, TravelPlan, TravelPlanResponse
-from services.travel_store import delete_travel_thread, ensure_guest_access, save_travel_turn
+from services.travel_store import (
+    delete_travel_thread,
+    ensure_guest_access,
+    save_travel_turn,
+    travel_plan_store,
+)
 
 
 def test_guest_travel_plan_and_calendar_endpoints():
@@ -232,6 +237,199 @@ def test_guest_plan_requires_matching_capability_cookie():
         authorized = authorized_client.get(f"/travel/plans/{thread_id}")
         assert authorized.status_code == 200
         assert authorized.json()["plan"]["destination"] == "杭州"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_guest_login_claims_current_session_into_account(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    save_travel_turn(thread_id=thread_id, role="user", content="游客保留的请求")
+    username = f"claim_{uuid4().hex[:12]}"
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    response = client.post(
+        "/auth/register",
+        data={
+            "username": username,
+            "password": "secret123",
+            "display_name": "Claim User",
+            "guest_thread_id": thread_id,
+            "guest_title": "我的游客旅行",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["guest_claim"]["status"] == "claimed"
+    assert body["claimed_thread"]["thread_id"] == thread_id
+    user_id = int(body["user"]["id"])
+    assert app_module.get_thread(thread_id)["user_id"] == user_id
+    assert app_module.get_plan_owner_id(thread_id) is None
+    assert travel_plan_store.list_turns(thread_id, user_id=user_id)[0]["content"] == "游客保留的请求"
+    assert app_module.ensure_guest_access(thread_id, guest_token) is None
+
+    history = client.get(f"/history/{thread_id}")
+    assert history.status_code == 200
+    assert history.json()["messages"][0]["content"] == "游客保留的请求"
+
+    try:
+        app_module.delete_thread_record(user_id, thread_id)
+    finally:
+        app_module.delete_thread(thread_id, user_id=user_id)
+
+
+def test_claimed_guest_thread_can_continue_chat_as_authenticated_user(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    save_travel_turn(thread_id=thread_id, role="user", content="游客保留的请求")
+    username = f"claim_chat_{uuid4().hex[:12]}"
+
+    def fake_stream_chat(**_kwargs):
+        yield AIMessageChunk(content=[{"type": "text", "text": "登录后继续聊天"}]), {}
+
+    monkeypatch.setattr(app_module, "stream_chat", fake_stream_chat)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    response = client.post(
+        "/auth/register",
+        data={
+            "username": username,
+            "password": "secret123",
+            "guest_thread_id": thread_id,
+        },
+    )
+    assert response.status_code == 200
+    user_id = int(response.json()["user"]["id"])
+
+    try:
+        chat_response = client.post(
+            "/chat",
+            data={"message": "继续安排", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert chat_response.status_code == 200
+        assert "登录后继续聊天" in chat_response.text
+        assert "event: error" not in chat_response.text
+    finally:
+        app_module.delete_thread_record(user_id, thread_id)
+        app_module.delete_thread(thread_id, user_id=user_id)
+
+
+def test_chat_stream_hides_internal_exception_details(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+
+    def failing_stream_chat(**_kwargs):
+        raise RuntimeError("provider-secret-token and /private/provider/path")
+
+    monkeypatch.setattr(app_module, "stream_chat", failing_stream_chat)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.post(
+            "/chat",
+            data={"message": "测试内部错误", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert response.status_code == 200
+        assert app_module.INTERNAL_SSE_ERROR_MESSAGE in response.text
+        assert "provider-secret-token" not in response.text
+        assert "/private/provider/path" not in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_authenticated_user_cannot_chat_on_unclaimed_guest_thread():
+    guest_thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(guest_thread_id)
+    username = f"deny_chat_{uuid4().hex[:12]}"
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+    response = client.post(
+        "/auth/register",
+        data={"username": username, "password": "secret123"},
+    )
+    assert response.status_code == 200
+
+    try:
+        denied = client.post(
+            "/chat",
+            data={
+                "message": "不应读到别人的游客会话",
+                "thread_id": guest_thread_id,
+                "search_enabled": "false",
+            },
+        )
+        assert denied.status_code == 200
+        assert "不能使用 guest 会话 ID" in denied.text
+    finally:
+        user_id = int(response.json()["user"]["id"])
+        account_threads = app_module.list_threads_for_user(user_id)
+        for thread in account_threads:
+            app_module.delete_thread_record(user_id, thread["thread_id"])
+            app_module.delete_thread(thread["thread_id"], user_id=user_id)
+        delete_travel_thread(guest_thread_id)
+
+
+def test_calendar_lazy_projection_export_and_share_endpoints():
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-03",
+        origin="广州",
+        destination="杭州",
+        days=[
+            PlanDay(
+                date="2026-09-02",
+                day_number=1,
+                title="第一天",
+                summary="西湖",
+                items=[PlanItem("lazy-item", "attraction", "西湖", "2026-09-02")],
+            ),
+            PlanDay(date="2026-09-03", day_number=2, title="第二天"),
+        ],
+    )
+    saved = app_module.save_plan_version(plan, expected_version=0)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        header = client.get(f"/travel/plans/{thread_id}?include_days=false")
+        assert header.status_code == 200
+        assert header.json()["plan"]["days"] == []
+
+        calendar = client.get(f"/travel/plans/{thread_id}/calendar?version={saved.version}")
+        assert [day["date"] for day in calendar.json()["days"]] == ["2026-09-02", "2026-09-03"]
+        day = client.get(f"/travel/plans/{thread_id}/days/2026-09-02?version=1")
+        assert day.json()["day"]["items"][0]["item_id"] == "lazy-item"
+
+        markdown = client.get(f"/travel/plans/{thread_id}/export?format=markdown")
+        assert markdown.status_code == 200
+        assert "西湖" in markdown.text
+        assert ".md" in markdown.headers["content-disposition"]
+        exported_json = client.get(f"/travel/plans/{thread_id}/export?format=json")
+        assert exported_json.status_code == 200
+        assert exported_json.json()["version"] == 1
+
+        created = client.post(f"/travel/plans/{thread_id}/shares", json={"expires_days": 5})
+        assert created.status_code == 200
+        share = created.json()["share"]
+        public = TestClient(app_module.app).get(share["api_url"])
+        assert public.status_code == 200
+        assert public.json()["plan"]["thread_id"] == ""
+        html = TestClient(app_module.app).get(share["url"])
+        assert html.status_code == 200
+        assert "西湖" in html.text
+
+        revoked = client.delete(f"/travel/plans/{thread_id}/shares/{share['share_id']}")
+        assert revoked.status_code == 200
+        assert TestClient(app_module.app).get(share["api_url"]).status_code == 404
     finally:
         delete_travel_thread(thread_id)
 

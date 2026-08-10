@@ -61,15 +61,15 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 重规划时日期范围外的已确认/锁定项目会进入结构化 `TravelPlan.out_of_range_items`，不会静默消失；该列表也支持计划项 PATCH。
 - 首次旅行计划写入使用 `expected_version=0`，与 SQLite `BEGIN IMMEDIATE` CAS 配合，避免并发首次请求互相覆盖。
 - 航班/铁路候选逐条隔离异常，路线 transit/driving/walking 按模式隔离异常；一个 provider 行或模式失败不会丢弃同批有效结果，并通过 `partial/failed` 状态和 diagnostics 暴露。
-- guest capability 服务端校验创建时间和最近使用时间的 30 天 TTL；旧 checkpoint 只能通过登录用户主动提交已知 ID 的迁移接口归属，禁止自动迁移。
+- guest capability 服务端校验创建时间和最近使用时间的 7 天 TTL；旧 checkpoint 只能通过登录用户主动提交已知 ID 的迁移接口归属，禁止自动迁移。
 - 计划项生成后做同日 ID 去重，避免相同标题导致 PATCH 更新到错误项目。
 - 航班 bridge 的 auto 路径已移除默认 dummy fallback；Flight MCP 现在必须显式启用。
 - 已新增旅行搜索发现层和证据对象；搜索关闭时不会创建 Tavily searcher 或调用网页搜索。
 - 自动化测试目录已建立，覆盖存储、日期、搜索开关、POI 无结果、重规划、锁定项、航班 demo 隔离、API 和 SSE。
 - `utils/weather_utils.py` 已增加高德 API 错误码、有限重试、请求节流和地址缓存；同一轮路线规划不会重复突发请求高德。
 - `adapters/rail_12306_adapter.py` 已缓存站点字典，并为会话初始化和余票查询增加单请求超时与整条查询总超时，避免 12306 风控/网络异常拖住整次规划。
-- `adapters/ctrip_flight_adapter.py`、`bridges/flight_mcp_bridge.py` 已识别 Ctrip H5 的 whaleguard/HTTP 432/页面结构变化，并把失败原因传给上层；不会把被拦截结果伪装成空航班或 dummy 航班。
-- 新增 `services/integration_health.py`：使用 `python -m services.integration_health --live` 检查高德、12306、Tavily、Ctrip H5 和 Flight MCP，输出不含密钥的结构化状态。
+- 航班生产链路只保留 VariFlight、Flight MCP 和其他已授权 provider；已删除不可用的 Ctrip H5 爬取/探测链路。
+- `services/integration_health.py`：使用 `python -m services.integration_health --live` 检查高德、12306、Tavily、VariFlight 和 Flight MCP，输出不含密钥的结构化状态。
 
 ## 6. 领域模型约定
 
@@ -140,13 +140,13 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ### Phase 5：外部环境联调与失败降级
 
-- 状态：已完成本轮联调与审查；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，VariFlight 已完成真实航班查询联调，相关变更已提交。
+- 状态：已完成本轮联调与审查；高德、12306、Tavily 和 VariFlight 已真实联调通过；不可用的 Ctrip H5 爬取链路已移除。
 - 目标：确认 `.env` 中的凭证不仅存在，而且真实请求、响应解析和业务降级链路可用。
 - 高德证据：地理编码、天气、文本 POI、周边 POI、步行路线、驾车路线和公交路线均返回成功；请求加入节流/重试/缓存。
 - 12306 证据：广州南 -> 深圳北，动态未来日期返回 579 条原始车次；加入站点字典缓存、单请求超时和 45 秒总超时后，本次健康检查约 1.3 秒完成。
 - Tavily 证据：真实搜索返回 5 条发现结果；搜索仍只有在 `search_enabled=true` 时允许进入旅行发现层。
-- Ctrip 证据：`https://m.ctrip.com/html5/flight/sha-hgh-day-8.html` 返回 HTTP 432，正文为 `whaleguard block`；当前 H5 爬虫不可作为生产航班源，不再尝试绕过风控。
-- Flight MCP 旧路径证据：未配置或 package/command/http provider 失败时仍返回明确的 `not_configured/failed`，不显示价格、班次或可预订暗示；Ctrip H5 只保留探测能力。
+- 航班证据：Ctrip H5 曾返回 HTTP 432/`whaleguard block`，因此不再尝试绕过风控，也不再保留其爬取或探测实现；生产航班只走授权 VariFlight/Flight MCP/官方合作 API。
+- Flight MCP 旧路径证据：未配置或 package/command/http provider 失败时仍返回明确的 `not_configured/failed`，不显示价格、班次或可预订暗示。
 - VariFlight 证据：当前 `.env` 已配置 `FLIGHT_MCP_ENABLED=true`、`FLIGHT_MCP_MODE=variflight` 及授权凭证；`python -m services.integration_health --live --only variflight` 与 `--only flight_mcp` 均已返回成功，上海（SHA）到杭州（HGH）样例返回 1 条可售航班且 provider 库存数量可解析。
 - 解决方案：生产航班只走已授权的 VariFlight/Flight MCP/官方合作 API；任何 provider 失败都进入结构化诊断，VariFlight 的价格、舱位和 `seat_count` 仅代表查询时的候选信息，不代表锁座或出票。
 
@@ -165,7 +165,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 是否允许旧 checkpoint 通过任意 guest cookie 首次绑定，或让过期 capability 继续访问。
 - 是否把同日同名项目生成相同 `item_id`，导致 PATCH 地址不唯一。
 - 是否在后端契约未稳定前修改前端文件。
-- 是否把 Ctrip H5 被风控后的空列表当作“当天没有航班”；应展示 `blocked/failed` 诊断并切换到授权航班源。
+- 是否把任一航班 provider 的失败当作“当天没有航班”；应展示 `failed/not_configured` 诊断并切换到授权航班源。
 - 是否让 12306/高德的单个网络调用无限等待或在同一计划内重复请求；应遵守 adapter 的节流、缓存和总超时配置。
 
 ## 10. 变更日志
@@ -189,7 +189,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 增加通用联网搜索的 Dianping 过滤、无效响应状态测试和网页搜索状态机测试。
 - 增加 `FRONTEND_HANDOFF.md`，记录 SSE、TravelPlan、日历、计划项 CAS、guest cookie、来源和错误契约。
 - 修复旧 checkpoint 的任意 guest cookie 劫持：旧 checkpoint 不能首次 mint capability；已有合法绑定仍可验证。
-- 增加 guest capability 服务端 TTL（创建时间/最近使用时间均超过 30 天则失效）；空线程可重新生成新 token，有持久化数据的线程不会静默重绑。
+- 增加 guest capability 服务端 TTL（创建时间/最近使用时间均超过 7 天则失效）；空线程可重新生成新 token，有持久化数据的线程不会静默重绑。
 - 增加登录用户主动迁移旧 checkpoint 的 `POST /threads/migrate-legacy`，仅接受用户显式提交且仍存在的 `guest_...` 随机线程 ID，不自动认领 `default` 等歧义历史。
 - 增加 `TravelPlan.out_of_range_items` 和日历 `out_of_range_item_count`，保留日期范围外的 confirmed/locked/booked 项并支持 PATCH。
 - 首次旅行计划保存显式传 `expected_version=0`；航班单条结果、路线各模式失败互不阻断；同日重复项目自动生成唯一 `item_id`。
@@ -215,7 +215,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 - 旧 checkpoint 带任意 guest cookie 不能首次 mint capability；只有已有合法绑定可以验证。
 - 旧历史迁移只接受登录用户显式提交的、仍存在且长度足够的 `guest_...` ID；`default` 等共享/歧义 ID 不允许自助认领。迁移后已归属当前用户的旧 guest ID 可以正常访问。
-- guest capability 服务端校验 30 天创建/最近使用 TTL；空线程过期后生成新 token，带持久化数据的过期线程不重绑。
+- guest capability 服务端校验 7 天创建/最近使用 TTL；空线程过期后生成新 token，带持久化数据的过期线程不重绑。
 - 首次旅行计划路径明确传 `expected_version=0`；日期外锁定项保存在 `out_of_range_items`，同日重复项目经过全局 ID 去重；航班、铁路和路线 partial/failed 状态会保留可用结果并进入 diagnostics。
 
 最终验证证据（后端基线 + 外部联调修复）：`python -m pytest -q` 为 **58 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。`FRONTEND_HANDOFF.md` 的 TravelPlan `adapter_status/diagnostics` 契约仍然有效。
@@ -228,10 +228,10 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 已验证的真实样例是上海（SHA）到杭州（HGH），返回航班号、跨午夜起降时间、价格、舱位和 provider 返回的可售数量。
 - `seat_count` 只表示选中票价舱位的 provider 可售数量；`null` 表示未知，不代表锁座、出票或预订保证。已暴露到 `TransportOption` 和持久化 `PlanItem`。
 - provider 错误、HTTP/鉴权错误、网络错误和响应结构变化不得降级为空航班；应进入 `failed/not_configured` 诊断。已知零库存舱位不作为可售候选。
-- Ctrip H5 继续只做风控探测，不绕过 WhaleGuard；Flight MCP 的旧 command/http/package 路径保持兼容，VariFlight 模式直接走授权 HTTP adapter；显式旧模式优先，不会因凭证存在而静默抢占。
+- Flight MCP 的旧 command/http/package 路径保持兼容，VariFlight 模式直接走授权 HTTP adapter；显式旧模式优先，不会因凭证存在而静默抢占。
 - 非空但结构异常的 provider 响应会进入 `schema_changed/failed`；混合有效/异常行保留有效结果并进入 `partial` 诊断；未知三字母码要求配置映射，避免把机场码盲传为城市码。
 - 完整验证已完成：`python -m pytest -q` 为 **80 passed**，有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`git diff --check` 无内容错误，仅报告 Windows 换行转换提示。
-- 实时验证已完成：VariFlight 与 `flight_mcp` 单项检查均 `success`，返回 1 条航班且 `seat_count_known=1`；全量检查中高德、12306（579 条）、Tavily（5 条）和 VariFlight 成功，Flight MCP 以 alias 复用且未重复请求，Ctrip H5 仍为已知 `blocked/HTTP 432`，全量 `overall_status=needs_attention` 属于预期边界。
+- 实时验证已完成：VariFlight 与 `flight_mcp` 单项检查均 `success`，返回 1 条航班且 `seat_count_known=1`；全量检查中高德、12306（579 条）、Tavily（5 条）和 VariFlight 成功，Flight MCP 以 alias 复用且未重复请求。
 
 ## 13. 旧通用能力清理增量（2026-08-09）
 
@@ -239,7 +239,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 目标：删除已经被垂直旅行规划后端替代、且不属于当前产品边界的股票/行情能力和独立通用 MCP 入口，降低维护面与误触发风险。
 - 已删除范围：`utils/stock_utils.py`、`agents/agent.py` 中的股票/行情分支、旧 `mcp_server/server.py`、`.mcp.json`、股票专用 `skills/market-query/SKILL.md` 以及仅供旧 MCP 入口使用的 `mcp` 直接依赖。
 - 文档同步：移除基础提示词中已删除的行情能力指引和通用 MCP 入口表述；将实体标准化/实时路由技能收敛到旅行领域；保留文件解析、天气和联网搜索能力。
-- 明确保留：旅行计划、日历/重规划、文件上传与可选 OSS 存储、高德/12306/VariFlight、Ctrip 风控探测、Flight MCP 兼容桥和静态前端。
+- 明确保留：旅行计划、日历/重规划、文件上传与可选 OSS 存储、高德/12306/VariFlight、Flight MCP 兼容桥和静态前端。
 - 边界：本次清理不删除运行时数据库、上传数据、缓存、静态前端或任何授权交通 adapter；不改变前端交接接口。
 - 验证：`python -m pytest -q` 为 **80 passed**，仅有既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 通过；`python -c "import app"` 通过；`git diff --check` 通过；仓库内未发现股票能力或本地 `mcp_server` 入口的运行时引用，`.env` 中未再保留旧股票配置变量。授权航班桥中保留的外部 `flight_ticket_mcp_server` 是兼容 provider 名称，不属于本次删除目标。
 ## 14. 句子级联网搜索引用（2026-08-10）
@@ -285,3 +285,66 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 如需统一来源卡字段，前端按 `summary ?? snippet` 展示摘要；来源链接必须二次确认协议为 `http/https`。
 - 本阶段没有修改 `static/index.html`、`static/main.js`、`static/style.css`。
 - 本次交接文档二次审查已补充历史/删除接口、会话列表字段、文件上传限制、SSE `fetch + ReadableStream` 处理、无计划日历返回、计划项状态约束、迁移上限和外部来源安全边界。
+
+## 15. 前端 Vue3+TS 重写（2026-08-10）
+
+### 决策
+
+- 用户确认：删除旧的原生 JS 前端（`static/index.html`、`static/main.js`、`static/style.css` 已删除），改用 Vue 3 + TypeScript + Vite 重写，全量接入 `FRONTEND_HANDOFF.md` 契约，布局为右侧可折叠计划面板。
+- 前端源码在 `frontend/`，构建产物输出到 `static/`（`vite build`，`base=/static/`，outDir `../static`）；FastAPI 无需改动，`/` 仍返回 `static/index.html`，`/static` 挂载资产。
+- 品牌图片（travel-mark.png、assistant-mark.png）复制到 `frontend/public/` 与 `frontend/src/assets/`，构建时自动重新生成到 `static/`。
+- 不再使用 `emptyOutDir`（沙箱安全删除钩子会拦截构建期目录清空）；静态目录清理由人工完成。
+
+### 前端架构
+
+- 状态：Pinia 四 store —— auth（登录态）、session（线程/会话、guest id 生成与切换、删除）、chat（消息、SSE 流式、附件、搜索开关）、plan（TravelPlan、日历、选中日期、PATCH/replan、来源栏、版本预览）。
+- API 层：`frontend/src/api/`，统一 `credentials: "include"`；`/chat` 用 `fetch + ReadableStream` 按空行分帧解析 SSE（兼容 LF/CRLF），支持 activity/source/text/done/error 事件。
+- 句子级引用：仅渲染 `answer_segments` + `done.sources` 中 `source_type="web_search"` 且 URL 为 http/https 的来源；句末链条图标点击后右侧面板来源标签页高亮对应来源卡；不从 Markdown 解析引用。
+- 计划面板：行程（计划头/版本切换/月历高亮/日清单/交通候选/冲突/out_of_range 保留项/重规划表单）、来源（summary ?? snippet、仅 http/https 可点击、noopener noreferrer）、状态（adapter_status 分层、alerts/risks/conflicts、diagnostics 折叠）三个标签页。
+- 计划项 PATCH 始终携带 `expected_version` CAS；409 时刷新计划并提示用户基于最新版本重试；confirmed/booked 强制 locked=true，单独 locked=false 回退 suggested。
+- 安全：所有 Markdown 经 marked + DOMPurify 过滤；来源标题/摘要/URL 按不可信数据处理；`is_demo` 明显标记"演示数据，不可购票"；`seat_count` 标注仅供参考不代表锁座出票。
+- 游客/登录：guest 线程 id 本地生成 `guest_<32hex>` 并持久化；登录后通常切换到账户线程（`POST /threads` / `GET /sessions`），但 `claimed_thread` 可继续使用已合并的原 guest id；删除会话有二次确认。
+
+### 验证
+
+- `npm run typecheck`（vue-tsc）通过；`npm run build` 通过，产物约 192KB JS（gzip ~70KB）+ 22KB CSS。
+- 冒烟（2026-08-10，隔离 venv `C:\Users\Website\.workbuddy\binaries\python\envs\default`，需补装 tzdata）：`/health`、`/`、`/static/assets/*`、`/favicon.ico`、`/auth/me` 均 200；guest `/chat` SSE 正确返回 error 事件（当前 LLM 供应商免费额度耗尽 403，非契约问题）；guest capability cookie 设置后 `/travel/plans/{id}` 返回 `plan=null,versions=[]`、`/calendar` 返回空日历结构、`/history/{id}` 正确保存用户回合。
+
+## 16. 游客生命周期与登录合并修复（2026-08-10）
+
+- 游客 capability 的创建时间和最近活跃时间均采用 7 天 TTL；每次有效请求滑动更新 cookie 和服务端 `last_seen_at`。
+- 后台清理会先把 capability 标记为 `deleting`，再删除 checkpoint、旅行回合、计划版本、分享快照和 OSS 附件；清理失败会保留状态供下一轮重试。
+- 登录/注册成功时，只有携带当前浏览器的 guest capability 且线程确实有数据才允许合并；合并后游客 capability 删除，数据归属账号。
+- 两个 SQLite 存储无法做跨库原子提交，因此合并流程按可重试/幂等设计：若进程在归属转移后中断，下一次登录可识别同一账号已拥有且仍有数据的线程并完成收尾。
+- 已合并的 `guest_...` 线程允许该账号继续使用；未归属的 guest 线程仍拒绝登录态访问，匿名线程和账号线程保持隔离。
+- 异常/损坏的 guest 时间字段按过期候选处理，避免清理任务因无法解析时间而永久跳过数据。
+- 登录弹窗需求已取消：前端不在首次进入或初始化时自动弹窗；仅保留用户主动打开账户菜单后的登录/注册入口，游客可直接使用。
+
+## 17. 二次对抗式审查修复（2026-08-10）
+
+### 审查结论
+
+- 前端审查确认当前没有首次进入自动登录弹窗；登录/注册弹窗只由账户菜单主动打开。部分早期报告中的初始化竞态、游客标题解析崩溃、移动端遮罩和计划读取竞态已在当前 Vue 工作树中有对应保护，仍需以前端实际构建结果为准。
+- 旧 checkpoint 迁移接口不要求 guest capability 是有意的兼容边界：旧数据创建时没有 capability 绑定，无法凭空验证旧 cookie。接口只接受用户显式提交、来源于旧浏览器状态且长度足够的随机 `guest_...` ID，拒绝 `default` 等歧义 ID；新游客线程的登录合并仍强制当前 capability。
+- 后端审查未发现分享 token 明文存储、公开分享泄露源线程 ID、guest TTL 绕过或计划版本 CAS 的 Critical 问题。
+
+### 已修复
+
+- `services/auth_service.py` 的进程级 SQLite 连接增加可重入锁，覆盖认证、会话、线程归属和旧历史迁移操作，避免 FastAPI 多工作线程同时提交导致事务串扰。
+- `/chat` 流内部异常改为服务端记录完整日志、SSE 仅返回稳定通用错误，不再把 provider 凭证、路径或异常原文泄漏给浏览器。
+- `FRONTEND_HANDOFF.md` 补充旧 checkpoint 迁移边界和 SSE 内部错误消息契约。
+
+### 待验证
+
+- 已验证：`python -m pytest -q` → **103 passed**，1 个既有 FastAPI/Starlette 弃用警告；其中新增 SSE 回归确认内部 provider 异常文本不会进入响应。
+- 已验证：`python -m compileall -q agents services adapters bridges app.py tests` 通过；`python -c "import app"` 通过。
+- 已验证：`frontend/npm run typecheck` 与 `frontend/npm run build` 均通过，构建产物输出到当前 `static/`；`git diff --check` 无内容错误，仅有 Windows 换行转换提示。
+- 最终状态：本轮后端对抗式审查修复完成；首次进入自动登录弹窗保持取消，登录/注册弹窗仍只从账户菜单主动打开。
+
+## 18. 移除不可用携程链路（2026-08-11）
+
+- 原因：Ctrip H5 实测返回 HTTP 432/WhaleGuard，无法作为稳定、合规的生产航班数据源。
+- 已删除：`adapters/ctrip_flight_adapter.py`、Flight MCP Bridge 中的携程 fallback 和显式模式、旅行 Agent 的携程探测、集成健康检查中的 `ctrip_h5` provider、`FLIGHT_CTRIP_PROBE_ENABLED` 配置以及对应测试。
+- 保留：VariFlight、Flight MCP 的授权 command/package/http 兼容路径和演示 dummy 隔离逻辑。
+- 文档已同步：README、`.env.example` 和本进程文档不再把携程列为可用能力；历史联调记录保留为“曾确认不可用”的审计证据。
+- 删除后验证已完成：`python -m pytest -q` → **101 passed**，仅有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 和 `python -c "import app"` 通过；`frontend/npm run typecheck` 与 `frontend/npm run build` 均通过；非文档源码无 Ctrip/WhaleGuard/携程引用；`.env` 与 `.env.example` 无 Ctrip 配置键；`git diff --check` 通过。

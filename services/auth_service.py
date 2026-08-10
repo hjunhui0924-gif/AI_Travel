@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import hmac
 import re
 import secrets
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +22,26 @@ SESSION_TTL_DAYS = 30
 connection = sqlite3.connect(DB_PATH, check_same_thread=False)
 connection.row_factory = sqlite3.Row
 connection.execute("PRAGMA foreign_keys = ON")
+_connection_lock = threading.RLock()
+
+
+def _synchronized(func):
+    """Serialize access to the process-wide SQLite connection.
+
+    The auth store predates the request-threaded FastAPI app and intentionally
+    keeps one connection for its small local database.  ``check_same_thread``
+    makes that connection usable from worker threads, but it does not make
+    transactions thread-safe; a lock is therefore required around every
+    public operation that touches it.  RLock keeps nested helpers such as
+    ``create_or_update_user -> create_user`` safe.
+    """
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with _connection_lock:
+            return func(*args, **kwargs)
+
+    return wrapped
 
 
 def _utc_now() -> datetime:
@@ -70,6 +92,7 @@ def _serialize_user(row: sqlite3.Row | None) -> dict[str, Any] | None:
     }
 
 
+@_synchronized
 def init_auth_store() -> None:
     connection.executescript(
         """
@@ -115,6 +138,7 @@ def validate_registration_input(username: str, password: str, display_name: str)
     return None
 
 
+@_synchronized
 def create_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:
     error = validate_registration_input(username, password, display_name or username)
     if error:
@@ -142,6 +166,7 @@ def create_user(username: str, password: str, display_name: str = "") -> dict[st
     return user
 
 
+@_synchronized
 def create_or_update_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:
     error = validate_registration_input(username, password, display_name or username)
     if error:
@@ -170,6 +195,7 @@ def create_or_update_user(username: str, password: str, display_name: str = "") 
     return user
 
 
+@_synchronized
 def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
     normalized_username = _normalize_username(username)
     row = connection.execute("SELECT * FROM users WHERE username = ?", (normalized_username,)).fetchone()
@@ -180,14 +206,17 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
     return _serialize_user(row)
 
 
+@_synchronized
 def _get_user_row_by_id(user_id: int) -> sqlite3.Row | None:
     return connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+@_synchronized
 def get_user_by_id(user_id: int) -> dict[str, Any] | None:
     return _serialize_user(_get_user_row_by_id(user_id))
 
 
+@_synchronized
 def create_session(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     now = _utc_now()
@@ -209,6 +238,7 @@ def create_session(user_id: int) -> str:
     return token
 
 
+@_synchronized
 def delete_session(token: str) -> None:
     if not token:
         return
@@ -216,6 +246,7 @@ def delete_session(token: str) -> None:
     connection.commit()
 
 
+@_synchronized
 def get_user_by_session_token(token: str) -> dict[str, Any] | None:
     if not token:
         return None
@@ -244,6 +275,7 @@ def get_user_by_session_token(token: str) -> dict[str, Any] | None:
     return _serialize_user(row)
 
 
+@_synchronized
 def create_thread(user_id: int, title: str = DEFAULT_THREAD_TITLE, thread_id: str | None = None) -> dict[str, Any]:
     resolved_thread_id = (thread_id or f"thread_{secrets.token_hex(8)}").strip()
     now = _utc_now_label()
@@ -263,6 +295,7 @@ def create_thread(user_id: int, title: str = DEFAULT_THREAD_TITLE, thread_id: st
     }
 
 
+@_synchronized
 def get_thread(thread_id: str) -> dict[str, Any] | None:
     row = connection.execute("SELECT * FROM chat_threads WHERE thread_id = ?", (thread_id,)).fetchone()
     if row is None:
@@ -276,6 +309,7 @@ def get_thread(thread_id: str) -> dict[str, Any] | None:
     }
 
 
+@_synchronized
 def ensure_thread_for_user(user_id: int, thread_id: str, title: str = DEFAULT_THREAD_TITLE) -> bool:
     existing = get_thread(thread_id)
     if existing is None:
@@ -284,6 +318,41 @@ def ensure_thread_for_user(user_id: int, thread_id: str, title: str = DEFAULT_TH
     return int(existing["user_id"]) == int(user_id)
 
 
+@_synchronized
+def claim_thread_for_user(
+    user_id: int,
+    thread_id: str,
+    title: str = DEFAULT_THREAD_TITLE,
+) -> tuple[dict[str, Any], bool] | None:
+    """Attach a previously anonymous/checkpoint thread to an account.
+
+    The caller must prove ownership of the anonymous capability before
+    invoking this function.  The returned boolean tells the caller whether a
+    new account-thread row was created so it can compensate if a second
+    storage transfer fails.
+    """
+
+    cleaned_thread_id = str(thread_id or "").strip()
+    if not cleaned_thread_id or len(cleaned_thread_id) > 256:
+        return None
+    existing = get_thread(cleaned_thread_id)
+    if existing is not None:
+        if int(existing["user_id"]) != int(user_id):
+            return None
+        cleaned_title = (title or "").strip()
+        if cleaned_title and existing["title"] == DEFAULT_THREAD_TITLE:
+            update_thread_activity(int(user_id), cleaned_thread_id, cleaned_title)
+        return get_thread(cleaned_thread_id), False
+
+    created = create_thread(
+        user_id=int(user_id),
+        title=(title or DEFAULT_THREAD_TITLE).strip()[:32] or DEFAULT_THREAD_TITLE,
+        thread_id=cleaned_thread_id,
+    )
+    return created, True
+
+
+@_synchronized
 def list_threads_for_user(user_id: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
@@ -305,6 +374,7 @@ def list_threads_for_user(user_id: int) -> list[dict[str, Any]]:
     ]
 
 
+@_synchronized
 def update_thread_activity(user_id: int, thread_id: str, title: str | None = None) -> None:
     existing = get_thread(thread_id)
     if existing is None or int(existing["user_id"]) != int(user_id):
@@ -323,6 +393,7 @@ def update_thread_activity(user_id: int, thread_id: str, title: str | None = Non
     connection.commit()
 
 
+@_synchronized
 def backfill_titles_for_user(user_id: int, title_resolver: Callable[[str], str | None]) -> None:
     rows = connection.execute(
         "SELECT thread_id, title FROM chat_threads WHERE user_id = ?",
@@ -341,6 +412,7 @@ def backfill_titles_for_user(user_id: int, title_resolver: Callable[[str], str |
     connection.commit()
 
 
+@_synchronized
 def list_legacy_thread_ids() -> list[str]:
     rows = connection.execute(
         """
@@ -358,6 +430,7 @@ def list_legacy_thread_ids() -> list[str]:
     return [str(row["thread_id"]) for row in rows if str(row["thread_id"]).strip()]
 
 
+@_synchronized
 def assign_threads_to_user(user_id: int, thread_ids: list[str], default_title: str = DEFAULT_THREAD_TITLE) -> int:
     now = _utc_now_label()
     claimed = 0
@@ -380,6 +453,7 @@ def assign_threads_to_user(user_id: int, thread_ids: list[str], default_title: s
     return claimed
 
 
+@_synchronized
 def delete_thread_record(user_id: int, thread_id: str) -> bool:
     existing = get_thread(thread_id)
     if existing is None or int(existing["user_id"]) != int(user_id):
@@ -389,6 +463,7 @@ def delete_thread_record(user_id: int, thread_id: str) -> bool:
     return True
 
 
+@_synchronized
 def is_thread_owned_by_user(user_id: int, thread_id: str) -> bool:
     existing = get_thread(thread_id)
     if existing is None:

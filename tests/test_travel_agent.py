@@ -323,6 +323,9 @@ def test_partial_transport_result_is_exposed_in_plan(monkeypatch):
         errors=["row:dict"],
     )
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: rail_result)
+    # Keep this unit test deterministic even when a developer's .env enables
+    # a live flight provider for integration checks.
+    monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
 
     response = travel_agent.plan_travel("2026-09-02 从上海去杭州坐高铁", [], search_enabled=False)
 

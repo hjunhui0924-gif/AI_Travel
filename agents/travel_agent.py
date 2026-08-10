@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled
-from adapters.ctrip_flight_adapter import probe_ctrip_flight_page
 from agents.schemas import (
     Evidence,
     PlanDay,
@@ -265,25 +263,6 @@ def _extract_constraints(message: str, preferences: list[str]) -> list[str]:
 
 def _extract_date(message: str) -> str:
     return _extract_date_range(message)[0]
-
-
-def _build_flight_diagnostics(query: TravelQuery) -> list[str]:
-    if query.travel_mode != "flight" or os.getenv("FLIGHT_CTRIP_PROBE_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return []
-
-    airport_map = {"上海": "SHA", "杭州": "HGH", "北京": "BJS", "广州": "CAN", "深圳": "SZX", "湛江": "ZHA"}
-    origin_code = airport_map.get(query.origin, query.origin)
-    destination_code = airport_map.get(query.destination, query.destination)
-    if not origin_code or not destination_code or not query.date:
-        return []
-
-    probe = probe_ctrip_flight_page(origin_code, destination_code, query.date)
-    return [
-        "ctrip_probe "
-        f"ok={probe.ok} blocked={probe.blocked} "
-        f"http_status={probe.http_status} failure_kind={probe.failure_kind} "
-        f"message={probe.message} url={probe.url}"
-    ]
 
 
 def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
@@ -748,10 +727,7 @@ def plan_travel(
     alerts: list[str] = []
     risks: list[str] = []
     conflicts: list[str] = []
-    try:
-        diagnostics = _build_flight_diagnostics(query)
-    except Exception as exc:
-        diagnostics = [f"flight probe failed: {type(exc).__name__}"]
+    diagnostics: list[str] = []
     adapter_status: dict[str, str] = {}
 
     if rail_requested and query.origin and query.destination and query.date:

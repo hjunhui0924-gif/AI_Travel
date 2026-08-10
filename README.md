@@ -1,7 +1,7 @@
 # AI Travel Agent
 
-一个基于 `FastAPI + LangChain + LangGraph` 的旅行与出行规划助手项目。  
-当前产品形态已经不是“通用 AI 助手”，而是围绕出行场景做了定向能力编排，重点覆盖机票、高铁、路线、天气、周边推荐、文件辅助问答，以及多用户会话隔离。
+一个基于 `FastAPI + LangChain + LangGraph` 的“懒人旅行规划 Agent”。
+用户只需描述大致出发时间、目的地和偏好，Agent 会整理交通、天气、路线、周边地点和每日行程，并将计划保存为可修改、可重规划的结构化数据。
 
 ## 当前定位
 
@@ -16,7 +16,7 @@
 ## 主要能力
 
 - 旅行问答工作台：围绕“从哪里出发、什么时候走、到哪里、怎么去”来组织回答
-- 机票查询链路：支持通过 VariFlight、Flight MCP Bridge 接入授权航班数据；携程 H5 仅保留探测能力
+- 机票查询链路：支持通过 VariFlight、Flight MCP Bridge 接入授权航班数据
 - 高铁查询链路：支持 12306 方向的高铁信息整理
 - 路线规划：支持地点解析、城市内路径建议与周边推荐
 - 天气辅助：支持高德天气查询，为出行建议补充天气上下文
@@ -25,7 +25,9 @@
 - 可视化回答：对出行类问题优先渲染更结构化的结果面板，而不是纯文本长回复
 - 多会话管理：支持新建、切换、删除历史会话
 - 登录与会话隔离：不同账号只能看到自己的聊天记录
-- 游客模式：未登录时可临时使用，关闭网页后自动清理游客会话
+- 游客模式：未登录时可直接使用；游客会话按最近活动滑动保留 7 天，过期后由后台清理
+- 计划能力：小日历按需加载、日期清单、版本预览、锁定项、冲突检测、Markdown/JSON 导出和只读分享
+- 句子级来源：联网搜索回答可将句子与网页来源关联，前端支持来源侧栏查看
 
 ## 登录与历史记录隔离
 
@@ -33,7 +35,7 @@
 
 - 注册 / 登录 / 退出登录
 - 游客模式临时会话
-- 历史记录迁移到管理员账户
+- 登录后可将当前浏览器持有 capability 的游客会话合并到账号
 - 不同用户之间的会话完全隔离
 
 隔离规则如下：
@@ -41,7 +43,7 @@
 - 已登录用户只能访问自己创建的会话
 - A 用户不能读取或删除 B 用户的会话
 - 游客只能访问 `guest_...` 临时会话
-- 游客关闭网页后，临时会话会自动删除
+- 游客 capability 超过 7 天未活动后，后台清理聊天、旅行计划、分享快照和关联附件
 
 登录信息和会话数据目前保存在本地 SQLite：
 
@@ -59,7 +61,7 @@
 
 - Backend: `FastAPI`
 - Agent orchestration: `LangChain`, `LangGraph`
-- Frontend: 原生 `HTML + CSS + JavaScript`
+- Frontend: `Vue 3 + TypeScript + Vite + Pinia`
 - Vector retrieval: `ChromaDB`
 - Web search: `Tavily`（可选）
 - Map / Weather: `AMap Web API`（可选）
@@ -80,7 +82,6 @@ AI_Agent/
 │   └── travel_agent.py
 ├── adapters/
 │   ├── amap_adapter.py
-│   ├── ctrip_flight_adapter.py
 │   ├── flight_mcp_adapter.py
 │   ├── variflight_adapter.py
 │   └── rail_12306_adapter.py
@@ -95,11 +96,8 @@ AI_Agent/
 │   ├── trip_extractor.py
 │   ├── trip_planner.py
 │   └── weather_service.py
-├── static/
-│   ├── index.html
-│   ├── main.js
-│   ├── style.css
-│   └── travel-mark.png
+├── frontend/                 # Vue3 + TypeScript 源码
+├── static/                   # Vite 构建产物，由 FastAPI 提供
 ├── resources/
 ├── uploads/
 └── utils/
@@ -225,8 +223,7 @@ are rejected instead of being sent as city codes. Extend the built-in map with
 
 `variflight` 模式通过 VariFlight 的 `getFlightPriceByCities` 接口查询航班方案、价格、舱位和 provider 返回的可售数量；它要求城市/机场能转换为 IATA 城市码。结果仍然只是实时查询候选，不代表已经锁座、出票或自动订票。
 
-航班数据源必须是已授权且能稳定返回结构化数据的 VariFlight、Flight MCP、HTTP 服务或命令适配器。
-携程 H5 探测仅用于判断页面是否可访问；当前实测会受到 `whaleguard`/HTTP 432 风控，不能作为生产航班数据源，也不能通过继续伪装请求来绕过风控。
+航班数据源必须是已授权且能稳定返回结构化数据的 VariFlight、Flight MCP、HTTP 服务或命令适配器。项目不再包含携程 H5 爬取或探测代码；携程 H5 已确认受到 `whaleguard`/HTTP 432 风控，不能作为生产航班数据源。
 
 ## 外部服务联调
 
@@ -242,12 +239,11 @@ python -m services.integration_health --live
 python -m services.integration_health --live --only amap
 python -m services.integration_health --live --only rail_12306
 python -m services.integration_health --live --only tavily
-python -m services.integration_health --live --only ctrip_h5
 python -m services.integration_health --live --only variflight
 python -m services.integration_health --live --only flight_mcp
 ```
 
-高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。携程 H5 被拦截时，应配置授权的 Flight MCP、官方或合作方航班 API；在此之前航班能力保持 `not_configured` 或 `failed`。
+高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。航班查询应配置授权的 VariFlight、Flight MCP 或官方/合作方航班 API。
 
 ## 文件支持
 
@@ -299,6 +295,7 @@ Chroma 运行时目录默认写入：
 - 航班能力依赖桥接配置或外部服务，不同环境返回效果可能不同
 - 项目当前使用本地 SQLite 与本地缓存目录，适合单机开发和演示
 - `.env` 中如果放了真实密钥，不应提交到公开仓库
+- 当前不实现自动订票、支付、锁座或订单提交；航班/车次结果只是查询时的候选信息
 
 ## 后续建议
 
@@ -307,3 +304,25 @@ Chroma 运行时目录默认写入：
 - 给航班结果增加更强的去重、排序与异常兜底
 - 把 SQLite 迁移到 MySQL / PostgreSQL，便于正式部署
 - 增加 Docker 部署与回归测试脚本
+
+## 开发验证
+
+后端测试：
+
+```bash
+python -m pytest -q
+python -m compileall -q agents services adapters bridges app.py tests
+```
+
+前端检查：
+
+```bash
+cd frontend
+npm install
+npm run typecheck
+npm run build
+```
+
+更多接口、SSE 事件、TravelPlan JSON、游客 capability 和前端接入边界，见
+[`FRONTEND_HANDOFF.md`](FRONTEND_HANDOFF.md)。持续开发状态见
+[`PROJECT_PROGRESS.md`](PROJECT_PROGRESS.md) 和 [`FRONTEND_PROGRESS.md`](FRONTEND_PROGRESS.md)。

@@ -229,6 +229,74 @@ def test_guest_access_expires_on_server_even_if_token_matches(tmp_path):
     assert durable_store.ensure_guest_access("guest_ttl_durable", durable_token) is None
 
 
+def test_guest_claim_transfers_travel_data_and_removes_capability(tmp_path):
+    store = TravelPlanStore(tmp_path / "guest_claim.db")
+    thread_id = "guest_claim_1234567890abcdef"
+    token = store.ensure_guest_access(thread_id)
+    plan = store.save_plan_version(make_plan(thread_id), expected_version=0)
+    store.save_turn(thread_id=thread_id, role="user", content="游客请求", plan=plan)
+    share = store.create_plan_share(plan)
+
+    assert store.validate_guest_access(thread_id, token)
+    assert store.claim_guest_thread(thread_id, 7, token) is True
+    assert store.ensure_guest_access(thread_id, token) is None
+    assert store.get_current_plan(thread_id) is None
+    assert store.get_current_plan(thread_id, user_id=7).version == 1
+    assert store.list_turns(thread_id, user_id=7)[0]["content"] == "游客请求"
+    assert store.list_plan_shares(thread_id, owner_id=7)[0]["share_id"] == share["share_id"]
+    assert store.claim_guest_thread(thread_id, 7, token) is False
+
+
+def test_expired_guest_cleanup_deletes_travel_data_and_shares(tmp_path):
+    store = TravelPlanStore(tmp_path / "guest_cleanup.db")
+    thread_id = "guest_cleanup_1234567890abcdef"
+    token = store.ensure_guest_access(thread_id)
+    plan = store.save_plan_version(make_plan(thread_id), expected_version=0)
+    store.save_turn(
+        thread_id=thread_id,
+        role="user",
+        content="待清理游客请求",
+        attachments=[{"storage": "oss", "object_key": "ai_agent/test-object"}],
+        plan=plan,
+    )
+    store.create_plan_share(plan)
+
+    with sqlite3.connect(tmp_path / "guest_cleanup.db") as connection:
+        connection.execute(
+            "UPDATE travel_guest_access SET created_at = ?, last_seen_at = ? WHERE thread_id = ?",
+            ("2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", thread_id),
+        )
+
+    assert thread_id in store.list_guest_cleanup_candidates()
+    assert store.begin_guest_cleanup(thread_id) is True
+    assert store.ensure_guest_access(thread_id, token) is None
+    result = store.finalize_guest_cleanup(thread_id)
+    assert result == {
+        "thread_id": thread_id,
+        "attachment_keys": ["ai_agent/test-object"],
+    }
+    assert store.get_current_plan(thread_id) is None
+    assert store.list_turns(thread_id) == []
+    assert store.get_plan_share("not-a-real-token") is None
+    assert store.list_guest_cleanup_candidates() == []
+
+
+def test_malformed_guest_timestamps_are_cleanup_candidates(tmp_path):
+    store = TravelPlanStore(tmp_path / "guest_cleanup_malformed.db")
+    thread_id = "guest_cleanup_malformed_1234567890abcdef"
+    store.ensure_guest_access(thread_id)
+
+    with sqlite3.connect(tmp_path / "guest_cleanup_malformed.db") as connection:
+        connection.execute(
+            "UPDATE travel_guest_access SET created_at = ?, last_seen_at = ? WHERE thread_id = ?",
+            ("not-a-timestamp", "", thread_id),
+        )
+
+    assert store.list_guest_cleanup_candidates() == [thread_id]
+    assert store.begin_guest_cleanup(thread_id) is True
+    assert store.list_guest_cleanup_candidates() == [thread_id]
+
+
 def test_out_of_range_items_survive_plan_round_trip(tmp_path):
     store = TravelPlanStore(tmp_path / "out_of_range.db")
     plan = make_plan("out_of_range")

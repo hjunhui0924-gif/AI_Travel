@@ -179,7 +179,7 @@ def search_flights(origin: str, destination: str, date: str) -> list[dict]:
     if mode == "variflight":
         return search_variflight_flights(origin, destination, date)
 
-    if mode in {"command", "auto", "package", "http", "dummy", "ctrip_h5"}:
+    if mode in {"command", "auto", "package", "http", "dummy"}:
         bridge_mode = "auto" if mode == "command" else mode
         return _search_flights_via_command(origin, destination, date, bridge_mode=bridge_mode)
 

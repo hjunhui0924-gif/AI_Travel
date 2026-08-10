@@ -14,7 +14,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from adapters.ctrip_flight_adapter import search_ctrip_h5_flights
 from adapters.variflight_adapter import search_variflight_flights
 
 
@@ -207,26 +206,13 @@ def _search_via_installed_package(origin: str, destination: str, date: str) -> l
 
 
 def _search_via_auto(origin: str, destination: str, date: str) -> list[dict]:
-    errors: list[str] = []
     try:
         flights = _search_via_installed_package(origin, destination, date)
     except Exception as exc:
-        errors.append(f"package:{type(exc).__name__}:{exc}")
-        flights = []
+        raise FlightBridgeError(f"package:{type(exc).__name__}:{exc}") from exc
 
     if flights:
         return flights
-
-    try:
-        flights = search_ctrip_h5_flights(origin, destination, date)
-    except Exception as exc:
-        errors.append(f"ctrip_h5:{type(exc).__name__}:{exc}")
-        flights = []
-
-    if flights:
-        return flights
-    if errors:
-        raise FlightBridgeError("; ".join(errors))
     # An empty result is safer than inventing a bookable-looking flight.
     return []
 
@@ -245,8 +231,6 @@ def main() -> int:
             flights = _search_via_http(origin, destination, date)
         elif mode == "package":
             flights = _search_via_installed_package(origin, destination, date)
-        elif mode == "ctrip_h5":
-            flights = search_ctrip_h5_flights(origin, destination, date)
         elif mode == "variflight":
             flights = search_variflight_flights(origin, destination, date)
         elif mode == "auto":

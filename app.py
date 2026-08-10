@@ -1,13 +1,16 @@
+import asyncio
 import json
+import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain.messages import AIMessage, AIMessageChunk
 from pydantic import BaseModel
@@ -17,7 +20,9 @@ from agents.agent import (
     consume_activity_log,
     consume_source_cards,
     consume_travel_plan,
+    delete_checkpoint_thread,
     delete_thread,
+    derive_session_title,
     encode_assistant_metadata,
     get_messages,
     has_checkpoint_data,
@@ -27,6 +32,7 @@ from services.auth_service import (
     DEFAULT_THREAD_TITLE,
     authenticate_user,
     assign_threads_to_user,
+    claim_thread_for_user,
     create_session,
     create_thread,
     create_user,
@@ -42,17 +48,30 @@ from services.auth_service import (
 )
 from agents.travel_agent import plan_travel, render_travel_response
 from services.travel_store import (
+    GUEST_ACCESS_TTL_DAYS,
     PlanVersionConflict,
+    begin_guest_cleanup,
+    claim_guest_thread,
+    create_plan_share,
+    finalize_guest_cleanup,
     get_current_plan,
     get_plan_version,
     get_plan_owner_id,
+    get_plan_share,
     ensure_guest_access,
+    has_travel_thread_data,
+    list_guest_cleanup_candidates,
+    list_plan_shares,
     list_plan_versions,
+    revoke_plan_share,
     save_conversation_turn,
     save_plan_version,
     save_travel_turn,
+    validate_guest_access,
 )
 from utils.file_utils import UnsupportedFileTypeError, parse_uploads
+from utils.oss_utils import delete_oss_object
+from services.travel_exports import render_plan_markdown, render_shared_plan_html
 from services.answer_citations import (
     deduplicate_sources,
     parse_answer_citations,
@@ -71,14 +90,92 @@ COOKIE_SECURE = (
     or os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}
     or os.getenv("ENVIRONMENT", "").strip().lower() in {"prod", "production"}
 )
+GUEST_COOKIE_MAX_AGE = 60 * 60 * 24 * GUEST_ACCESS_TTL_DAYS
+try:
+    GUEST_CLEANUP_INTERVAL_SECONDS = max(
+        60, int(os.getenv("AI_AGENT_GUEST_CLEANUP_INTERVAL_SECONDS", "3600"))
+    )
+except ValueError:
+    GUEST_CLEANUP_INTERVAL_SECONDS = 3600
 
-app = FastAPI(title="AI Agent")
+logger = logging.getLogger("ai_agent")
+INTERNAL_SSE_ERROR_MESSAGE = "服务暂时不可用，请稍后重试。"
+
+
+def _history_attachment_keys(thread_id: str) -> set[str]:
+    keys: set[str] = set()
+    try:
+        messages = get_messages(thread_id)
+    except Exception:
+        messages = []
+    for message in messages:
+        for attachment in message.get("attachments", []):
+            if not isinstance(attachment, dict):
+                continue
+            if attachment.get("storage") == "oss" and attachment.get("object_key"):
+                keys.add(str(attachment["object_key"]))
+    return keys
+
+
+def cleanup_expired_guest_sessions() -> int:
+    """Remove expired guest data and its checkpoint state.
+
+    Travel-store cleanup is marked before the checkpoint is removed.  A
+    failed checkpoint delete leaves the row in ``cleanup_state=deleting`` so
+    the next worker pass can retry instead of silently losing the cleanup
+    candidate.
+    """
+
+    deleted = 0
+    for thread_id in list_guest_cleanup_candidates():
+        if not begin_guest_cleanup(thread_id):
+            continue
+        attachment_keys = _history_attachment_keys(thread_id)
+        try:
+            delete_checkpoint_thread(thread_id)
+        except Exception:
+            logger.exception("guest checkpoint cleanup failed for %s", thread_id)
+            continue
+        result = finalize_guest_cleanup(thread_id)
+        if result is None:
+            continue
+        attachment_keys.update(result.get("attachment_keys", []))
+        for object_key in attachment_keys:
+            delete_oss_object(object_key)
+        deleted += 1
+    return deleted
+
+
+async def _guest_cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_guest_sessions)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("guest cleanup pass failed")
+        await asyncio.sleep(GUEST_CLEANUP_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    cleanup_task = asyncio.create_task(_guest_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+
+app = FastAPI(title="AI Agent", lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.middleware("http")
 async def attach_guest_access_cookie(request: Request, call_next):
     response = await call_next(request)
+    if getattr(request.state, "guest_access_cleared", False):
+        response.delete_cookie(GUEST_COOKIE_NAME, path="/")
+        return response
     guest_token = getattr(request.state, "guest_access_token", "")
     if guest_token:
         response.set_cookie(
@@ -87,7 +184,7 @@ async def attach_guest_access_cookie(request: Request, call_next):
             httponly=True,
             samesite="lax",
             secure=COOKIE_SECURE,
-            max_age=60 * 60 * 24 * 30,
+            max_age=GUEST_COOKIE_MAX_AGE,
             path="/",
         )
     return response
@@ -122,8 +219,19 @@ def _current_user_from_request(request: Request) -> dict:
     return user
 
 
-def _auth_json_response(user: dict, session_token: str) -> JSONResponse:
-    response = JSONResponse({"status": "success", "user": user})
+def _auth_json_response(
+    user: dict,
+    session_token: str,
+    *,
+    claimed_thread: dict | None = None,
+    guest_claim_status: str | None = None,
+) -> JSONResponse:
+    payload: dict = {"status": "success", "user": user}
+    if claimed_thread is not None:
+        payload["claimed_thread"] = claimed_thread
+    if guest_claim_status is not None:
+        payload["guest_claim"] = {"status": guest_claim_status}
+    response = JSONResponse(payload)
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=session_token,
@@ -172,8 +280,9 @@ def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
         )
         if not guest_token:
             raise HTTPException(status_code=404, detail="无权访问该会话。")
-        if guest_token != request.cookies.get(GUEST_COOKIE_NAME, ""):
-            request.state.guest_access_token = guest_token
+        # Re-issue the cookie on every valid request so browser max-age
+        # follows the same seven-day inactivity window as the server.
+        request.state.guest_access_token = guest_token
         return None
     # A deliberately migrated legacy checkpoint may retain its old guest_ ID
     # while now being owned by this account.  The ownership check remains the
@@ -184,6 +293,70 @@ def _authorized_thread_user(request: Request, thread_id: str) -> dict | None:
     if not thread_owned:
         raise HTTPException(status_code=404, detail="无权访问该会话。")
     return user
+
+
+def _try_claim_guest_thread(
+    request: Request,
+    user: dict,
+    thread_id: str,
+    requested_title: str = "",
+) -> tuple[dict | None, str]:
+    """Claim an active guest thread after login, failing closed."""
+
+    cleaned_thread_id = str(thread_id or "").strip()
+    if not _is_migratable_guest_thread_id(cleaned_thread_id):
+        return None, "not_requested"
+    presented_token = request.cookies.get(GUEST_COOKIE_NAME, "")
+    if not validate_guest_access(cleaned_thread_id, presented_token):
+        # The two SQLite stores cannot commit atomically.  If a process was
+        # interrupted after the account row and travel/checkpoint ownership
+        # were transferred, the guest capability has already been removed.
+        # Treat that exact account-owned, data-bearing state as an idempotent
+        # successful claim so the next login can finish the handoff and clear
+        # the stale browser cookie.
+        existing_thread = get_thread(cleaned_thread_id)
+        if existing_thread and int(existing_thread["user_id"]) == int(user["id"]):
+            try:
+                has_data = has_checkpoint_data(cleaned_thread_id) or has_travel_thread_data(
+                    cleaned_thread_id
+                )
+            except Exception:
+                has_data = False
+            if has_data:
+                request.state.guest_access_cleared = True
+                return existing_thread, "claimed"
+        return None, "expired_or_not_owned"
+    try:
+        has_data = has_checkpoint_data(cleaned_thread_id) or has_travel_thread_data(cleaned_thread_id)
+    except Exception:
+        has_data = False
+    if not has_data:
+        return None, "empty"
+
+    title = (requested_title or "").strip()[:32]
+    if not title:
+        try:
+            title = derive_session_title(get_messages(cleaned_thread_id))[:32]
+        except Exception:
+            title = ""
+    title = title or DEFAULT_THREAD_TITLE
+
+    account_thread = claim_thread_for_user(int(user["id"]), cleaned_thread_id, title)
+    if account_thread is None:
+        return None, "already_owned"
+    thread, created = account_thread
+    try:
+        claimed = claim_guest_thread(cleaned_thread_id, int(user["id"]), presented_token)
+    except Exception:
+        if created:
+            delete_thread_record(int(user["id"]), cleaned_thread_id)
+        raise
+    if not claimed:
+        if created:
+            delete_thread_record(int(user["id"]), cleaned_thread_id)
+        return None, "expired_or_not_owned"
+    request.state.guest_access_cleared = True
+    return thread, "claimed"
 
 
 class TravelReplanRequest(BaseModel):
@@ -203,6 +376,18 @@ class LegacyThreadMigrationRequest(BaseModel):
     # user (for example, from their old browser state).  The server never
     # auto-assigns every orphaned checkpoint to the current account.
     thread_ids: list[str]
+
+
+class PlanShareCreateRequest(BaseModel):
+    version: int | None = None
+    expires_days: int = 30
+
+
+def _serialize_plan_for_api(plan, *, include_days: bool = True) -> dict:
+    payload = asdict(plan)
+    if not include_days:
+        payload["days"] = []
+    return payload
 
 
 @app.get("/")
@@ -230,28 +415,64 @@ def auth_me(request: Request):
 
 @app.post("/auth/register")
 async def auth_register(
+    request: Request,
     username: str = Form(""),
     password: str = Form(""),
     display_name: str = Form(""),
+    guest_thread_id: str = Form(""),
+    guest_title: str = Form(""),
 ):
     try:
         user = create_user(username=username, password=password, display_name=display_name)
         session_token = create_session(int(user["id"]))
-        return _auth_json_response(user, session_token)
+        try:
+            claimed_thread, claim_status = _try_claim_guest_thread(
+                request, user, guest_thread_id, guest_title
+            )
+        except Exception:
+            logger.exception("guest claim failed during registration")
+            claimed_thread, claim_status = None, "failed"
+        response = _auth_json_response(
+            user,
+            session_token,
+            claimed_thread=claimed_thread,
+            guest_claim_status=claim_status if guest_thread_id else None,
+        )
+        if claimed_thread is not None:
+            response.delete_cookie(GUEST_COOKIE_NAME, path="/")
+        return response
     except ValueError as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
 
 
 @app.post("/auth/login")
 async def auth_login(
+    request: Request,
     username: str = Form(""),
     password: str = Form(""),
+    guest_thread_id: str = Form(""),
+    guest_title: str = Form(""),
 ):
     user = authenticate_user(username=username, password=password)
     if not user:
         return JSONResponse({"status": "error", "message": "用户名或密码不正确。"}, status_code=401)
     session_token = create_session(int(user["id"]))
-    return _auth_json_response(user, session_token)
+    try:
+        claimed_thread, claim_status = _try_claim_guest_thread(
+            request, user, guest_thread_id, guest_title
+        )
+    except Exception:
+        logger.exception("guest claim failed during login")
+        claimed_thread, claim_status = None, "failed"
+    response = _auth_json_response(
+        user,
+        session_token,
+        claimed_thread=claimed_thread,
+        guest_claim_status=claim_status if guest_thread_id else None,
+    )
+    if claimed_thread is not None:
+        response.delete_cookie(GUEST_COOKIE_NAME, path="/")
+    return response
 
 
 @app.post("/auth/logout")
@@ -360,13 +581,17 @@ def clear_history(thread_id: str, request: Request):
 
 
 @app.get("/travel/plans/{thread_id}")
-def get_travel_plan(thread_id: str, request: Request):
+def get_travel_plan(
+    thread_id: str,
+    request: Request,
+    include_days: bool = Query(True),
+):
     try:
         user = _authorized_thread_user(request, thread_id)
         plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
         return {
             "status": "success",
-            "plan": asdict(plan) if plan else None,
+            "plan": _serialize_plan_for_api(plan, include_days=include_days) if plan else None,
             "versions": list_plan_versions(thread_id, user_id=int(user["id"]) if user else None),
         }
     except HTTPException as exc:
@@ -375,11 +600,165 @@ def get_travel_plan(thread_id: str, request: Request):
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
 
-@app.get("/travel/plans/{thread_id}/calendar")
-def get_travel_calendar(thread_id: str, request: Request):
+@app.get("/travel/plans/{thread_id}/export")
+def export_travel_plan(
+    thread_id: str,
+    request: Request,
+    format: str = Query("markdown"),
+    version: int | None = Query(None, ge=1),
+):
     try:
         user = _authorized_thread_user(request, thread_id)
-        plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, version, user_id=user_id)
+            if version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "travel plan not found"}, status_code=404)
+
+        export_format = str(format or "").strip().lower()
+        filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", plan.plan_id or "travel_plan")[:80]
+        if export_format in {"md", "markdown"}:
+            content = render_plan_markdown(plan)
+            media_type = "text/markdown; charset=utf-8"
+            filename = f"{filename_base}.md"
+        elif export_format == "json":
+            content = json.dumps(asdict(plan), ensure_ascii=False, indent=2) + "\n"
+            media_type = "application/json; charset=utf-8"
+            filename = f"{filename_base}.json"
+        else:
+            return JSONResponse(
+                {"status": "error", "message": "format 只支持 markdown 或 json。"},
+                status_code=400,
+            )
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.post("/travel/plans/{thread_id}/shares")
+def create_travel_plan_share(
+    thread_id: str,
+    payload: PlanShareCreateRequest,
+    request: Request,
+):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, payload.version, user_id=user_id)
+            if payload.version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "travel plan not found"}, status_code=404)
+        created = create_plan_share(
+            plan,
+            owner_id=user_id,
+            expires_days=payload.expires_days,
+        )
+        token = str(created.pop("token"))
+        created["url"] = f"/shared/{token}"
+        created["api_url"] = f"/shared/plans/{token}"
+        return {"status": "success", "share": created}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/travel/plans/{thread_id}/shares")
+def get_travel_plan_shares(thread_id: str, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        return {
+            "status": "success",
+            "shares": list_plan_shares(thread_id, owner_id=user_id),
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.delete("/travel/plans/{thread_id}/shares/{share_id}")
+def revoke_travel_plan_share(thread_id: str, share_id: str, request: Request):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        if not revoke_plan_share(thread_id, share_id, owner_id=user_id):
+            return JSONResponse({"status": "error", "message": "分享链接不存在或已失效。"}, status_code=404)
+        return {"status": "success"}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+
+
+@app.get("/shared/plans/{token}")
+def get_public_shared_plan(token: str):
+    shared = get_plan_share(token)
+    if shared is None:
+        return JSONResponse({"status": "error", "message": "分享链接不存在或已失效。"}, status_code=404)
+    plan = shared["plan"]
+    public_plan = asdict(plan)
+    # A share token is the public capability; do not disclose the private
+    # source thread id in the unauthenticated response.
+    public_plan["thread_id"] = ""
+    return {
+        "status": "success",
+        "share": {
+            "share_id": shared["share_id"],
+            "version": shared["version"],
+            "created_at": shared["created_at"],
+            "expires_at": shared["expires_at"],
+        },
+        "plan": public_plan,
+    }
+
+
+@app.get("/shared/{token}")
+def render_public_shared_plan(token: str):
+    shared = get_plan_share(token)
+    if shared is None:
+        return HTMLResponse(
+            "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><title>分享已失效</title>"
+            "<p>分享链接不存在或已失效。</p>",
+            status_code=404,
+        )
+    response = HTMLResponse(render_shared_plan_html(shared["plan"], shared["expires_at"]))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/travel/plans/{thread_id}/calendar")
+def get_travel_calendar(
+    thread_id: str,
+    request: Request,
+    version: int | None = Query(None, ge=1),
+):
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, version, user_id=user_id)
+            if version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
         if plan is None:
             return {"status": "success", "plan_id": None, "version": None, "days": []}
         return {
@@ -411,10 +790,20 @@ def get_travel_calendar(thread_id: str, request: Request):
 
 
 @app.get("/travel/plans/{thread_id}/days/{date_text}")
-def get_travel_day(thread_id: str, date_text: str, request: Request):
+def get_travel_day(
+    thread_id: str,
+    date_text: str,
+    request: Request,
+    version: int | None = Query(None, ge=1),
+):
     try:
         user = _authorized_thread_user(request, thread_id)
-        plan = get_current_plan(thread_id, user_id=int(user["id"]) if user else None)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, version, user_id=user_id)
+            if version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
         if plan is None:
             return JSONResponse({"status": "error", "message": "该会话还没有旅行计划。"}, status_code=404)
         day = next((item for item in plan.days if item.date == date_text), None)
@@ -428,13 +817,18 @@ def get_travel_day(thread_id: str, date_text: str, request: Request):
 
 
 @app.get("/travel/plans/{thread_id}/versions/{version}")
-def get_travel_plan_version(thread_id: str, version: int, request: Request):
+def get_travel_plan_version(
+    thread_id: str,
+    version: int,
+    request: Request,
+    include_days: bool = Query(True),
+):
     try:
         user = _authorized_thread_user(request, thread_id)
         plan = get_plan_version(thread_id, version, user_id=int(user["id"]) if user else None)
         if plan is None:
             return JSONResponse({"status": "error", "message": "计划版本不存在。"}, status_code=404)
-        return {"status": "success", "plan": asdict(plan)}
+        return {"status": "success", "plan": _serialize_plan_for_api(plan, include_days=include_days)}
     except HTTPException as exc:
         return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
     except Exception as exc:
@@ -626,29 +1020,24 @@ async def chat(
     files: list[UploadFile] | None = File(default=None),
 ):
     try:
-        user = _current_user_from_request(request)
+        # Use the same ownership gate as the travel/history endpoints.  A
+        # guest-shaped thread is normally anonymous-only, but a guest thread
+        # that was explicitly claimed during login remains addressable under
+        # its original id so the user can continue the conversation without
+        # losing the just-merged context.
+        user = _authorized_thread_user(request, thread_id)
     except HTTPException as exc:
+        detail = exc.detail
         if not _is_guest_thread_id(thread_id):
             async def unauthorized_response():
-                yield _sse_event("error", {"message": exc.detail})
+                yield _sse_event("error", {"message": detail})
 
             return StreamingResponse(unauthorized_response(), media_type="text/event-stream; charset=utf-8")
         user = None
+        async def unauthorized_guest_response():
+            yield _sse_event("error", {"message": detail})
 
-    if user is not None and _is_guest_thread_id(thread_id):
-        async def invalid_guest_thread_response():
-            yield _sse_event("error", {"message": "登录后请使用账户会话 ID，不能使用 guest 会话 ID。"})
-
-        return StreamingResponse(invalid_guest_thread_response(), media_type="text/event-stream; charset=utf-8")
-
-    if user is None:
-        try:
-            _authorized_thread_user(request, thread_id)
-        except HTTPException as exc:
-            async def unauthorized_guest_response():
-                yield _sse_event("error", {"message": exc.detail})
-
-            return StreamingResponse(unauthorized_guest_response(), media_type="text/event-stream; charset=utf-8")
+        return StreamingResponse(unauthorized_guest_response(), media_type="text/event-stream; charset=utf-8")
 
     try:
         attachments = parse_uploads(files or [])
@@ -886,8 +1275,13 @@ async def chat(
                     ],
                 },
             )
-        except Exception as exc:
-            yield _sse_event("error", {"message": f"[服务运行错误或网络超时: {exc}]"})
+        except Exception:
+            # Do not expose provider URLs, credentials, filesystem paths, or
+            # traceback text through the streaming protocol.  The server log
+            # retains the diagnostic while the client receives a stable,
+            # non-sensitive message.
+            logger.exception("chat stream failed")
+            yield _sse_event("error", {"message": INTERNAL_SSE_ERROR_MESSAGE})
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream; charset=utf-8")
 

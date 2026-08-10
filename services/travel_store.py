@@ -35,7 +35,9 @@ from agents.schemas import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR / "resources" / "travel_plans.db"
-GUEST_ACCESS_TTL_DAYS = 30
+GUEST_ACCESS_TTL_DAYS = 7
+SHARE_DEFAULT_TTL_DAYS = 30
+SHARE_MAX_TTL_DAYS = 90
 
 
 class PlanVersionConflict(RuntimeError):
@@ -55,6 +57,34 @@ def _now_utc() -> str:
 
 def _hash_guest_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _parse_guest_timestamp(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _guest_access_is_expired(
+    created_at: object,
+    last_seen_at: object,
+    now: datetime,
+) -> bool:
+    """Treat malformed timestamps as expired so cleanup cannot be bypassed."""
+
+    expiry = now - timedelta(days=GUEST_ACCESS_TTL_DAYS)
+    created = _parse_guest_timestamp(created_at)
+    last_seen = _parse_guest_timestamp(last_seen_at)
+    return (
+        created is None
+        or last_seen is None
+        or created < expiry
+        or last_seen < expiry
+    )
 
 
 def _json(value: Any) -> str:
@@ -391,7 +421,21 @@ class TravelPlanStore:
                     thread_id TEXT PRIMARY KEY,
                     token_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL
+                    last_seen_at TEXT NOT NULL,
+                    cleanup_state TEXT NOT NULL DEFAULT 'active'
+                );
+
+                CREATE TABLE IF NOT EXISTS travel_plan_shares (
+                    share_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    thread_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    owner_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT
                 );
                 """
             )
@@ -402,6 +446,14 @@ class TravelPlanStore:
             if "turn_type" not in turn_columns:
                 connection.execute(
                     "ALTER TABLE travel_turns ADD COLUMN turn_type TEXT NOT NULL DEFAULT 'travel'"
+                )
+            guest_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(travel_guest_access)").fetchall()
+            }
+            if "cleanup_state" not in guest_columns:
+                connection.execute(
+                    "ALTER TABLE travel_guest_access ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'active'"
                 )
 
     def save_plan_version(
@@ -639,11 +691,390 @@ class TravelPlanStore:
         with self._lock, self._connect() as connection:
             connection.execute("DELETE FROM travel_turns WHERE thread_id = ?", (thread_id,))
             connection.execute("DELETE FROM travel_guest_access WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM travel_plan_shares WHERE thread_id = ?", (thread_id,))
             row = connection.execute(
                 "SELECT plan_id FROM travel_plans WHERE thread_id = ?", (thread_id,)
             ).fetchone()
             if row is not None:
                 connection.execute("DELETE FROM travel_plans WHERE thread_id = ?", (thread_id,))
+
+    def has_thread_data(self, thread_id: str) -> bool:
+        """Return whether the travel store has durable data for a thread."""
+
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM travel_plans WHERE thread_id = ?
+                UNION ALL
+                SELECT 1 FROM travel_turns WHERE thread_id = ?
+                LIMIT 1
+                """,
+                (thread_id, thread_id),
+            ).fetchone()
+        return row is not None
+
+    def validate_guest_access(
+        self,
+        thread_id: str,
+        presented_token: str = "",
+        *,
+        touch: bool = False,
+    ) -> bool:
+        """Verify a live guest capability without creating a new one.
+
+        ``touch`` is used by an authenticated claim flow only after the
+        caller has already presented the HttpOnly capability.  Anonymous
+        request authorization continues to use ``ensure_guest_access``.
+        """
+
+        presented_token = (presented_token or "").strip()
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT token_hash, created_at, last_seen_at, cleanup_state
+                FROM travel_guest_access
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+            if row is None or str(row["cleanup_state"] or "active") != "active":
+                return False
+            created_at = _parse_guest_timestamp(row["created_at"])
+            last_seen_at = _parse_guest_timestamp(row["last_seen_at"])
+            expiry = now - timedelta(days=GUEST_ACCESS_TTL_DAYS)
+            if (
+                created_at is None
+                or last_seen_at is None
+                or created_at < expiry
+                or last_seen_at < expiry
+                or not presented_token
+                or not hmac.compare_digest(str(row["token_hash"]), _hash_guest_token(presented_token))
+            ):
+                return False
+            if touch:
+                connection.execute(
+                    "UPDATE travel_guest_access SET last_seen_at = ? WHERE thread_id = ?",
+                    (_now_utc(), thread_id),
+                )
+        return True
+
+    def claim_guest_thread(
+        self,
+        thread_id: str,
+        user_id: int,
+        presented_token: str = "",
+    ) -> bool:
+        """Transfer an active guest thread's durable travel data to a user.
+
+        The capability is required even though the request is authenticated:
+        knowing a client-generated ``guest_`` id is not proof of ownership.
+        The transfer is idempotent for the same account and removes the guest
+        capability once the data has been assigned.
+        """
+
+        presented_token = (presented_token or "").strip()
+        now = datetime.now(timezone.utc)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT token_hash, created_at, last_seen_at, cleanup_state
+                FROM travel_guest_access
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+            if row is None or str(row["cleanup_state"] or "active") != "active":
+                return False
+            created_at = _parse_guest_timestamp(row["created_at"])
+            last_seen_at = _parse_guest_timestamp(row["last_seen_at"])
+            expiry = now - timedelta(days=GUEST_ACCESS_TTL_DAYS)
+            if (
+                created_at is None
+                or last_seen_at is None
+                or created_at < expiry
+                or last_seen_at < expiry
+                or not presented_token
+                or not hmac.compare_digest(str(row["token_hash"]), _hash_guest_token(presented_token))
+            ):
+                return False
+
+            owner_rows = (
+                connection.execute(
+                    "SELECT user_id FROM travel_plans WHERE thread_id = ?",
+                    (thread_id,),
+                ).fetchall()
+                + connection.execute(
+                    "SELECT user_id FROM travel_turns WHERE thread_id = ?",
+                    (thread_id,),
+                ).fetchall()
+            )
+            stored_owners = {
+                int(owner_row["user_id"])
+                for owner_row in owner_rows
+                if owner_row["user_id"] is not None
+            }
+            if stored_owners and stored_owners != {int(user_id)}:
+                return False
+
+            connection.execute(
+                "UPDATE travel_plans SET user_id = ? WHERE thread_id = ? AND user_id IS NULL",
+                (int(user_id), thread_id),
+            )
+            connection.execute(
+                "UPDATE travel_turns SET user_id = ? WHERE thread_id = ? AND user_id IS NULL",
+                (int(user_id), thread_id),
+            )
+            connection.execute(
+                "UPDATE travel_plan_shares SET owner_id = ? WHERE thread_id = ? AND owner_id IS NULL",
+                (int(user_id), thread_id),
+            )
+            connection.execute("DELETE FROM travel_guest_access WHERE thread_id = ?", (thread_id,))
+        return True
+
+    def list_guest_cleanup_candidates(self, now: datetime | None = None) -> list[str]:
+        """Return guest threads that are expired or already being cleaned."""
+
+        current = now or datetime.now(timezone.utc)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT thread_id, created_at, last_seen_at, cleanup_state
+                FROM travel_guest_access
+                """
+            ).fetchall()
+        candidates: list[tuple[datetime, str]] = []
+        for row in rows:
+            thread_id = str(row["thread_id"])
+            state = str(row["cleanup_state"] or "active")
+            expired = _guest_access_is_expired(row["created_at"], row["last_seen_at"], current)
+            if state != "deleting" and not expired:
+                continue
+            sort_time = _parse_guest_timestamp(row["last_seen_at"]) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            candidates.append((sort_time, thread_id))
+        candidates.sort(key=lambda item: item[0])
+        return [thread_id for _sort_time, thread_id in candidates]
+
+    def begin_guest_cleanup(self, thread_id: str, now: datetime | None = None) -> bool:
+        """Mark an expired guest capability as deleting, preventing new access."""
+
+        current = now or datetime.now(timezone.utc)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT created_at, last_seen_at, cleanup_state
+                FROM travel_guest_access
+                WHERE thread_id = ?
+                """,
+                (thread_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            state = str(row["cleanup_state"] or "active")
+            if state == "deleting":
+                return True
+            if not _guest_access_is_expired(row["created_at"], row["last_seen_at"], current):
+                return False
+            connection.execute(
+                "UPDATE travel_guest_access SET cleanup_state = 'deleting' WHERE thread_id = ?",
+                (thread_id,),
+            )
+        return True
+
+    def finalize_guest_cleanup(self, thread_id: str) -> dict[str, Any] | None:
+        """Delete travel-store data after checkpoint cleanup has succeeded."""
+
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT cleanup_state FROM travel_guest_access WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if row is None or str(row["cleanup_state"] or "active") != "deleting":
+                return None
+
+            owner_rows = (
+                connection.execute(
+                    "SELECT user_id FROM travel_plans WHERE thread_id = ?",
+                    (thread_id,),
+                ).fetchall()
+                + connection.execute(
+                    "SELECT user_id FROM travel_turns WHERE thread_id = ?",
+                    (thread_id,),
+                ).fetchall()
+            )
+            if any(owner_row["user_id"] is not None for owner_row in owner_rows):
+                # A claim should remove the guest capability first.  Fail
+                # closed if an old/manual row violates that invariant.
+                connection.execute("DELETE FROM travel_guest_access WHERE thread_id = ?", (thread_id,))
+                return None
+
+            attachment_keys: set[str] = set()
+            for raw in connection.execute(
+                "SELECT attachments FROM travel_turns WHERE thread_id = ?", (thread_id,)
+            ).fetchall():
+                try:
+                    attachments = json.loads(str(raw["attachments"] or "[]"))
+                except json.JSONDecodeError:
+                    attachments = []
+                if not isinstance(attachments, list):
+                    continue
+                for attachment in attachments:
+                    if isinstance(attachment, dict):
+                        key = str(attachment.get("object_key") or "").strip()
+                        if key and attachment.get("storage") == "oss":
+                            attachment_keys.add(key)
+
+            connection.execute("DELETE FROM travel_turns WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM travel_plan_shares WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM travel_guest_access WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM travel_plans WHERE thread_id = ?", (thread_id,))
+        return {"thread_id": thread_id, "attachment_keys": sorted(attachment_keys)}
+
+    def create_plan_share(
+        self,
+        plan: TravelPlan,
+        *,
+        owner_id: int | None = None,
+        expires_days: int = SHARE_DEFAULT_TTL_DAYS,
+    ) -> dict[str, Any]:
+        """Create an expiring, immutable read-only snapshot of a plan."""
+
+        if not isinstance(expires_days, int) or not 1 <= expires_days <= SHARE_MAX_TTL_DAYS:
+            raise ValueError(f"share expiration must be between 1 and {SHARE_MAX_TTL_DAYS} days")
+        payload = _as_dict(plan)
+        share_id = f"share_{secrets.token_hex(12)}"
+        token = secrets.token_urlsafe(32)
+        created_at = _now_utc()
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=expires_days)).isoformat(
+            timespec="seconds"
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO travel_plan_shares
+                    (share_id, token_hash, thread_id, plan_id, version, payload, owner_id,
+                     created_at, expires_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    share_id,
+                    _hash_guest_token(token),
+                    plan.thread_id,
+                    plan.plan_id,
+                    int(plan.version),
+                    _json(payload),
+                    None if owner_id is None else int(owner_id),
+                    created_at,
+                    expires_at,
+                ),
+            )
+        return {
+            "share_id": share_id,
+            "token": token,
+            "thread_id": plan.thread_id,
+            "plan_id": plan.plan_id,
+            "version": int(plan.version),
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+
+    def get_plan_share(self, token: str) -> dict[str, Any] | None:
+        """Resolve a public share token without exposing the source thread."""
+
+        token = (token or "").strip()
+        if not token:
+            return None
+        now_label = _now_utc()
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT share_id, thread_id, plan_id, version, payload, created_at, expires_at
+                FROM travel_plan_shares
+                WHERE token_hash = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                """,
+                (_hash_guest_token(token), now_label),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload"] or "{}"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        plan = _rebuild_plan(payload)
+        return {
+            "share_id": str(row["share_id"]),
+            "thread_id": str(row["thread_id"]),
+            "plan_id": str(row["plan_id"]),
+            "version": int(row["version"]),
+            "created_at": str(row["created_at"] or ""),
+            "expires_at": str(row["expires_at"] or ""),
+            "plan": plan,
+        }
+
+    def list_plan_shares(self, thread_id: str, owner_id: int | None = None) -> list[dict[str, Any]]:
+        """List share metadata for an already-authorized source thread."""
+
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT share_id, plan_id, version, created_at, expires_at, revoked_at, owner_id
+                FROM travel_plan_shares
+                WHERE thread_id = ?
+                ORDER BY created_at DESC
+                """,
+                (thread_id,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            stored_owner = row["owner_id"]
+            if stored_owner is not None and (owner_id is None or int(stored_owner) != int(owner_id)):
+                continue
+            result.append(
+                {
+                    "share_id": str(row["share_id"]),
+                    "plan_id": str(row["plan_id"]),
+                    "version": int(row["version"]),
+                    "created_at": str(row["created_at"] or ""),
+                    "expires_at": str(row["expires_at"] or ""),
+                    "revoked_at": str(row["revoked_at"] or "") or None,
+                }
+            )
+        return result
+
+    def revoke_plan_share(
+        self,
+        thread_id: str,
+        share_id: str,
+        owner_id: int | None = None,
+    ) -> bool:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT owner_id, revoked_at
+                FROM travel_plan_shares
+                WHERE share_id = ? AND thread_id = ?
+                """,
+                (share_id, thread_id),
+            ).fetchone()
+            if row is None or row["revoked_at"] is not None:
+                return False
+            stored_owner = row["owner_id"]
+            if stored_owner is not None and (owner_id is None or int(stored_owner) != int(owner_id)):
+                return False
+            connection.execute(
+                "UPDATE travel_plan_shares SET revoked_at = ? WHERE share_id = ?",
+                (_now_utc(), share_id),
+            )
+        return True
 
     def _get_plan_row(self, thread_id: str, user_id: int | None = None) -> sqlite3.Row | None:
         with self._lock, self._connect() as connection:
@@ -708,25 +1139,38 @@ class TravelPlanStore:
         presented_token = (presented_token or "").strip()
         with self._lock, self._connect() as connection:
             row = connection.execute(
-                "SELECT token_hash, created_at, last_seen_at FROM travel_guest_access WHERE thread_id = ?",
+                """
+                SELECT token_hash, created_at, last_seen_at, cleanup_state
+                FROM travel_guest_access
+                WHERE thread_id = ?
+                """,
                 (thread_id,),
             ).fetchone()
             if row is not None:
+                if str(row["cleanup_state"] or "active") != "active":
+                    return None
                 now = datetime.now(timezone.utc)
-                try:
-                    created_at = datetime.fromisoformat(str(row["created_at"]))
-                    last_seen_at = datetime.fromisoformat(str(row["last_seen_at"]))
-                    if created_at.tzinfo is None:
-                        created_at = created_at.replace(tzinfo=timezone.utc)
-                    if last_seen_at.tzinfo is None:
-                        last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
-                except (TypeError, ValueError):
+                created_at = _parse_guest_timestamp(row["created_at"])
+                last_seen_at = _parse_guest_timestamp(row["last_seen_at"])
+                if created_at is None or last_seen_at is None:
                     return None
                 expiry = now - timedelta(days=GUEST_ACCESS_TTL_DAYS)
                 if created_at < expiry or last_seen_at < expiry:
-                    # Let an otherwise empty guest thread start a fresh
-                    # capability, while durable plan/turn data below still
-                    # prevents a silent re-bind after expiry.
+                    # Empty guest threads can start over with a fresh
+                    # capability. Durable data remains behind the expired
+                    # row for the background cleanup worker and cannot be
+                    # silently rebound by an arbitrary caller.
+                    existing_data = connection.execute(
+                        """
+                        SELECT 1 FROM travel_plans WHERE thread_id = ?
+                        UNION ALL
+                        SELECT 1 FROM travel_turns WHERE thread_id = ?
+                        LIMIT 1
+                        """,
+                        (thread_id, thread_id),
+                    ).fetchone()
+                    if existing_data is not None:
+                        return None
                     connection.execute(
                         "DELETE FROM travel_guest_access WHERE thread_id = ?",
                         (thread_id,),
@@ -833,6 +1277,60 @@ def ensure_guest_access(
         presented_token,
         allow_new_binding=allow_new_binding,
     )
+
+
+def validate_guest_access(
+    thread_id: str,
+    presented_token: str = "",
+    *,
+    touch: bool = False,
+) -> bool:
+    return travel_plan_store.validate_guest_access(thread_id, presented_token, touch=touch)
+
+
+def claim_guest_thread(thread_id: str, user_id: int, presented_token: str = "") -> bool:
+    return travel_plan_store.claim_guest_thread(thread_id, user_id, presented_token)
+
+
+def has_travel_thread_data(thread_id: str) -> bool:
+    return travel_plan_store.has_thread_data(thread_id)
+
+
+def list_guest_cleanup_candidates(now: datetime | None = None) -> list[str]:
+    return travel_plan_store.list_guest_cleanup_candidates(now=now)
+
+
+def begin_guest_cleanup(thread_id: str, now: datetime | None = None) -> bool:
+    return travel_plan_store.begin_guest_cleanup(thread_id, now=now)
+
+
+def finalize_guest_cleanup(thread_id: str) -> dict[str, Any] | None:
+    return travel_plan_store.finalize_guest_cleanup(thread_id)
+
+
+def create_plan_share(
+    plan: TravelPlan,
+    *,
+    owner_id: int | None = None,
+    expires_days: int = SHARE_DEFAULT_TTL_DAYS,
+) -> dict[str, Any]:
+    return travel_plan_store.create_plan_share(
+        plan,
+        owner_id=owner_id,
+        expires_days=expires_days,
+    )
+
+
+def get_plan_share(token: str) -> dict[str, Any] | None:
+    return travel_plan_store.get_plan_share(token)
+
+
+def list_plan_shares(thread_id: str, owner_id: int | None = None) -> list[dict[str, Any]]:
+    return travel_plan_store.list_plan_shares(thread_id, owner_id=owner_id)
+
+
+def revoke_plan_share(thread_id: str, share_id: str, owner_id: int | None = None) -> bool:
+    return travel_plan_store.revoke_plan_share(thread_id, share_id, owner_id=owner_id)
 
 
 def delete_travel_thread(thread_id: str, user_id: int | None = None) -> None:
