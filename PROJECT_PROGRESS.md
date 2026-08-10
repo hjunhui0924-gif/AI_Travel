@@ -140,7 +140,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ### Phase 5：外部环境联调与失败降级
 
-- 状态：已完成本轮联调与审查；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，VariFlight 已完成真实航班查询联调，当前仅待提交。
+- 状态：已完成本轮联调与审查；高德、12306、Tavily 已真实联调通过，Ctrip H5 已确认被风控拦截，VariFlight 已完成真实航班查询联调，相关变更已提交。
 - 目标：确认 `.env` 中的凭证不仅存在，而且真实请求、响应解析和业务降级链路可用。
 - 高德证据：地理编码、天气、文本 POI、周边 POI、步行路线、驾车路线和公交路线均返回成功；请求加入节流/重试/缓存。
 - 12306 证据：广州南 -> 深圳北，动态未来日期返回 579 条原始车次；加入站点字典缓存、单请求超时和 45 秒总超时后，本次健康检查约 1.3 秒完成。
@@ -273,7 +273,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ### 本阶段状态与验证
 
-- 状态：已完成，等待提交本阶段变更。
+- 状态：已完成，相关变更已提交（当前阶段提交：`b44b036`）。
 - 全量测试：`python -m pytest -q` → **95 passed**，1 个既有 FastAPI/Starlette 弃用警告。
 - 编译检查：`python -m compileall -q agents services adapters bridges app.py tests` → 通过。
 - 导入检查：`python -c "import app"` → 通过。
@@ -284,3 +284,4 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 前端按 `FRONTEND_HANDOFF.md` 接入 `answer_segments`、`done.sources`、TravelPlan 日历和重规划接口；不得从 Markdown 猜测引用关系。
 - 如需统一来源卡字段，前端按 `summary ?? snippet` 展示摘要；来源链接必须二次确认协议为 `http/https`。
 - 本阶段没有修改 `static/index.html`、`static/main.js`、`static/style.css`。
+- 本次交接文档二次审查已补充历史/删除接口、会话列表字段、文件上传限制、SSE `fetch + ReadableStream` 处理、无计划日历返回、计划项状态约束、迁移上限和外部来源安全边界。

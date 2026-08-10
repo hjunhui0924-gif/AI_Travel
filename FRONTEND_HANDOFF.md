@@ -44,7 +44,7 @@
     "avatar_label": "A",
     "created_at": "2026-08-09T10:00:00+00:00"
   }
-}
+  }
 ```
 
 未登录时 `authenticated=false`、`user=null`。
@@ -77,6 +77,51 @@
 
 登录后返回当前用户的账户线程列表：`{status:"success", sessions:[...]}`。
 
+`sessions` 中每项包含：`thread_id`、`title`、`created_at`、`updated_at`。列表按最近更新时间倒序返回；前端切换会话时应使用这里返回的账户线程 ID，不要自行拼接 `thread_...`。
+
+### `GET /history/{thread_id}`
+
+返回当前会话的有序消息：
+
+```json
+{
+  "status": "success",
+  "messages": [
+    {
+      "role": "user",
+      "content": "帮我安排杭州三日游",
+      "attachments": [],
+      "image_urls": [],
+      "search_enabled": true
+    },
+    {
+      "role": "assistant",
+      "content": "已为你整理好行程。",
+      "activities": [],
+      "sources": [],
+      "answer_segments": [
+        {"text": "已为你整理好行程。", "source_ids": []}
+      ],
+      "search_enabled": true,
+      "plan_id": "plan_xxx",
+      "plan_version": 1
+    }
+  ]
+}
+```
+
+助手消息中的 `activities`、`sources`、`answer_segments`、`plan_id` 和 `plan_version` 可能为空；旧 checkpoint 历史可能缺少部分可选字段，前端应按空数组或 `null` 兼容。后端已经移除内部 metadata 和 `[[cite:...]]` 标记，前端只渲染 `content` 或结构化引用字段。
+
+### `DELETE /history/{thread_id}`
+
+删除当前会话的聊天历史、旅行计划版本、旅行回合、guest capability 和关联的 OSS 上传对象，返回：
+
+```json
+{"status":"success"}
+```
+
+这是不可逆操作，前端应在删除前二次确认；删除后应从会话列表移除该线程并清空当前视图。
+
 ### `POST /threads/migrate-legacy`
 
 登录用户主动迁移自己仍持有的旧 checkpoint 会话。请求必须显式提供旧线程 ID；后端不会把所有无归属旧历史自动分配给当前用户，也不会接受不在旧 checkpoint 列表中的 ID。为避免旧的 `default` 等共享命名造成越权，当前接口只接受 `guest_...` 随机命名空间；其他旧 ID 需要人工恢复。
@@ -84,6 +129,8 @@
 ```json
 {"thread_ids":["guest_old_uuid"]}
 ```
+
+单次请求最多处理前 100 个 `thread_ids`；需要迁移更多历史时应分批提交，并根据 `migrated_thread_ids` 与 `skipped_thread_ids` 更新本地状态。
 
 返回：
 
@@ -112,6 +159,8 @@
 
 响应 `Content-Type` 为 `text/event-stream`。每条 SSE 由 `event:` 和 `data:` 组成，`data` 是 JSON。
 
+这是 `POST` 的 multipart 流式接口，不能使用原生 `EventSource`。前端应使用 `fetch` 配合 `ReadableStream`，按空行缓冲解析 SSE 帧；网络分片不能直接当作完整事件。请求必须继续携带 `credentials: "include"`。
+
 事件：
 
 ```text
@@ -128,6 +177,9 @@ event: done
 data: {
   "ok": true,
   "final_text": "供聊天区展示的完整文本",
+  "answer_segments": [
+    {"text":"供聊天区展示的完整文本", "source_ids":[]}
+  ],
   "activities": [],
   "sources": [],
   "trip_plan": null,
@@ -140,7 +192,10 @@ data: {
 - `text.delta` 只做聊天文本增量拼接。
 - 旅行请求完成时 `done.trip_plan` 为结构化 TravelPlan；普通聊天为 `null`。
 - `done.final_text` 是可直接展示的文本，不包含内部 metadata 标记。前端不要从它解析日历。
-- 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；可能没有 `done`，前端应结束 loading 并保留已收到内容。
+- `done.answer_segments` 是句子级引用的权威结构；有内容时按它渲染，不能为空或缺失时回退到 `done.final_text`。不要把两者同时完整渲染造成重复文本。
+- 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
+
+附件限制：图片支持 `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`；文档支持 `.pdf`、`.txt`、`.md`、`.csv`、`.docx`、`.doc`、`.xlsx`、`.xls`。单个文件最大 10MB。`.doc` 只返回兼容性提示，不保证可靠解析。图片附件的 `image_url` 可能是内联 `data:` URL 或有时效的 OSS URL，不应假设它永久有效；历史消息中的图片通过用户消息的 `attachments`/`image_urls` 返回，而 `done.attachments` 当前只列出文本附件。
 
 推荐处理逻辑：以 `done` 作为本轮结束信号；如果 `done.trip_plan` 非空，直接刷新计划卡、日历和来源卡。不要仅凭某一条 `activity` 判断计划已保存。
 
@@ -324,6 +379,17 @@ POI 卡使用 `name`、`category`、`address`、`distance`、`rating`、`rating_
 }
 ```
 
+没有计划时不会返回 `timezone` 等计划字段，而是返回：
+
+```json
+{
+  "status":"success",
+  "plan_id":null,
+  "version":null,
+  "days":[]
+}
+```
+
 前端按 `days[].date` 高亮日历；没有对应项的日期不高亮。`has_conflicts=true` 应有独立冲突提示。`out_of_range_item_count>0` 表示完整计划中的 `out_of_range_items` 有内容；日历投影不会为这些日期生成虚假的日期格子。
 
 ### `GET /travel/plans/{thread_id}/days/{YYYY-MM-DD}`
@@ -355,6 +421,8 @@ JSON 请求：
 ```
 
 每次成功修改都会生成新版本。强烈建议始终发送从最近一次 GET 或 `done.trip_plan` 读到的 `expected_version`；省略时后端仍会以本次读取到的版本做 CAS，但并发场景不如显式传递清晰。
+
+状态约束：允许的 `status` 为 `suggested`、`confirmed`、`booked`、`skipped`、`cancelled`。`confirmed/booked` 必须配合 `locked=true`；`locked=true` 时只能使用 `confirmed/booked`。只提交 `locked=true` 会将项目置为 `confirmed`，只提交 `locked=false` 会将项目置为 `suggested`。`item_id` 也可以指向 `plan.out_of_range_items` 中的项目。
 
 版本过期返回 HTTP 409：
 
@@ -400,10 +468,10 @@ JSON 请求：
 
 - 认证接口：按 HTTP 状态码处理 400/401。
 - 旅行查询：无计划、无权限、无版本通常为 404。
-- 修改/重规划：版本冲突为 409，读取 `current_version`。
+- 修改/重规划：无权限可能为 403，版本冲突为 409，读取 `current_version`。
 - 重规划未生成计划为 502。
 - 普通后端异常通常为 500，正文为 `{status:"error", message}`。
-- SSE 解析错误事件后停止当前 loading；不要重复提交同一请求。
+- `/chat` 的鉴权、文件类型、文件解析和空消息错误也可能表现为 HTTP 200 内的 SSE `error` 事件；解析错误事件后停止当前 loading，不要重复提交同一请求。
 
 计划来源优先级：`done.trip_plan` > `GET /travel/plans/{thread_id}` > 日历/日期接口。每次 PATCH/replan 成功后用响应中的完整 `plan` 更新本地版本号，避免继续使用旧 `expected_version`。
 
@@ -415,14 +483,15 @@ JSON 请求：
 - 不把 `rating`、`popularity_signal`、`opening_status="unknown"` 混为一谈。
 - 不隐藏 `risks`、`conflicts`、`adapter_status` 或 `is_demo`。
 - 不在前端保存或展示大众点评评价正文。
+- Markdown 展示必须进行 HTML/XSS 安全过滤；来源标题、摘要和 URL 都是不可信外部数据。
+- 来源链接只允许 `http`/`https`，新标签页打开时使用 `noopener,noreferrer`；其他协议只展示文本，不允许点击跳转。
 - 不修改 `static/` 现有文件作为本阶段后端交接的一部分；接入时请另行评估 UI 改造范围。
-## 11. Sentence-level web citations (new)
 
-The backend now exposes citations as structured data. The frontend must not
-parse citation markers from Markdown and must not guess which source supports
-which sentence.
+## 11. 句子级联网搜索引用
 
-### SSE `event: done`
+后端通过结构化字段暴露句子级引用。前端不能从 Markdown 解析引用标记，也不能猜测哪一个来源支持哪一句话。
+
+### SSE `event: done` 示例
 
 ```json
 {
@@ -444,30 +513,14 @@ which sentence.
 }
 ```
 
-Render each `answer_segments` item in order. Show the link/chain icon only
-when `source_ids` is non-empty; the number beside it is the number of valid
-source IDs. Resolve IDs against `done.sources` and show only those source
-cards in the right-side panel. Clicking a source opens its `http`/`https` URL
-in a new tab with `noopener,noreferrer`.
+按顺序渲染每个 `answer_segments` 项。只有 `source_ids` 中存在有效来源时才显示句末链条图标；图标旁的数字是有效来源数量。使用 ID 到 `done.sources` 中解析，只在右侧来源栏显示该句对应的来源卡。点击来源时，在新标签页打开其 `http`/`https` URL，并使用 `noopener,noreferrer`。
 
-The same `answer_segments` field is present on assistant messages from
-`GET /history/{thread_id}` and on the JSON response from
-`POST /travel/plans/{thread_id}/replan`. `source` SSE events are emitted after
-the response sources have been sanitized and deduplicated, but before `done`;
-treat `done.sources` as the authoritative complete list.
+`GET /history/{thread_id}` 的助手消息和 `POST /travel/plans/{thread_id}/replan` 的 JSON 响应也包含同样的 `answer_segments` 字段。`source` SSE 事件会在来源清理、去重后且 `done` 之前发送；应以 `done.sources` 作为完整来源列表。
 
-Source-card payloads from SSE use `summary`; `Evidence` objects in
-`TravelPlan` and the replan response use `snippet`. Both are source summaries,
-not full web-page content. A frontend source card may display
-`summary ?? snippet`, and must only make an `http`/`https` URL clickable.
+SSE 来源卡使用 `summary`；`TravelPlan` 和重规划响应中的 `Evidence` 使用 `snippet`。两者都只是来源摘要，不是网页正文。前端来源卡可以显示 `summary ?? snippet`，且只能让 `http`/`https` URL 可点击。
 
-Only `source_type="web_search"` sources are eligible for sentence citations.
-Map POI, weather, rail, flight, and route sources remain available as source
-cards/structured plan evidence but must not be rendered as web-search sentence
-icons. When no source supports a sentence, keep `source_ids: []` and show no
-icon.
+只有 `source_type="web_search"` 的来源可以作为句子引用。地图 POI、天气、铁路、航班和路线来源仍可作为来源卡或结构化计划证据，但不能渲染为网页搜索句末图标。没有来源支持时保留 `source_ids: []`，不显示图标。
 
-The model's internal `[[cite:web_...]]` markers are removed by the backend and
-must never be displayed. Streaming `text.delta` events are already sanitized;
-`done.final_text` is the canonical clean text. `search_enabled=false` must
-never produce a web-search citation.
+模型内部的 `[[cite:web_...]]` 标记已经由后端移除，绝不能显示。流式 `text.delta` 已经清理；`done.final_text` 是规范的干净文本。`search_enabled=false` 绝不能产生网页搜索句子引用。
+
+如果历史消息或兼容旧数据中的 `answer_segments` 为空，直接渲染清理后的 `content`，不要自行补造引用关系。
