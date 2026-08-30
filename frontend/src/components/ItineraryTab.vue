@@ -5,11 +5,13 @@ import PlanCalendar from "./PlanCalendar.vue";
 import PlanItemCard from "./PlanItemCard.vue";
 import TransportCard from "./TransportCard.vue";
 import ReplanForm from "./ReplanForm.vue";
+import RouteMap from "./RouteMap.vue";
 
 const plan = usePlanStore();
 
 const p = computed(() => plan.displayPlan);
 const day = computed(() => plan.selectedDay);
+const routePlans = computed(() => p.value?.route_plans ?? []);
 
 const outOfRangeOpen = ref(true);
 
@@ -97,6 +99,9 @@ const dateRangeText = computed(() => {
       <div class="plan-route">
         {{ p.origin || "出发地待定" }} → {{ p.destination || "目的地待定" }}
       </div>
+      <div v-if="p.destination_cities?.length" class="plan-route-cities">
+        {{ p.destination_scope === "province" ? "城市路线" : "途经" }}：{{ p.destination_cities.join(" · ") }}
+      </div>
       <div class="plan-dates">{{ dateRangeText }} · {{ p.travelers }} 人</div>
       <div v-if="p.preferences?.length" class="plan-tags">
         <span v-for="(pref, i) in p.preferences" :key="i" class="plan-tag">{{ pref }}</span>
@@ -118,6 +123,8 @@ const dateRangeText = computed(() => {
         <span v-if="p.status === 'needs_attention'" class="badge demo">需关注</span>
       </div>
     </div>
+
+    <RouteMap v-if="routePlans.some((route) => route.polyline?.length >= 2)" :routes="routePlans" />
 
     <div class="plan-actions" aria-label="计划操作">
       <button

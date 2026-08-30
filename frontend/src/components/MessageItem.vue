@@ -1,31 +1,42 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import type { ChatMessage } from "../stores/chat";
+import { useChatStore } from "../stores/chat";
 import { useAuthStore } from "../stores/auth";
 import { usePlanStore } from "../stores/plan";
 import { renderMarkdown, safeImageUrl } from "../utils/markdown";
 import SegmentText from "./SegmentText.vue";
-import assistantMarkUrl from "../assets/assistant-mark.png";
+import assistantMarkUrl from "../assets/gpt.png";
 
 const props = defineProps<{ message: ChatMessage }>();
 const auth = useAuthStore();
+const chat = useChatStore();
 const plan = usePlanStore();
 
-const showActivities = ref(false);
+const showActivities = ref(Boolean(props.message.streaming));
+
+watch(
+  () => props.message.streaming,
+  (streaming, wasStreaming) => {
+    if (streaming) showActivities.value = true;
+    else if (wasStreaming) showActivities.value = false;
+  },
+);
 
 const isUser = computed(() => props.message.role === "user");
 
 const renderedContent = computed(() => renderMarkdown(props.message.content));
 
 /**
- * answer_segments is the authoritative sentence-citation structure. Render it
- * when present; otherwise fall back to final content. Never render both.
+ * answer_segments is needed for inline citation badges. When a response has
+ * no citations, render the complete Markdown document so headings and lists
+ * are not shown as raw ``##``/``-`` markers. Never render both paths.
  */
 const useSegments = computed(
   () =>
     !isUser.value &&
     !props.message.streaming &&
-    (props.message.answer_segments?.length ?? 0) > 0,
+    (props.message.answer_segments?.some((segment) => (segment.source_ids?.length ?? 0) > 0) ?? false),
 );
 
 const textAttachments = computed(() =>
@@ -41,6 +52,21 @@ const imageAttachments = computed(() => {
   ].filter((url): url is string => Boolean(url));
 });
 
+const customClarification = ref("");
+
+function chooseClarification(value: string) {
+  const prompt = value.trim();
+  if (!prompt || chat.loading) return;
+  void chat.send(prompt);
+}
+
+function submitCustomClarification() {
+  const cities = customClarification.value.trim();
+  if (!cities || chat.loading) return;
+  customClarification.value = "";
+  chooseClarification(`我想去${cities}`);
+}
+
 function openSources() {
   plan.setMessageSources(props.message.sources ?? []);
   plan.activeTab = "sources";
@@ -52,15 +78,54 @@ function openPlan() {
   plan.panelOpen = true;
   plan.loadPlan();
 }
+
+function toggleActivities() {
+  showActivities.value = !showActivities.value;
+}
 </script>
 
 <template>
   <div class="message" :class="{ user: isUser, assistant: !isUser }">
     <div class="message-avatar">
       <template v-if="isUser">{{ auth.avatarLabel }}</template>
-      <img v-else :src="assistantMarkUrl" alt="AI" />
+      <img v-else :src="assistantMarkUrl" alt="旅行助手" />
     </div>
     <div class="message-body">
+      <template v-if="!isUser && message.activities?.length">
+        <div class="activity-section">
+          <button
+            class="activity-toggle"
+            type="button"
+            :aria-expanded="showActivities"
+            @click="toggleActivities"
+          >
+            <span class="activity-toggle-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12 3v4M12 17v4M3 12h4M17 12h4" />
+                <circle cx="12" cy="12" r="4" />
+              </svg>
+            </span>
+            <span>{{ showActivities ? "收起执行步骤" : `查看 ${message.activities.length} 个执行步骤` }}</span>
+            <svg class="activity-toggle-chevron" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m7 10 5 5 5-5" />
+            </svg>
+          </button>
+          <Transition name="activity-reveal">
+            <div v-if="showActivities" class="activity-feed">
+              <div
+                v-for="(act, i) in message.activities"
+                :key="i"
+                class="activity-item"
+                :class="{ running: message.streaming && i === message.activities.length - 1 }"
+              >
+                <span class="activity-state">[{{ act.state || "..." }}]</span>
+                <span class="activity-title">{{ act.title || act.stage }}</span>
+              </div>
+            </div>
+          </Transition>
+        </div>
+      </template>
+
       <!-- Streaming or plain assistant text -->
       <!-- eslint-disable-next-line vue/no-v-html -->
       <div
@@ -86,28 +151,40 @@ function openPlan() {
         </span>
       </div>
 
-      <!-- Activity feed (collapsed by default once finished) -->
-      <template v-if="message.activities?.length">
-        <div v-if="message.streaming || showActivities" class="activity-feed">
-          <div
-            v-for="(act, i) in message.activities"
-            :key="i"
-            class="activity-item"
-            :class="{ running: message.streaming && i === message.activities.length - 1 }"
-          >
-            <span class="activity-state">[{{ act.state || "..." }}]</span>
-            <span class="activity-title">{{ act.title || act.stage }}</span>
-          </div>
-        </div>
-        <div v-else class="message-meta-row">
-          <button class="meta-chip" type="button" @click="showActivities = true">
-            查看 {{ message.activities.length }} 个执行步骤
-          </button>
-        </div>
-      </template>
-
       <div v-if="message.failed" class="message-failed">
         本轮回答未成功完成，以上内容可能不完整；请调整后重试。
+      </div>
+
+      <div v-if="!isUser && message.clarification" class="clarification-card">
+        <p class="clarification-prompt">{{ message.clarification.prompt }}</p>
+        <div v-if="message.clarification.options?.length" class="clarification-options">
+          <template v-for="option in message.clarification.options" :key="option.key">
+            <button
+              v-if="option.value"
+              class="clarification-option"
+              type="button"
+              :disabled="chat.loading"
+              @click="chooseClarification(option.value)"
+            >
+              <span class="clarification-option-key">{{ option.key }}</span>
+              <span class="clarification-option-copy">
+                <strong>{{ option.label }}</strong>
+                <small v-if="option.description">{{ option.description }}</small>
+              </span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13" /><path d="m13 6 6 6-6 6" /></svg>
+            </button>
+            <div v-else class="clarification-custom">
+              <div class="clarification-custom-copy">
+                <span class="clarification-option-key">{{ option.key }}</span>
+                <span><strong>{{ option.label }}</strong><small>{{ option.description }}</small></span>
+              </div>
+              <form @submit.prevent="submitCustomClarification">
+                <input v-model="customClarification" type="text" placeholder="例如：南京、苏州" :disabled="chat.loading" aria-label="输入自定义城市" />
+                <button type="submit" :disabled="chat.loading || !customClarification.trim()">继续</button>
+              </form>
+            </div>
+          </template>
+        </div>
       </div>
 
       <div v-if="!isUser && !message.streaming" class="message-meta-row">

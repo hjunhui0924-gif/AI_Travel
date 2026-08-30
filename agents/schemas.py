@@ -36,6 +36,11 @@ class TravelQuery:
     duration_was_capped: bool = False
     attachment_notes: list[str] = field(default_factory=list)
     named_places: list[str] = field(default_factory=list)
+    # A destination can be a single city or a broader province/region.  Keep
+    # the scope explicit so a province query can be clarified before city-
+    # scoped adapters are called.
+    destination_scope: str = "unknown"  # unknown | city | province | region
+    destination_cities: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -107,6 +112,12 @@ class RoutePlan:
     summary: str = ""
     origin_address: str = ""
     destination_address: str = ""
+    # AMap returns route geometry as semicolon-separated lng,lat pairs. Keep
+    # the normalized points in the domain model so consumers do not need to
+    # parse provider payloads or rendered text.
+    origin_location: str = ""
+    destination_location: str = ""
+    polyline: list[list[float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -225,6 +236,13 @@ class TravelPlan:
     # Keep the provider-backed transport candidates alongside the selected
     # calendar item so HTTP consumers never need to parse rendered text.
     transport_options: list[TransportOption] = field(default_factory=list)
+    # AMap route segments used by the route preview in the itinerary panel.
+    # Kept at the end for positional backwards compatibility with older plans.
+    route_plans: list[RoutePlan] = field(default_factory=list)
+    # Preserve the scope and selected city anchors when a province-level plan
+    # is revised in a later turn.
+    destination_scope: str = "unknown"
+    destination_cities: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -244,3 +262,22 @@ class TravelPlanResponse:
     trip_plan: TravelPlan | None = None
     sources: list[Evidence] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
+    clarification: "ClarificationRequest | None" = None
+    pending_query: dict | None = None
+
+
+@dataclass(slots=True)
+class ClarificationOption:
+    key: str
+    label: str
+    description: str = ""
+    value: str = ""
+
+
+@dataclass(slots=True)
+class ClarificationRequest:
+    """A small, user-facing request for missing travel requirements."""
+
+    code: str
+    prompt: str
+    options: list[ClarificationOption] = field(default_factory=list)

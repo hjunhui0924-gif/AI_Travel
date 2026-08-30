@@ -9,7 +9,7 @@ import ConfirmDialog from "./ConfirmDialog.vue";
 import travelMarkUrl from "../assets/travel-mark.png";
 
 defineProps<{ open: boolean }>();
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{ close: []; "new-chat": [] }>();
 
 const auth = useAuthStore();
 const session = useSessionStore();
@@ -34,7 +34,7 @@ const guestThreads = computed(() => {
 });
 
 // A guest thread only becomes deletable once it actually holds content;
-// a freshly minted "新对话" has nothing on the server to delete.
+// a freshly minted current session has nothing on the server to delete.
 const guestHasContent = computed(() => {
   if (chat.messages.length > 0) return true;
   return !!session.guestTitles[session.threadId];
@@ -69,11 +69,9 @@ async function onAuthSuccess() {
   }
 }
 
-async function onNewChat() {
-  chat.cancelPending();
-  plan.reset();
-  await session.startNewChat();
+function onNewChat() {
   emit("close");
+  emit("new-chat");
 }
 
 function onSelect(threadId: string) {
@@ -111,10 +109,10 @@ async function confirmDelete() {
   <aside class="sidebar" :class="{ collapsed: !open }">
     <div class="sidebar-inner">
       <div class="brand">
-        <img :src="travelMarkUrl" alt="AI Travel Agent" />
+        <img :src="travelMarkUrl" alt="旅途规划" />
         <div>
-          <div class="brand-name">AI Travel Agent</div>
-          <div class="brand-subtitle">Lazy Trip Copilot</div>
+          <div class="brand-name">旅途规划</div>
+          <div class="brand-subtitle">旅行规划工作台</div>
         </div>
       </div>
 
@@ -137,7 +135,7 @@ async function confirmDelete() {
             type="button"
             @click="onSelect(s.thread_id)"
           >
-            <span class="session-title">{{ s.title || "新对话" }}</span>
+            <span class="session-title">{{ s.title || "未命名会话" }}</span>
             <span
               class="session-delete"
               title="删除会话"

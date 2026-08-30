@@ -1,0 +1,828 @@
+/*
+ * Current interaction pass.
+ * Imported after main.css so the final component decisions stay in one small,
+ * easy-to-tune layer while the older visual history remains intact.
+ */
+
+/* One background layer is shared by the explore and workspace states. This
+   prevents the handoff from swapping between two differently tinted photos. */
+.app-background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  filter: saturate(0.86) contrast(0.94);
+  transform: scale(1.045);
+}
+
+.app-background::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(4, 17, 22, 0.82), rgba(5, 24, 29, 0.32) 35%, rgba(5, 24, 29, 0.9) 100%),
+    linear-gradient(90deg, rgba(5, 24, 29, 0.7), transparent 62%, rgba(5, 24, 29, 0.22));
+}
+
+.app-background-enter-active,
+.app-background-leave-active {
+  will-change: opacity;
+  transition: opacity 920ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.app-background-enter-from,
+.app-background-leave-to {
+  opacity: 0;
+}
+
+.main-column.is-explore,
+.main-column.is-workspace {
+  background: transparent;
+}
+
+/* Keep the content swap visually quiet; the persistent photo layer and the
+   shared-element curtain provide the motion cue. */
+.workspace-switch-enter-active,
+.workspace-switch-leave-active {
+  transition: opacity 180ms ease;
+}
+
+.workspace-switch-enter-from,
+.workspace-switch-leave-to {
+  opacity: 0;
+}
+
+.main-column.is-explore::before,
+.main-column.is-explore::after,
+.main-column.is-workspace::before,
+.main-column.is-workspace::after {
+  content: none !important;
+  display: none;
+}
+
+.main-column > .header,
+.main-column > .chat-scroll {
+  position: relative;
+}
+
+.main-column > .header {
+  z-index: 40;
+}
+
+.main-column > .chat-scroll {
+  z-index: 1;
+  background: transparent;
+}
+
+.main-column.is-explore .chat-scroll,
+.main-column.is-workspace .chat-scroll {
+  background: transparent !important;
+}
+
+.main-column .home-background,
+.main-column .home-background-shade,
+.main-column .home-background-grain {
+  display: none;
+}
+
+/* A message bubble should hug the copy with the same breathing room on every
+   side. Keep the accent in the surface, not as a heavy side strip. */
+.main-column.is-workspace .message.user .message-content {
+  display: inline-block;
+  width: fit-content;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 11px 16px;
+  border: 1px solid rgba(243, 181, 104, 0.42);
+  border-radius: 18px;
+  color: #102f33;
+  background: rgba(255, 250, 240, 0.95);
+  box-shadow: 0 7px 22px rgba(3, 18, 22, 0.14);
+  line-height: 1.55;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.main-column.is-workspace .message.user .message-content :is(p, ul, ol):first-child,
+.main-column.is-workspace .message.user .message-content :is(p, ul, ol):last-child {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* Clarifications are actionable answer content: compact route choices keep
+   the conversation moving while the custom row handles an open city list. */
+.clarification-card {
+  max-width: min(620px, 100%);
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid rgba(243, 181, 104, 0.34);
+  border-radius: 16px;
+  background: rgba(255, 250, 240, 0.08);
+}
+
+.clarification-prompt {
+  margin: 0 0 11px;
+  color: rgba(255, 250, 240, 0.88);
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.clarification-options {
+  display: grid;
+  gap: 8px;
+}
+
+.clarification-option,
+.clarification-custom {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 9px 11px;
+  border: 1px solid rgba(255, 250, 240, 0.16);
+  border-radius: 12px;
+  color: rgba(255, 250, 240, 0.88);
+  background: rgba(255, 250, 240, 0.06);
+  text-align: left;
+  transition: border-color 180ms ease, background 180ms ease, opacity 180ms ease;
+}
+
+.clarification-option {
+  width: 100%;
+}
+
+.clarification-option:hover:not(:disabled),
+.clarification-option:focus-visible {
+  border-color: rgba(243, 181, 104, 0.7);
+  background: rgba(243, 181, 104, 0.13);
+}
+
+.clarification-option:disabled,
+.clarification-custom:has(input:disabled) {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.clarification-option-key {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  color: #102f33;
+  background: var(--sun);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.clarification-option-copy,
+.clarification-custom-copy > span:last-child {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 1px;
+}
+
+.clarification-option-copy strong,
+.clarification-custom-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.clarification-option-copy small,
+.clarification-custom-copy small {
+  overflow: hidden;
+  color: rgba(255, 250, 240, 0.58);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clarification-option svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.clarification-custom {
+  display: grid;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.clarification-custom-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.clarification-custom form {
+  display: flex;
+  gap: 8px;
+}
+
+.clarification-custom input {
+  min-width: 0;
+  flex: 1;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 250, 240, 0.18);
+  border-radius: 9px;
+  color: #fffaf0;
+  outline: none;
+  background: rgba(5, 24, 29, 0.28);
+}
+
+.clarification-custom input::placeholder {
+  color: rgba(255, 250, 240, 0.42);
+}
+
+.clarification-custom input:focus {
+  border-color: rgba(243, 181, 104, 0.72);
+  box-shadow: 0 0 0 3px rgba(243, 181, 104, 0.12);
+}
+
+.clarification-custom form button {
+  min-width: 56px;
+  padding: 0 13px;
+  border-radius: 9px;
+  color: #102f33;
+  background: var(--sun);
+  font-size: 12px;
+  transition: opacity 180ms ease;
+}
+
+.clarification-custom form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+/* A single calm search surface: focus gets a soft ring, while idle hover does
+   not make the whole hero jump around. */
+.home-prompt {
+  width: min(660px, 100%);
+  min-height: 72px;
+  padding: 8px 8px 8px 19px;
+  border-radius: 23px;
+  transform: none;
+  transition: border-color 220ms ease, background 220ms ease, box-shadow 220ms ease;
+}
+
+.home-prompt:focus-within {
+  transform: none;
+}
+
+.home-prompt button,
+.home-prompt button:hover,
+.home-prompt button:active {
+  transform: none;
+  box-shadow: none;
+  transition: background 180ms ease, opacity 180ms ease;
+}
+
+.home-prompt button:hover {
+  background: #ffd293;
+}
+
+.home-prompt button:active {
+  opacity: 0.82;
+}
+
+/* Route preview card. The interactive branch uses the browser-scoped AMap JS
+   API key; the static image fallback keeps the Web Service key on the server. */
+.route-map-card {
+  margin: 0 0 16px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(253, 251, 243, 0.86);
+  box-shadow: var(--shadow);
+}
+
+.plan-route-cities {
+  margin-top: 4px;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.route-map-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 11px;
+}
+
+.route-map-kicker {
+  margin: 0 0 3px;
+  color: var(--clay);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.route-map-heading h3 {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-serif);
+  font-size: 19px;
+  font-weight: 400;
+  line-height: 1.25;
+}
+
+.route-map-provider {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  font-size: 10px;
+}
+
+.route-map-image {
+  display: block;
+  width: 100%;
+  aspect-ratio: 750 / 420;
+  overflow: hidden;
+  border: 1px solid rgba(14, 95, 84, 0.18);
+  border-radius: 10px;
+  object-fit: cover;
+  background: #e8e6df;
+}
+
+.route-map-interactive {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(14, 95, 84, 0.18);
+  border-radius: 10px;
+  background: #e8e6df;
+  isolation: isolate;
+}
+
+.route-map-canvas {
+  width: 100%;
+  height: clamp(260px, 34vw, 360px);
+  cursor: grab;
+}
+
+.route-map-canvas:active {
+  cursor: grabbing;
+}
+
+.route-map-canvas .amap-container {
+  width: 100%;
+  height: 100%;
+  font-family: var(--font-sans);
+}
+
+.route-map-interactive-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: var(--text-secondary);
+  background: rgba(253, 251, 243, 0.68);
+  backdrop-filter: blur(2px);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.route-map-interactive-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 3;
+  padding: 5px 8px;
+  border: 1px solid rgba(14, 95, 84, 0.16);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: rgba(253, 251, 243, 0.88);
+  box-shadow: 0 4px 12px rgba(45, 42, 32, 0.08);
+  font-size: 10px;
+  pointer-events: none;
+}
+
+.route-map-pin {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 3px solid #fffaf0;
+  border-radius: 50%;
+  color: #102f33;
+  background: var(--sun);
+  box-shadow: 0 3px 12px rgba(45, 42, 32, 0.24);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.route-map-pin.is-end {
+  color: #fffaf0;
+  background: var(--clay);
+}
+
+.route-map-fallback {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(14, 95, 84, 0.18);
+  border-radius: 10px;
+  background: #e8f0e7;
+}
+
+.route-map-fallback svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.route-map-fallback-label {
+  position: absolute;
+  right: 9px;
+  bottom: 8px;
+  padding: 4px 7px;
+  border: 1px solid rgba(14, 95, 84, 0.14);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: rgba(253, 251, 243, 0.86);
+  font-size: 10px;
+}
+
+.route-map-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 170px;
+  gap: 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  color: var(--text-muted);
+  background:
+    linear-gradient(135deg, rgba(217, 233, 222, 0.4), transparent 45%),
+    var(--bg-subtle);
+  font-size: 12px;
+}
+
+.route-map-placeholder .spinner {
+  width: 18px;
+  height: 18px;
+  border-width: 2px;
+}
+
+.route-map-error {
+  padding: 20px;
+  text-align: center;
+}
+
+.route-map-legend {
+  display: grid;
+  gap: 7px;
+  margin-top: 11px;
+}
+
+.route-map-legend-item {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.route-map-marker {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.route-map-legend-item > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.route-map-distance {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.route-map-note {
+  margin: 10px 0 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.home-view.is-transitioning .home-prompt {
+  width: min(660px, 100%);
+  min-height: 72px;
+  border-radius: 23px;
+  transform: none;
+  opacity: 0.12;
+}
+
+/* Quick prompts act as low-noise suggestions rather than a second row of
+   floating cards. */
+.home-quick-prompts {
+  gap: 18px;
+  margin-top: 15px;
+}
+
+.home-quick-prompts button {
+  min-height: 32px;
+  padding: 3px 0 4px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 250, 240, 0.28);
+  border-radius: 0;
+  color: rgba(255, 250, 240, 0.78);
+  background: transparent;
+  transition: border-color 180ms ease, color 180ms ease;
+}
+
+.home-quick-prompts button:hover {
+  border-bottom-color: #f3b568;
+  color: #f8dfb7;
+  background: transparent;
+}
+
+/* Shared-element handoff. App.vue measures the original search form and
+   stores those four offsets as CSS variables before showing this layer. */
+.workspace-transition-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 35;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  color: #fffaf0;
+  background: transparent;
+  clip-path: inset(0 round 0);
+  isolation: isolate;
+  will-change: clip-path, opacity;
+}
+
+.workspace-transition-layer::after {
+  display: none;
+}
+
+.workspace-transition-surface {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+  gap: 12px;
+  padding: 8px 20px;
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  transition: background 430ms ease, border-color 360ms ease, border-radius 430ms ease, box-shadow 430ms ease;
+}
+
+.workspace-curtain-enter-active {
+  transition: clip-path 520ms cubic-bezier(0.16, 1, 0.3, 1), opacity 180ms ease;
+}
+
+.workspace-curtain-enter-from {
+  clip-path: inset(var(--transition-top) var(--transition-right) var(--transition-bottom) var(--transition-left) round 23px);
+  opacity: 1;
+}
+
+.workspace-curtain-enter-from .workspace-transition-surface {
+  border-color: rgba(255, 250, 240, 0.48);
+  border-radius: 23px;
+  background: rgba(255, 250, 240, 0.15);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 250, 240, 0.15);
+}
+
+.workspace-transition-icon,
+.workspace-transition-query,
+.workspace-transition-status {
+  transition: opacity 260ms ease, transform 360ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.workspace-transition-icon {
+  width: 21px;
+  height: 21px;
+  flex: 0 0 auto;
+  opacity: 0;
+  color: rgba(255, 250, 240, 0.76);
+}
+
+.workspace-transition-query {
+  max-width: min(70%, 600px);
+  overflow: hidden;
+  color: #fffaf0;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(-4px);
+}
+
+.workspace-transition-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: rgba(255, 250, 240, 0.78);
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.workspace-curtain-enter-from .workspace-transition-icon,
+.workspace-curtain-enter-from .workspace-transition-query {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.workspace-curtain-enter-from .workspace-transition-status {
+  opacity: 0;
+  transform: translateY(7px);
+}
+
+.workspace-curtain-leave-active {
+  transition: opacity 180ms ease;
+}
+
+.workspace-curtain-leave-to {
+  opacity: 0;
+}
+
+/* DeepSeek-inspired identity treatment: brand is always present on the left,
+   then the entire header settles into a compact glass pill on scroll. */
+.main-column.is-explore .header,
+.main-column.is-workspace .header {
+  transition: top 280ms cubic-bezier(0.16, 1, 0.3, 1), right 280ms cubic-bezier(0.16, 1, 0.3, 1), left 280ms cubic-bezier(0.16, 1, 0.3, 1), height 280ms cubic-bezier(0.16, 1, 0.3, 1), margin 280ms cubic-bezier(0.16, 1, 0.3, 1), padding 280ms cubic-bezier(0.16, 1, 0.3, 1), border-color 220ms ease, border-radius 280ms cubic-bezier(0.16, 1, 0.3, 1), background 260ms ease, box-shadow 260ms ease;
+}
+
+.main-column.is-explore .header {
+  height: 72px;
+  padding: 0 22px;
+}
+
+.header > .icon-btn {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+}
+
+.header-brand > img {
+  width: 32px;
+  height: 32px;
+  padding: 4px;
+  border-radius: 10px;
+}
+
+.header-brand-copy strong {
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.header-brand-copy small {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.main-column.is-explore .header.is-compact {
+  top: 11px;
+  right: 18px;
+  left: 18px;
+  height: 54px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 250, 240, 0.26);
+  border-radius: 22px;
+  background: rgba(7, 34, 39, 0.58);
+  box-shadow: 0 14px 36px rgba(3, 18, 22, 0.22), 0 1px 0 rgba(255, 250, 240, 0.14) inset;
+  backdrop-filter: blur(20px) saturate(135%);
+}
+
+.main-column.is-workspace .header.is-compact {
+  height: 52px;
+  margin: 9px 18px 0;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 250, 240, 0.26);
+  border-radius: 22px;
+  background: rgba(7, 34, 39, 0.58);
+  box-shadow: 0 14px 36px rgba(3, 18, 22, 0.22), 0 1px 0 rgba(255, 250, 240, 0.14) inset;
+  backdrop-filter: blur(20px) saturate(135%);
+}
+
+.header.is-compact .header-brand > img {
+  width: 25px;
+  height: 25px;
+  padding: 3px;
+  border-radius: 8px;
+}
+
+.header.is-compact .header-brand-copy strong {
+  font-size: 13px;
+}
+
+.header.is-compact .header-brand-copy small {
+  max-height: 0;
+  opacity: 0;
+}
+
+@media (max-width: 600px) {
+  .home-prompt {
+    min-height: 60px;
+    padding-left: 15px;
+    border-radius: 18px;
+  }
+
+  .home-prompt button {
+    width: 44px;
+    height: 44px;
+    border-radius: 13px;
+  }
+
+  .main-column.is-explore .header {
+    padding: 0 14px;
+  }
+
+  .main-column.is-explore .header.is-compact {
+    top: 10px;
+    right: 12px;
+    left: 12px;
+  }
+
+  .main-column.is-workspace .header.is-compact {
+    margin-right: 12px;
+    margin-left: 12px;
+  }
+
+  .home-view.is-transitioning .home-prompt {
+    width: calc(100vw - 32px);
+    min-height: 60px;
+    border-radius: 18px;
+    transform: none;
+  }
+
+  .workspace-transition-query {
+    max-width: 72%;
+    font-size: 13px;
+  }
+
+  .route-map-card {
+    padding: 11px;
+  }
+
+  .route-map-canvas {
+    height: 280px;
+  }
+
+  .route-map-heading h3 {
+    font-size: 18px;
+  }
+
+  .route-map-legend-item {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+
+  .route-map-distance {
+    grid-column: 2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-transition-layer,
+  .workspace-transition-surface,
+  .workspace-transition-icon,
+  .workspace-transition-query,
+  .workspace-transition-status {
+    animation: none;
+    transition: none;
+  }
+}

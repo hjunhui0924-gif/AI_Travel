@@ -41,6 +41,28 @@ PLACE_STOP_WORDS = [
     "\u822a\u73ed",
 ]
 
+GENERIC_PLACE_PHRASES = {
+    "美食",
+    "本地美食",
+    "当地美食",
+    "好吃的",
+    "餐厅",
+    "附近餐厅",
+    "景点",
+    "附近景点",
+    "周边景点",
+    "慢节奏",
+    "轻松",
+    "不赶路",
+    "少走路",
+    "多安排美食",
+    "节奏慢一些",
+    "节奏慢一点",
+    "慢一点",
+    "慢慢玩",
+    "不赶景点",
+}
+
 LEADING_CONTEXT_WORDS = [
     "\u6211\u4f4f\u5728",
     "\u6211\u5165\u4f4f\u5728",
@@ -48,6 +70,14 @@ LEADING_CONTEXT_WORDS = [
     "\u5165\u4f4f",
     "\u4f1a\u573a\u5728",
     "\u5728",
+    "包含",
+    "包括",
+    "途经",
+    "打算去",
+    "计划去",
+    "想去",
+    "游览",
+    "游玩",
 ]
 
 
@@ -70,7 +100,7 @@ def _clean_value(value: str) -> str:
 
 def _append_place(places: list[str], value: str) -> None:
     cleaned = _clean_value(value)
-    if not cleaned or cleaned in places:
+    if not cleaned or cleaned in places or cleaned in GENERIC_PLACE_PHRASES:
         return
     if any(stop_word in cleaned for stop_word in PLACE_STOP_WORDS):
         if not any(label in cleaned for label in ["宾馆", "酒店", "景区", "公园", "博物馆", "中心", "大厦", "广场", "西湖"]):
@@ -124,6 +154,20 @@ def extract_named_places(attachments: list[dict], message: str = "") -> list[str
         r"(?:\u5728)([^\n,，。.;；]{2,24}?)(?:\u5f00\u4f1a|\u53c2\u4f1a|$)",
         r"(?:顺便去|顺路去|想去)([^\n,，。.;；]{2,24})",
     ]
+
+    # Explicit lists are the most reliable route anchors. Split them before
+    # the broader sentence patterns so "包含西湖、灵隐寺和河坊街" becomes
+    # three city-scoped place searches instead of one ambiguous long string.
+    explicit_list_patterns = [
+        r"(?:包含|包括|途经|打算去|计划去|想去|游览|游玩)([^\n。！？!?]{2,120})",
+        r"(?:顺便去|顺路去)([^\n。！？!?]{2,120})",
+    ]
+    for pattern in explicit_list_patterns:
+        for match in re.findall(pattern, message):
+            candidates = re.split(r"[、,，;；]|以及|还有|和|及|与", match)
+            for candidate in candidates:
+                _append_place(places, candidate)
+
     for pattern in message_patterns:
         for match in re.findall(pattern, message):
             cleaned = _clean_value(match)

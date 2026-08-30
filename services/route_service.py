@@ -75,7 +75,10 @@ def _build_segments(query: TravelQuery) -> list[tuple[dict, dict]]:
     for start, end in zip(resolved_places, resolved_places[1:]):
         start_key = (start.get("name", ""), start.get("formatted_address", ""), start.get("location", ""))
         end_key = (end.get("name", ""), end.get("formatted_address", ""), end.get("location", ""))
-        if start_key == end_key:
+        # Do not invent a route for an unresolved landmark. AMap's route
+        # geometry is only trustworthy after both endpoints are location
+        # resolved in the requested city.
+        if start_key == end_key or not start.get("location") or not end.get("location"):
             continue
         segments.append((start, end))
     return segments
@@ -92,7 +95,11 @@ def get_route_plans(query: TravelQuery) -> RoutePlansResult:
         candidates: list[RoutePlan] = []
         for mode in ["transit", "driving", "walking"]:
             try:
-                payload = plan_route(start["name"], end["name"], strategy=mode)
+                # Use the city-scoped coordinates resolved above. Passing a
+                # bare landmark name to geocoding can select a same-named
+                # place in another city; the adapter returns the geometry and
+                # the route model keeps the display names separately.
+                payload = plan_route(start["location"], end["location"], strategy=mode)
             except Exception as exc:
                 # Route modes are independent provider calls.  A transit
                 # outage must not prevent driving/walking alternatives from
@@ -104,13 +111,16 @@ def get_route_plans(query: TravelQuery) -> RoutePlansResult:
             candidates.append(
                 RoutePlan(
                     mode=mode,
-                    origin=payload.get("origin", start["name"]),
-                    destination=payload.get("destination", end["name"]),
+                    origin=start.get("name") or payload.get("origin", ""),
+                    destination=end.get("name") or payload.get("destination", ""),
                     origin_address=start.get("formatted_address", start["name"]),
                     destination_address=end.get("formatted_address", end["name"]),
                     duration=payload.get("duration", ""),
                     distance=payload.get("distance", ""),
                     summary=payload.get("summary", ""),
+                    origin_location=payload.get("origin_location", start.get("location", "")),
+                    destination_location=payload.get("destination_location", end.get("location", "")),
+                    polyline=payload.get("polyline", []) if isinstance(payload.get("polyline", []), list) else [],
                 )
             )
 

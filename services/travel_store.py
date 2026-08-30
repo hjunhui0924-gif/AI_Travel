@@ -26,6 +26,7 @@ from agents.schemas import (
     Evidence,
     PlanDay,
     PlanItem,
+    RoutePlan,
     TransportOption,
     TravelConstraint,
     TravelFact,
@@ -197,6 +198,44 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
         if item is not None:
             out_of_range_items.append(item)
 
+    route_plans = []
+    for raw_route in payload.get("route_plans") or []:
+        if isinstance(raw_route, dict):
+            route_values = _field_values(
+                RoutePlan,
+                raw_route,
+                {
+                    "mode": "walking",
+                    "origin": "",
+                    "destination": "",
+                    "duration": "",
+                    "distance": "",
+                    "summary": "",
+                    "origin_address": "",
+                    "destination_address": "",
+                    "origin_location": "",
+                    "destination_location": "",
+                    "polyline": [],
+                },
+            )
+            normalized_polyline: list[list[float]] = []
+            for raw_point in _list_value(route_values.get("polyline")):
+                if isinstance(raw_point, (list, tuple)) and len(raw_point) == 2:
+                    try:
+                        longitude = float(raw_point[0])
+                        latitude = float(raw_point[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        longitude == longitude
+                        and latitude == latitude
+                        and -180 <= longitude <= 180
+                        and -90 <= latitude <= 90
+                    ):
+                        normalized_polyline.append([round(longitude, 6), round(latitude, 6)])
+            route_values["polyline"] = normalized_polyline
+            route_plans.append(RoutePlan(**route_values))
+
     facts = []
     for raw_fact in payload.get("facts") or []:
         if isinstance(raw_fact, dict):
@@ -320,11 +359,14 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             "projection_end_date": last_day,
             "origin": "",
             "destination": "",
+            "destination_scope": "unknown",
+            "destination_cities": [],
             "travelers": 1,
             "preferences": [],
             "summary": "",
             "out_of_range_items": [],
             "transport_options": [],
+            "route_plans": [],
             "conflicts": [],
             "risks": [],
             "alerts": [],
@@ -348,6 +390,8 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
     values["constraints"] = constraints
     values["sources"] = sources
     values["transport_options"] = transport_options
+    values["route_plans"] = route_plans
+    values["destination_cities"] = _list_value(values.get("destination_cities"))
     # A malformed/old row should not make a thread impossible to open.
     return TravelPlan(**values)
 

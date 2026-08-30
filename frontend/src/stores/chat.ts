@@ -6,6 +6,7 @@ import type {
   AttachmentInfo,
   DonePayload,
   HistoryMessage,
+  ClarificationRequest,
   SourceInfo,
 } from "../types/api";
 import { useSessionStore } from "./session";
@@ -20,6 +21,8 @@ export interface ChatMessage {
   activities?: ActivityEvent[];
   sources?: SourceInfo[];
   answer_segments?: AnswerSegment[];
+  clarification?: ClarificationRequest | null;
+  scope_refusal?: boolean;
   search_enabled?: boolean;
   plan_id?: string | null;
   plan_version?: number | null;
@@ -76,6 +79,8 @@ export const useChatStore = defineStore("chat", {
           activities: m.activities ?? [],
           sources: m.sources ?? [],
           answer_segments: m.answer_segments ?? [],
+          clarification: m.clarification ?? null,
+          scope_refusal: m.scope_refusal ?? false,
           search_enabled: m.search_enabled,
           plan_id: m.plan_id ?? null,
           plan_version: m.plan_version ?? null,
@@ -212,6 +217,8 @@ export const useChatStore = defineStore("chat", {
             current.failed = payload.ok === false;
             current.content = payload.final_text || current.content;
             current.answer_segments = payload.answer_segments ?? [];
+            current.clarification = payload.clarification ?? null;
+            current.scope_refusal = payload.scope_refusal ?? false;
             current.activities = payload.activities ?? current.activities;
             current.sources = payload.sources ?? current.sources;
             if (payload.trip_plan) {

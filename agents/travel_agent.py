@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import re
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled
 from agents.schemas import (
+    ClarificationOption,
+    ClarificationRequest,
     Evidence,
     PlanDay,
     PlanItem,
@@ -36,9 +39,48 @@ CN_TZ = ZoneInfo("Asia/Shanghai")
 MAX_REQUESTED_TRIP_DAYS = 365
 
 KNOWN_CITIES = [
-    "北京", "上海", "广州", "深圳", "杭州", "苏州", "南京", "成都",
-    "重庆", "武汉", "西安", "长沙", "厦门", "青岛", "湛江", "佛山",
+    "北京", "上海", "广州", "深圳", "杭州", "苏州", "南京", "扬州", "无锡",
+    "镇江", "常州", "南通", "徐州", "成都", "重庆", "武汉", "西安", "长沙",
+    "厦门", "福州", "青岛", "济南", "郑州", "合肥", "南昌", "昆明", "贵阳",
+    "湛江", "佛山",
 ]
+
+# Province-level destinations need a different completeness rule from a
+# city-level destination: five days in Jiangsu is not one place lookup. Keep
+# the profile data-driven so other provinces can add route presets without
+# changing the clarification pipeline.
+PROVINCE_DESTINATION_PROFILES = {
+    "江苏": {
+        "aliases": ("江苏省", "江苏"),
+        "cities": ("南京", "扬州", "苏州", "无锡", "镇江", "常州", "南通", "徐州"),
+        "routes": (
+            {
+                "key": "A",
+                "cities": ("南京", "扬州"),
+                "label": "南京 + 扬州",
+                "description": "历史人文、园林古城",
+            },
+            {
+                "key": "B",
+                "cities": ("苏州", "无锡"),
+                "label": "苏州 + 无锡",
+                "description": "水乡园林、休闲慢游",
+            },
+            {
+                "key": "C",
+                "cities": ("南京", "苏州"),
+                "label": "南京 + 苏州",
+                "description": "第一次去江苏的经典路线",
+            },
+        ),
+    },
+}
+
+PROVINCE_ALIASES = {
+    alias: province
+    for province, profile in PROVINCE_DESTINATION_PROFILES.items()
+    for alias in profile["aliases"]
+}
 
 RAIL_KEYWORDS = ["高铁", "火车", "动车", "12306", "车次", "车票", "余票"]
 FLIGHT_KEYWORDS = ["飞机", "航班", "机票"]
@@ -95,7 +137,32 @@ def _clean_location(value: str) -> str:
     return cleaned
 
 
+def _extract_origin_hint(message: str) -> str:
+    """Extract an optional origin from phrases such as ``从上海出发``."""
+
+    match = re.search(r"(?:从|由)\s*([^\s，。,.;；]+?)\s*(?:出发|到|去|前往)", message)
+    if not match:
+        return ""
+    candidate = _clean_location(match.group(1))
+    for location in [*KNOWN_CITIES, *PROVINCE_ALIASES]:
+        if location in candidate:
+            return PROVINCE_ALIASES.get(location, location)
+    return candidate
+
+
 def _extract_cities(message: str) -> tuple[str, str]:
+    # A province mention is the destination scope. It must win over city-name
+    # scanning so ``江苏五日游，想去南京和苏州`` is not misread as a Shanghai-
+    # style point-to-point route between the two cities.
+    province_hits = [
+        (message.find(alias), province)
+        for alias, province in PROVINCE_ALIASES.items()
+        if message.find(alias) >= 0
+    ]
+    if province_hits:
+        _position, province = min(province_hits, key=lambda item: item[0])
+        return _extract_origin_hint(message), province
+
     hits_with_pos = []
     for city in KNOWN_CITIES:
         index = message.find(city)
@@ -115,6 +182,31 @@ def _extract_cities(message: str) -> tuple[str, str]:
     if route_match_alt:
         return _clean_location(route_match_alt.group(1)), _clean_location(route_match_alt.group(2))
     return "", ""
+
+
+def _extract_destination_cities(message: str, destination: str) -> list[str]:
+    province = PROVINCE_ALIASES.get(destination, destination)
+    profile = PROVINCE_DESTINATION_PROFILES.get(province)
+    if not profile:
+        return []
+
+    mentioned = [
+        (message.find(city), city)
+        for city in profile["cities"]
+        if message.find(city) >= 0
+    ]
+    selected = [city for _position, city in sorted(mentioned, key=lambda item: item[0])]
+
+    selection = re.search(r"(?:选择|选|路线)\s*([A-C])", message, re.IGNORECASE)
+    if selection:
+        route = next(
+            (item for item in profile["routes"] if item["key"].upper() == selection.group(1).upper()),
+            None,
+        )
+        if route:
+            selected = list(route["cities"])
+
+    return list(dict.fromkeys(selected))
 
 
 _CN_NUMBERS = {
@@ -265,22 +357,80 @@ def _extract_date(message: str) -> str:
     return _extract_date_range(message)[0]
 
 
-def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
+def _hint_string(hint: dict | None, key: str) -> str:
+    value = (hint or {}).get(key, "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _hint_list(hint: dict | None, key: str) -> list[str]:
+    value = (hint or {}).get(key, [])
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def build_travel_query(
+    message: str,
+    attachments: list[dict],
+    *,
+    extraction_hint: dict | None = None,
+) -> TravelQuery:
     origin, destination = _extract_cities(message)
+    if not origin:
+        origin = _hint_string(extraction_hint, "origin")
+    if not destination:
+        destination = _hint_string(extraction_hint, "destination")
+    origin = PROVINCE_ALIASES.get(origin, origin)
+    destination = PROVINCE_ALIASES.get(destination, destination)
     intent = _detect_intent(message, origin, destination)
+    hinted_intent = _hint_string(extraction_hint, "intent")
+    if hinted_intent in {"rail_query", "flight_query", "transport_compare", "trip_plan", "nearby_explore", "trip_replan"}:
+        # Deterministic routing wins whenever it found an explicit transport
+        # request. The fallback may only fill the default trip intent.
+        if intent == "trip_plan" and not _contains_any(message, [*RAIL_KEYWORDS, *FLIGHT_KEYWORDS]):
+            intent = hinted_intent
     attachment_notes = extract_attachment_notes(attachments)
     named_places = extract_named_places(attachments, message=message)
+    destination_scope = "province" if destination in PROVINCE_DESTINATION_PROFILES else "city" if destination else "unknown"
+    destination_cities = _extract_destination_cities(message, destination)
+    destination_cities = list(dict.fromkeys([*destination_cities, *_hint_list(extraction_hint, "destination_cities")]))
+    if destination_scope == "province" and destination_cities:
+        # City names serve as route/POI anchors after the province scope has
+        # been clarified. Preserve any explicitly named landmarks after them.
+        named_places = list(dict.fromkeys([*destination_cities, *named_places]))[:6]
     city = destination or origin
     start_date, end_date, date_is_assumed, days = _extract_date_range(message)
     explicit_dates = _extract_explicit_dates(message)
+    hinted_start_date = _hint_string(extraction_hint, "start_date")
+    if not explicit_dates and re.fullmatch(r"20\d{2}-\d{2}-\d{2}", hinted_start_date):
+        try:
+            hinted_date = date.fromisoformat(hinted_start_date)
+        except ValueError:
+            hinted_date = None
+        if hinted_date is not None:
+            start_date = hinted_date.isoformat()
+            date_is_assumed = False
     _duration_days, duration_was_capped = _extract_duration_days(message)
+    hinted_days = (extraction_hint or {}).get("days")
+    if not _has_explicit_duration(message) and isinstance(hinted_days, int) and hinted_days > 0:
+        days = min(MAX_REQUESTED_TRIP_DAYS, hinted_days)
+        duration_was_capped = hinted_days > MAX_REQUESTED_TRIP_DAYS
+        end_date = (date.fromisoformat(start_date) + timedelta(days=days - 1)).isoformat()
     preferences = _extract_preferences(message)
+    preferences = list(dict.fromkeys([*preferences, *_hint_list(extraction_hint, "preferences")]))
 
     travel_mode = ""
     if _contains_any(message, FLIGHT_KEYWORDS):
         travel_mode = "flight"
     elif _contains_any(message, RAIL_KEYWORDS):
         travel_mode = "rail"
+    elif _hint_string(extraction_hint, "travel_mode") in {"flight", "rail"}:
+        travel_mode = _hint_string(extraction_hint, "travel_mode")
+
+    travelers = _extract_travelers(message)
+    hinted_travelers = (extraction_hint or {}).get("travelers")
+    if travelers == 1 and isinstance(hinted_travelers, int) and 1 < hinted_travelers <= 30 and "人" not in message:
+        travelers = hinted_travelers
 
     query = TravelQuery(
         raw_text=message,
@@ -292,10 +442,10 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
         start_date=start_date,
         end_date=end_date,
         days=days,
-        travelers=_extract_travelers(message),
+        travelers=travelers,
         preferences=preferences,
         constraints=_extract_constraints(message, preferences),
-        duration_is_assumed=not _has_explicit_duration(message),
+        duration_is_assumed=not _has_explicit_duration(message) and not isinstance(hinted_days, int),
         duration_was_capped=duration_was_capped
         or (
             len(explicit_dates) >= 2
@@ -303,6 +453,8 @@ def build_travel_query(message: str, attachments: list[dict]) -> TravelQuery:
         ),
         attachment_notes=attachment_notes,
         named_places=named_places,
+        destination_scope=destination_scope,
+        destination_cities=destination_cities,
     )
     query.date_is_assumed = date_is_assumed
     return query
@@ -315,6 +467,10 @@ def _inherit_previous_requirement(query: TravelQuery, current_plan: TravelPlan |
         query.origin = current_plan.origin
     if not query.destination:
         query.destination = current_plan.destination
+    if query.destination_scope == "unknown":
+        query.destination_scope = current_plan.destination_scope
+    if not query.destination_cities:
+        query.destination_cities = list(current_plan.destination_cities)
     query.city = query.destination or query.city or current_plan.destination
     if not query.start_date or query.date_is_assumed:
         query.start_date = current_plan.start_date
@@ -338,6 +494,68 @@ def _inherit_previous_requirement(query: TravelQuery, current_plan: TravelPlan |
 
 def _should_include_explore(query: TravelQuery) -> bool:
     return query.intent in {"trip_plan", "nearby_explore", "trip_replan"}
+
+
+def _route_anchor_names_from_recommendations(
+    recommendations: list[PoiRecommendation],
+) -> list[str]:
+    """Choose map-verified sightseeing anchors for a generic city trip."""
+
+    route_categories = ("景点", "去处", "公园", "风景", "博物馆", "古迹")
+    names: list[str] = []
+    for recommendation in recommendations:
+        if recommendation.is_placeholder:
+            continue
+        if not any(token in recommendation.category for token in route_categories):
+            continue
+        name = recommendation.name.strip()
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= 4:
+            break
+    return names
+
+
+def _build_clarification(query: TravelQuery) -> ClarificationRequest | None:
+    if not query.destination:
+        return ClarificationRequest(
+            code="destination_required",
+            prompt="我还没有识别出目的地。请告诉我想去哪个城市或省份。",
+        )
+
+    if query.destination_scope != "province":
+        return None
+
+    province = PROVINCE_ALIASES.get(query.destination, query.destination)
+    profile = PROVINCE_DESTINATION_PROFILES.get(province)
+    if not profile or query.destination_cities:
+        return None
+
+    options = [
+        ClarificationOption(
+            key=route["key"],
+            label=route["label"],
+            description=route["description"],
+            value=f"选择 {route['key']}：{route['label']}",
+        )
+        for route in profile["routes"]
+    ]
+    options.append(
+        ClarificationOption(
+            key="D",
+            label="自定义城市",
+            description="直接告诉我想去的城市",
+            value="",
+        )
+    )
+    return ClarificationRequest(
+        code="destination_cities",
+        prompt=(
+            f"{province}范围比较大，{query.days}天建议选择 2～3 个城市。"
+            "你更想走哪条路线？预计出发日期也可以一并告诉我；日期未定也可以先做行程。"
+        ),
+        options=options,
+    )
 
 
 def _should_include_weather(query: TravelQuery) -> bool:
@@ -684,11 +902,14 @@ def _build_structured_plan(
         projection_end_date=day_dates[-1] if day_dates else query.start_date,
         origin=query.origin,
         destination=query.destination or query.city,
+        destination_scope=query.destination_scope,
+        destination_cities=list(query.destination_cities),
         travelers=query.travelers,
         preferences=list(query.preferences),
         summary=_build_summary(query),
         days=days,
         transport_options=list(transport_options),
+        route_plans=list(route_plans),
         out_of_range_items=out_of_range_items,
         facts=facts,
         constraints=constraints,
@@ -711,8 +932,22 @@ def plan_travel(
     search_enabled: bool = False,
     current_plan: TravelPlan | None = None,
     activity_logger=None,
+    extraction_hint: dict | None = None,
 ) -> TravelPlanResponse:
-    query = _inherit_previous_requirement(build_travel_query(message, attachments), current_plan)
+    query = _inherit_previous_requirement(
+        build_travel_query(message, attachments, extraction_hint=extraction_hint),
+        current_plan,
+    )
+    clarification = _build_clarification(query)
+    if clarification is not None:
+        # Do not create a placeholder TravelPlan or spend provider quota while
+        # a blocking destination requirement is still ambiguous.
+        return TravelPlanResponse(
+            intent=query.intent,
+            summary="我可以帮你规划这趟旅行，但需要先确认一个关键信息。",
+            clarification=clarification,
+            pending_query=asdict(query),
+        )
     has_cross_city_route = bool(query.origin and query.destination and query.origin != query.destination)
 
     should_fetch_transport = query.intent in {"rail_query", "flight_query", "transport_compare", "trip_plan", "trip_replan"}
@@ -820,6 +1055,39 @@ def plan_travel(
             diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
         else:
             adapter_status["poi"] = poi_status
+
+        # A generic city request such as "广州五日游" has no explicit
+        # landmark list, so the first route lookup quite correctly returns
+        # no segments. Reuse the map-backed sightseeing recommendations as
+        # route anchors after POI discovery; explicit user landmarks remain
+        # authoritative and are never silently replaced.
+        has_route_geometry = any(len(route.polyline) >= 2 for route in route_plans)
+        if not has_route_geometry and not query.named_places:
+            route_anchor_names = _route_anchor_names_from_recommendations(poi_items)
+            if len(route_anchor_names) >= 2:
+                route_query = deepcopy(query)
+                route_query.named_places = route_anchor_names
+                try:
+                    fallback_route_result = get_route_plans(route_query)
+                    route_plans = list(fallback_route_result)
+                    fallback_route_errors = list(getattr(fallback_route_result, "errors", []) or [])
+                    if fallback_route_errors:
+                        adapter_status["route"] = "partial" if route_plans else "failed"
+                        diagnostics.extend(
+                            f"route mode failed: {error}" for error in fallback_route_errors
+                        )
+                        alerts.append(
+                            "部分地图路线模式查询失败，已保留仍可用的路线结果。"
+                            if route_plans
+                            else "地图路线模式查询失败，本次没有可用路线结果。"
+                        )
+                    else:
+                        adapter_status["route"] = "success" if route_plans else "empty"
+                except Exception as exc:
+                    route_plans = []
+                    adapter_status["route"] = "failed"
+                    diagnostics.append(f"route adapter failed: {type(exc).__name__}")
+                    alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
     else:
         route_plans = []
         poi_items, poi_groups, poi_sources, poi_errors = [], [], [], []
@@ -917,6 +1185,9 @@ def plan_travel(
 
 def render_travel_response(response: TravelPlanResponse) -> str:
     lines = [response.summary]
+    if response.clarification:
+        lines.extend(["", response.clarification.prompt])
+        return "\n".join(lines).strip()
     web_source_ids = {
         source.evidence_id
         for source in response.sources

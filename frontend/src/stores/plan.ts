@@ -31,7 +31,9 @@ export const usePlanStore = defineStore("plan", {
     dayLoading: false,
     dayError: "",
     selectedDate: "",
-    panelOpen: true,
+    // The plan is a floating bottom sheet in the workspace. Keep it closed
+    // until the user opens the dock so the exploration surface stays clear.
+    panelOpen: false,
     activeTab: "itinerary" as PanelTab,
     /** Sources attached to the latest assistant answer (chat-level). */
     messageSources: [] as SourceInfo[],
@@ -86,7 +88,6 @@ export const usePlanStore = defineStore("plan", {
   actions: {
     setMessageSources(sources: SourceInfo[]) {
       this.messageSources = sources ?? [];
-      if (sources?.length) this.panelOpen = true;
     },
     highlightSources(ids: string[]) {
       this.highlightedSourceIds = ids;
@@ -98,8 +99,11 @@ export const usePlanStore = defineStore("plan", {
       this.viewingPlan = null;
       this.viewingVersion = null;
       this.conflict409 = null;
-      this.panelOpen = true;
       this.activeTab = "itinerary";
+      // A newly generated plan should reveal its structured result
+      // immediately. Otherwise the route map stays inside the hidden plan
+      // sheet and users only see the chat background after submitting.
+      this.panelOpen = true;
       this.dayCache = {};
       for (const day of plan.days) {
         this.dayCache[dayCacheKey(plan.thread_id, plan.version, day.date)] = day;
@@ -148,6 +152,10 @@ export const usePlanStore = defineStore("plan", {
         this.versions = res.versions ?? [];
         if (res.plan) {
           this.plan = res.plan;
+          // Existing plans should behave like newly generated plans: if a
+          // route is available, keep it discoverable after a refresh or
+          // session switch instead of leaving it inside a hidden sheet.
+          this.panelOpen = true;
           this.viewingPlan = null;
           this.viewingVersion = null;
           this.dayCache = {};

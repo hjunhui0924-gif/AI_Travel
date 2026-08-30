@@ -120,3 +120,39 @@ def test_route_mode_failure_does_not_block_other_modes(monkeypatch):
     assert results[0].mode == "driving"
     assert results.partial is True
     assert results.errors == ["transit:TimeoutError"]
+
+
+def test_route_service_keeps_geometry_for_map_preview(monkeypatch):
+    monkeypatch.setattr(
+        route_service,
+        "_build_segments",
+        lambda query: [
+            (
+                {"name": "西湖", "formatted_address": "西湖", "location": "120,30"},
+                {"name": "灵隐寺", "formatted_address": "灵隐寺", "location": "120.1,30.1"},
+            )
+        ],
+    )
+
+    def fake_plan_route(origin, destination, *, strategy):
+        if strategy == "driving":
+            return {
+                "origin": origin,
+                "destination": destination,
+                "duration": "20 分钟",
+                "distance": "2 公里",
+                "summary": "驾车",
+                "origin_location": "120,30",
+                "destination_location": "120.1,30.1",
+                "polyline": [[120.0, 30.0], [120.1, 30.1]],
+            }
+        return None
+
+    monkeypatch.setattr(route_service, "plan_route", fake_plan_route)
+
+    results = route_service.get_route_plans(_query())
+
+    assert len(results) == 1
+    assert results[0].origin_location == "120,30"
+    assert results[0].destination_location == "120.1,30.1"
+    assert results[0].polyline == [[120.0, 30.0], [120.1, 30.1]]

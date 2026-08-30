@@ -141,6 +141,13 @@ export function exportTravelPlan(
   );
 }
 
+export function getTravelPlanMap(threadId: string, version?: number | null) {
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return apiDownload(
+    `/travel/plans/${encodeURIComponent(threadId)}/map${query}`,
+  );
+}
+
 export interface PlanShareInfo {
   share_id: string;
   plan_id: string;

@@ -16,7 +16,7 @@
 - 源码：`frontend/`；构建产物：`vite build` 输出到 `static/`（`base=/static/`，`outDir=../static`，`emptyOutDir=false`）。
 - FastAPI 无需改动：`/` 每次读取 `static/index.html`，`/static` 挂载资产。
 - 品牌图片放在 `frontend/public/`（favicon 用）和 `frontend/src/assets/`（组件内 import，构建期指纹化）。
-- 开发模式：`npm run dev`（端口 5173，base `/static/`，API 前缀代理到 `127.0.0.1:8000`）。
+- 开发模式：`npm run dev`（端口 5173，base `/static/`，API 前缀代理到默认 `127.0.0.1:8001`）。
 - 常用命令：`npm run typecheck`（vue-tsc）、`npm run build`。
 
 ### 目录结构
@@ -33,18 +33,22 @@ frontend/
     stores/session.ts       # 线程/会话、guest id 生成与切换、删除
     stores/chat.ts          # 消息、SSE 流式、附件校验（类型/10MB）、搜索开关
     stores/plan.ts          # TravelPlan、日历、选中日期、PATCH/replan、来源栏、版本预览
-    components/             # AppSidebar、ChatView、MessageItem、SegmentText、ChatComposer、
-                            # PlanPanel、ItineraryTab、PlanCalendar、PlanItemCard、TransportCard、
-                            # ReplanForm、SourcesTab、StatusTab、AuthModal、ConfirmDialog
+    components/             # HomeView、AppSidebar、ChatView、MessageItem、ChatComposer、
+                            # PlanDock、PlanPanel、ItineraryTab、PlanCalendar、RouteMap、
+                            # PlanItemCard、TransportCard、ReplanForm、SourcesTab、StatusTab、
+                            # AuthModal、ConfirmDialog
     styles/main.css         # 旅行主题全局样式（无 UI 框架，全部手写）
+    styles/interaction-pass.css # 澄清卡片、转场与交互细节
     utils/guest.ts          # guest_<32hex> 线程 id 生成/持久化
+    utils/amap.ts           # 高德 JS API 2.0 加载与交互地图适配
     utils/markdown.ts       # marked + DOMPurify + safeExternalUrl
+    assets/destinations/    # 首页景点背景图
 ```
 
 ## 3. 已确认的前端决策
 
 - 布局：左侧会话栏 + 中间聊天 + 右侧可折叠计划面板（≤1100px 时面板变抽屉，≤860px 时侧栏变抽屉）。
-- 句子级引用：只渲染 `answer_segments`；句末链条图标只关联 `source_type="web_search"` 且 URL 为 http/https 的来源；点击后右侧面板"来源"标签页高亮对应卡。`answer_segments` 为空时回退渲染 `content`，两者绝不同时渲染。
+- 句子级引用：只有 `answer_segments` 中存在有效网页引用时才使用句子引用组件；句末链条图标只关联 `source_type="web_search"` 且 URL 为 http/https 的来源，点击后右侧面板“来源”标签页高亮对应卡。没有有效引用时渲染完整 Markdown `content`，保证标题和列表正常显示；两条路径绝不同时渲染。
 - 计划项 PATCH 始终携带 `expected_version`；409 时刷新计划并用横幅提示用户基于最新版本重试，不静默覆盖。confirmed/booked 强制 `locked=true`；单独 `locked=false` 回退 suggested。
 - 计划来源优先级：`done.trip_plan` > `GET /travel/plans/{id}` > 日历/日期接口；PATCH/replan 成功后立即用响应里的完整 plan 更新本地版本号。
 - 日历是抽屉：有计划自动展开并高亮行程日期；无计划默认收起，可点开自由翻看任意月份（带"今天"标记）；用户手动展开/收起后记住选择。
@@ -81,7 +85,8 @@ frontend/
 
 - 沙箱安全删除钩子会拦截 `rm`/`Remove-Item` 及 Vite `emptyOutDir` 的目录清空；清理 `static/` 旧文件需用 PowerShell 逐个 `-LiteralPath` 删除，且构建配置保持 `emptyOutDir: false`。
 - 托管 Python（Windows）缺时区数据，运行后端前必须 `pip install tzdata`。
-- 后端启动：`C:/Users/Website/.workbuddy/binaries/python/envs/default/Scripts/python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000`（项目根目录下）。
+- 后端启动：项目根目录执行 `python app.py`，默认监听 `127.0.0.1:8001`；如修改 `AI_AGENT_PORT`，需同步更新 `frontend/vite.config.ts` 的代理目标。
+- 前端开发：另开终端执行 `cd frontend`、`npm install`（首次）和 `npm run dev`，访问 `http://127.0.0.1:5173`。
 - `D:\develop\python\pythonProject\.venv` 已损坏（指向不存在的解释器），不要使用。
 
 ## 8. 变更日志
@@ -97,3 +102,40 @@ frontend/
 - 第六轮：完成前端对抗式审查修复——SSE assistant 消息改为通过响应式数组更新，修复流式文本/引用不刷新的问题；补充线程代际校验、AbortController 和历史请求竞态保护，避免切换会话/登录注销时计划串线；历史版本预览同步日历；无 `done` 的断流明确标记失败；严格限制来源和图片 URL；修复初始化重复请求、损坏 guest 标题导致启动失败、状态页 `needs_attention` 误报、移动端侧栏遮罩、时区日期计算与删除错误提示。
 - 第六轮验证：`npm run typecheck` 与 `npm run build` 通过；Playwright 独立 HTTP SSE 冒烟通过 `citation_flow`、来源侧栏和安全外链属性检查；构建产物仅保留当前 `index.html` 引用的 JS/CSS/图片，历史 hash 包已清理。
 - 第七轮：取消首次进入自动登录弹窗；保留主动账户菜单登录/注册入口；接入游客 7 天生命周期和登录合并后的 guest 线程继续聊天契约，日历/日期接口按版本懒加载、计划导出与只读分享保持可用。
+
+### 2026-08-28
+
+- 第八轮：收敛探索页交互——首屏搜索改为安静的单一输入面，快捷建议降为文字入口；提交时从搜索框真实位置展开共享过渡层，再进入工作台，避免页面瞬间替换的突兀感。
+- 第八轮：用户消息气泡统一四边内边距并移除造成底部留白的段落 margin；顶部栏补齐中文产品名与图标，滚动时收缩为液态玻璃胶囊，移动端同步检查无横向溢出；首页首个景点确认为北海公园。
+- 第八轮验证：`npm run typecheck`、`npm run build` 通过；Playwright Chromium 检查桌面/390px 移动端首页、滚动收缩恢复、回车提交转场、工作台气泡和控制台错误，均通过。
+- 第九轮：修复搜索转场背景闪变——将目的地背景与遮罩提升为 `main-column` 内唯一的常驻层，探索页与工作台共用同一背景上下文；转场层改为透明裁剪展开，不再绘制不透明整屏色块；切换期间锁定滚动位置，避免探索页末尾卡片闪出。
+- 第九轮验证：Playwright Chromium 多时间点检查确认转场前后背景图片一致、过渡层背景透明、探索页末尾卡片未闪出、转场结束后层正确卸载；桌面与移动端无浏览器错误；`npm run typecheck` 与 `npm run build` 通过。
+
+### 2026-08-29
+
+- 第十轮：修复景点卡片悬停导致背景切换过快的问题。鼠标悬停加入 220ms 意图确认，离开或快速移动会取消待切换；键盘聚焦仍立即切换；背景交叉淡入调整为 760ms。
+- 第十轮验证：悬停回归确认 80ms 短停和快速扫过均不换图，持续停留后才换图；真实浏览器策划杭州 3 天游成功生成结构化计划（2026-09-02 至 2026-09-04，日历 3 天，行程项 4 条，地点/天气状态成功），行程面板与状态页可读取；`pytest -q` 为 102 passed、1 warning，`npm run typecheck` 与 `npm run build` 通过。
+
+### 2026-08-29 路线预览
+
+- 背景切换改为 280ms 悬停意图确认 + 920ms 交叉淡入淡出，快速扫过景点卡片不会连续换图；键盘聚焦仍可立即切换。
+- 高德路径规划现在保留已验证地点之间的 `origin_location`、`destination_location` 和 `polyline`，写入 `TravelPlan.route_plans`；新增 `GET /travel/plans/{thread_id}/map`，服务端优先调用高德静态地图，不向浏览器暴露 Key。
+- 当前 Web Service key 若没有静态地图权限，地图接口返回基于真实高德折线的 SVG 示意图；前端行程面板展示路线图、起终点和距离摘要，不再因静态地图权限不足出现空白或 502。
+- 修复常见“杭州三日游”未进入结构化旅行规划的问题，并改进“包含西湖、灵隐寺和河坊街”地点列表解析，确保路线查询使用城市范围内的地点坐标。
+- 验证：真实浏览器路线流程生成杭州 3 天游并保存 2 段路线（折线点数 505/537），路线图面板显示；悬停淡入淡出回归、桌面/移动端浏览器审计、`pytest -q`（109 passed、1 warning）、`compileall`、`npm run typecheck`、`npm run build` 均通过。
+
+### 2026-08-29 清理
+
+- 清理了 `static/assets/` 中不再被当前 `static/index.html` 引用的旧 Vite hash 构建产物和历史景点图片；重新构建后仅保留当前入口所需的 JS、CSS、品牌图和 7 张首页景点图。
+- 清理了未被源码引用的旧 `MiniCalendarHeat.vue`、目的地 SVG、重复头像/根目录图片及空的旧 `mcp_server` 缓存目录；保留当前旅行 Agent、航班桥、测试、历史兼容逻辑和图片来源说明。
+- 清理后验证：入口资源引用缺失数为 0；`pytest -q` 为 102 passed、1 warning；`npm run typecheck`、`npm run build` 和 FastAPI 生产入口浏览器冒烟均通过。
+
+### 2026-08-30
+
+- 第十一轮：前端与旅行范围边界同步——规则未识别的消息展示为旅行范围分类结果；非旅行问题只显示范围说明，不进入通用问答。
+- 第十一轮：接入结构化澄清展示。`done.clarification` 会渲染路线选项和自定义城市输入，用户补充后复用原始 `pending_query` 继续规划；澄清轮次不被标记为失败。
+- 第十一轮：普通城市请求没有显式景点时，使用已通过地图验证的景点推荐作为路线锚点；收到 `done.trip_plan` 后自动打开行程面板，路线地图不再藏在收起的面板中。
+- 第十一轮：旅行正文、澄清和范围拒答均按小段拆分为 SSE `text.delta`，先刷新执行步骤，再逐段更新聊天正文；前端继续以 `done` 作为最终一致性信号。
+- 第十一轮：统一记录首屏搜索、工作台转场、悬停背景淡入淡出、液态玻璃顶部栏、用户气泡和高德交互地图的当前行为，便于后续回归测试。
+- 当前开发端口约定为：Vite `5173`，FastAPI `8001`；高德 JS API 使用 `VITE_AMAP_JS_KEY` 与 `VITE_AMAP_SECURITY_JS_CODE`，未配置时回退服务端静态路线图。
+- 本轮验证：`python -m pytest -q` 为 **125 passed**、1 个既有 Starlette 依赖弃用警告；`python -m compileall -q agents services adapters bridges app.py tests`、`npm run typecheck`、`npm run build` 和 `git diff --check` 均通过；真实浏览器流程确认 72 个文本 SSE 事件、3 条路线图例、行程面板打开且无控制台错误。

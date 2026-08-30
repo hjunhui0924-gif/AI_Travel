@@ -46,10 +46,10 @@ export const useSessionStore = defineStore("session", {
     isGuest: (state) => isGuestThread(state.threadId),
     currentTitle(): string {
       if (this.isGuest) {
-        return this.guestTitles[this.threadId] || "新对话";
+        return this.guestTitles[this.threadId] || "当前会话";
       }
       return (
-        this.sessions.find((s) => s.thread_id === this.threadId)?.title ?? "新对话"
+        this.sessions.find((s) => s.thread_id === this.threadId)?.title ?? "未命名会话"
       );
     },
   },

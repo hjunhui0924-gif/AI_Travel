@@ -51,7 +51,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 ## 5. 当前代码基线与已知问题
 
 - app.py 提供 FastAPI /chat 和 SSE 流。
-- agents/agent.py 负责通用 Agent、旅行路由、搜索、checkpoint 和活动/来源缓冲。
+- agents/agent.py 负责旅行范围分类、旅行路由、搜索、checkpoint 和活动/来源缓冲；未识别为旅行的问题走范围拒答，不进入通用问答。
 - agents/travel_agent.py 负责旅行意图、交通、路线、POI、天气和时间轴编排。
 - agents/schemas.py 已有 TravelQuery、TravelPlanResponse、TransportOption、TimelineItem、PoiRecommendation 等雏形。
 - adapters/amap_adapter.py 已经能取得 POI、评分、人均、地址和距离等字段。
@@ -348,3 +348,36 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 保留：VariFlight、Flight MCP 的授权 command/package/http 兼容路径和演示 dummy 隔离逻辑。
 - 文档已同步：README、`.env.example` 和本进程文档不再把携程列为可用能力；历史联调记录保留为“曾确认不可用”的审计证据。
 - 删除后验证已完成：`python -m pytest -q` → **101 passed**，仅有 1 个既有 FastAPI/Starlette 弃用警告；`python -m compileall -q agents services adapters bridges app.py tests` 和 `python -c "import app"` 通过；`frontend/npm run typecheck` 与 `frontend/npm run build` 均通过；非文档源码无 Ctrip/WhaleGuard/携程引用；`.env` 与 `.env.example` 无 Ctrip 配置键；`git diff --check` 通过。
+
+## 19. 高德路线几何与前端路线预览（2026-08-29）
+
+- 高德路径规划适配器从 walking/driving/transit 结果的 steps/segments 中归一化折线点，并限制点数后写入 `RoutePlan.polyline`；路线两端保留城市范围内解析得到的坐标，避免同名地点跨城误匹配。
+- `TravelPlan.route_plans` 持久化路线段；新增 `/travel/plans/{thread_id}/map` 服务端地图接口。优先请求高德 Static Map，静态地图权限不可用时返回真实路线几何生成的 SVG 示意图；Web Service Key 始终只在后端使用，可通过 `AMAP_STATIC_MAP_KEY` 配置单独静态地图 Key。
+- 修复自然语言“杭州三日游”未触发结构化旅行规划的路由判断，并扩展显式地点列表解析；地点/路线/计划仍遵守后端唯一事实来源边界。
+- 验证：高德真实地点/路径查询返回杭州西湖→灵隐寺、灵隐寺→河坊街两段路线，折线点数 505/537；路线地图浏览器流程成功；全量 `pytest -q` 为 **109 passed**、1 个既有依赖弃用警告；`compileall`、前端 typecheck/build 均通过。
+
+## 20. 旅行需求澄清与模型兜底（2026-08-30）
+
+- 省级目的地增加 `destination_scope` 和 `destination_cities`，当前支持江苏的南京 + 扬州、苏州 + 无锡、南京 + 苏州路线建议。
+- 关键目的地信息缺失时返回结构化 `clarification`，不创建“目的地待定”的 TravelPlan，也不调用交通、路线、POI 或天气适配器。
+- 澄清请求及待补充需求写入旅行回合 metadata；用户下一轮选择路线或输入自定义城市后，服务端合并原始需求再生成正式计划。
+- 规则未命中的高置信旅行表达会进入一次受约束的大模型结构化抽取；模型只补充意图和候选字段，仍须通过确定性完整性检查，不能直接调用工具。
+- 前端支持路线选项按钮和自定义城市输入，SSE/history 均保留结构化澄清字段。
+- 验证：省级澄清与多轮合并 API 测试、实际模型兜底和浏览器流程均通过；全量测试结果以本轮最终验证为准。
+
+## 21. 旅行专用范围边界（2026-08-30）
+
+- 产品不再把未识别消息交给通用问答 Agent；规则未命中后统一进入一次旅行范围分类。
+- 大模型分类器返回 `is_travel_request` 和受限的旅行字段。非旅行问题返回稳定的范围说明；模型失败或输出无效时也采用安全拒答，不泄漏内部异常。
+- `BASE_SYSTEM_PROMPT` 已改为旅行专用系统提示，保留旧常量名仅为兼容；SSE `done.scope_refusal` 和历史 metadata 标记范围拒答。
+
+## 22. 当前发布基线与文档同步（2026-08-30）
+
+- 用户输入链路已收敛为：`HomeView / ChatComposer` → `POST /chat` → FastAPI 鉴权与附件解析 → `stream_chat` → 规则识别 / 大模型范围分类 → 旅行规划或范围拒答 → SSE → Pinia 与行程页面。
+- 省级或条件不完整的旅行需求返回 `ClarificationRequest`，保存 `pending_query`，用户选择路线或补充城市后再生成正式 `TravelPlan`；不创建“目的地待定”空计划。
+- 普通城市请求未指定景点时，先从已通过地图验证的景点推荐中选取 2～4 个路线锚点再调用路线适配器；不会从未经验证的文本地点生成路线。计划生成后自动打开行程面板，使路线地图立即可见。
+- 旅行正文、澄清和范围拒答均拆分为多个 SSE 文本事件，并在旅行规划耗时阶段先刷新执行步骤；前端仍以 `done` 作为最终一致性信号。
+- 首屏搜索提交使用共享背景和展开式转场；景点悬停使用意图确认与淡入淡出；顶部栏支持滚动收缩；路线面板支持高德 JS 地图的缩放、拖拽、自动适配和起终点标记，并保留静态路线图降级方案。
+- 当前本地开发端口约定为 Vite `5173`、FastAPI `8001`；高德浏览器端配置使用 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SECURITY_JS_CODE`，服务端配置使用 Web Service Key。
+- README、前端进程记录、前后端交接契约和领域上下文已同步以上行为与边界；未新增独立流程文档，流程说明集中在 README 和交接文档中。
+- 本轮验证：`python -m pytest -q` 为 **125 passed**、1 个既有 Starlette 依赖弃用警告；`python -m compileall -q agents services adapters bridges app.py tests`、`npm run typecheck`、`npm run build` 和 `git diff --check` 均通过；真实浏览器流程确认 72 个文本 SSE 事件、3 条路线图例、行程面板打开且无控制台错误。

@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from langchain.messages import AIMessage, AIMessageChunk
 from pydantic import BaseModel
 
+from adapters.amap_adapter import fetch_static_route_map, render_route_map_svg
 from agents.agent import (
     attach_assistant_metadata,
     consume_activity_log,
@@ -647,6 +648,74 @@ def export_travel_plan(
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
 
 
+@app.get("/travel/plans/{thread_id}/map")
+def get_travel_plan_map(
+    thread_id: str,
+    request: Request,
+    version: int | None = Query(None, ge=1),
+):
+    """Return a server-rendered route image for stored route geometry.
+
+    The Web Service key stays on the server. AMap Static Map is preferred; a
+    verified SVG route schematic is returned when that optional permission is
+    unavailable, so the UI never loses the route preview.
+    """
+
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, version, user_id=user_id)
+            if version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "该会话还没有旅行计划。"}, status_code=404)
+
+        routes = [
+            asdict(route)
+            for route in plan.route_plans
+            if len(route.polyline) >= 2
+        ]
+        if not routes:
+            return JSONResponse(
+                {"status": "error", "message": "当前计划没有可展示的路线几何。"},
+                status_code=404,
+            )
+
+        try:
+            rendered = fetch_static_route_map(routes)
+        except Exception:
+            logger.warning("AMap Static Map unavailable; using route SVG fallback")
+            rendered = None
+        if rendered is None:
+            fallback = render_route_map_svg(routes)
+            if not fallback:
+                return JSONResponse(
+                    {"status": "error", "message": "当前计划没有可展示的路线几何。"},
+                    status_code=404,
+                )
+            return Response(
+                content=fallback,
+                media_type="image/svg+xml",
+                headers={"Cache-Control": "no-store", "X-Route-Map-Fallback": "true"},
+            )
+        content, media_type = rendered
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store"},
+        )
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception:
+        logger.exception("route map rendering failed")
+        return JSONResponse(
+            {"status": "error", "message": "路线地图暂时不可用，请稍后重试。"},
+            status_code=502,
+        )
+
+
 @app.post("/travel/plans/{thread_id}/shares")
 def create_travel_plan_share(
     thread_id: str,
@@ -1072,6 +1141,8 @@ async def chat(
             assistant_activities = []
             assistant_sources = []
             assistant_answer_segments = []
+            assistant_clarification = None
+            assistant_scope_refusal = False
             travel_plan = None
             is_travel_response = False
 
@@ -1098,6 +1169,10 @@ async def chat(
                 if isinstance(metadata, dict) and isinstance(metadata.get("answer_segments"), list):
                     if metadata["answer_segments"]:
                         assistant_answer_segments = metadata["answer_segments"]
+                if isinstance(metadata, dict) and isinstance(metadata.get("clarification"), dict):
+                    assistant_clarification = metadata["clarification"]
+                if isinstance(metadata, dict) and metadata.get("scope_refusal") is True:
+                    assistant_scope_refusal = True
                 for activity in consume_activity_log():
                     assistant_activities.append(activity)
                     yield _sse_event("activity", activity)
@@ -1189,6 +1264,8 @@ async def chat(
                 assistant_sources,
                 answer_segments,
                 search_enabled=search_enabled,
+                clarification=assistant_clarification,
+                scope_refusal=assistant_scope_refusal,
             )
 
             if not is_travel_response:
@@ -1264,6 +1341,8 @@ async def chat(
                     # must never leak into the frontend's rendered text.
                     "final_text": final_text,
                     "answer_segments": answer_segments,
+                    "clarification": assistant_clarification,
+                    "scope_refusal": assistant_scope_refusal,
                     "trip_plan": travel_plan,
                     "attachments": [
                         {
@@ -1289,4 +1368,8 @@ async def chat(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    try:
+        server_port = int(os.getenv("AI_AGENT_PORT", "8001"))
+    except ValueError:
+        server_port = 8001
+    uvicorn.run(app, host="127.0.0.1", port=server_port)

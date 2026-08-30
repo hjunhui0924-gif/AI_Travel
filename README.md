@@ -22,6 +22,10 @@
 - 天气辅助：支持高德天气查询，为出行建议补充天气上下文
 - 文件问答：支持上传 PDF、Word、Excel、Markdown、文本、图片等作为补充上下文
 - 搜索补充：前端可手动开启联网搜索，用于时效性信息补充
+- 旅行需求澄清：目的地范围或关键条件不完整时，先返回结构化问题和有限选项，用户补充后继续规划
+- 旅行范围识别：规则优先；规则未命中时由大模型做受约束的旅行范围分类和字段抽取，非旅行问题礼貌拒答
+- 交互式路线地图：配置高德 Web 端 JS API 后支持缩放、拖拽、路线自适应和起终点标记
+- 流式回答：旅行规划、澄清和范围拒答均通过 SSE 分段回传，前端按增量文本渲染
 - 可视化回答：对出行类问题优先渲染更结构化的结果面板，而不是纯文本长回复
 - 多会话管理：支持新建、切换、删除历史会话
 - 登录与会话隔离：不同账号只能看到自己的聊天记录
@@ -53,7 +57,11 @@
 
 - 左侧会话列表 + 右侧聊天工作台
 - 左下角账户模块，点击后弹出登录 / 注册 / 退出菜单
-- 旅行类问题优先展示路线、时间轴、天气、周边推荐等结构化卡片
+- 旅行类问题优先展示路线、时间轴、天气、周边推荐等结构化卡片；无关问题会礼貌拒答
+- 目的地范围或关键条件不足时先进行结构化澄清，不生成“目的地待定”的空计划
+- 首屏搜索框保持单一输入面，提交时从搜索框位置自然展开到工作台，避免整页闪变
+- 景点卡片悬停带意图确认和交叉淡入淡出；顶部栏下滑收缩为液态玻璃样式，回到顶部恢复
+- 首页首个风景目的地为北海公园；路线面板优先展示高德交互地图，未配置浏览器 Key 时降级为静态路线图
 - 切换历史会话时自动定位到底部
 - 支持滚动查看历史、回到底部按钮、搜索结果侧抽屉
 
@@ -65,6 +73,7 @@
 - Vector retrieval: `ChromaDB`
 - Web search: `Tavily`（可选）
 - Map / Weather: `AMap Web API`（可选）
+- 旅行识别：规则优先，未命中的消息由大模型做旅行范围分类和结构化抽取兜底，不提供通用问答
 - Flight bridge: 本地 bridge / MCP / HTTP 适配（可选）
 - File parsing: `pypdf`, `python-docx`, `openpyxl`, `xlrd`
 
@@ -97,6 +106,9 @@ AI_Agent/
 │   ├── trip_planner.py
 │   └── weather_service.py
 ├── frontend/                 # Vue3 + TypeScript 源码
+│   ├── src/components/       # 首页、聊天、计划面板、路线地图
+│   ├── src/stores/            # auth、session、chat、plan
+│   └── src/utils/amap.ts      # 高德 JS API 加载与地图适配
 ├── static/                   # Vite 构建产物，由 FastAPI 提供
 ├── resources/
 ├── uploads/
@@ -117,19 +129,75 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+PowerShell 可使用：
+
+```powershell
+Copy-Item .env.example .env
+```
+
 至少准备一组可用的大模型配置，然后按需补充旅行相关能力配置。
 
-### 3. 启动项目
+### 3. 启动项目（开发模式）
+
+分别打开两个终端。
+
+终端一，启动 FastAPI：
 
 ```bash
 python app.py
 ```
 
+终端二，启动 Vue：
+
+```bash
+cd frontend
+npm install       # 首次运行执行一次
+npm run dev
+```
+
 浏览器访问：
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:5173
 ```
+
+旅行 Agent 后端默认运行在 `http://127.0.0.1:8001`。如需修改端口，可通过 `AI_AGENT_PORT` 设置，并同步更新 `frontend/vite.config.ts` 中的代理目标。
+
+如果只验证 FastAPI 提供的构建产物，先在 `frontend/` 执行 `npm run build`，再运行 `python app.py` 并访问 `http://127.0.0.1:8001`。
+
+## 用户输入与响应流程
+
+```text
+用户输入（例如“江苏五日游”）
+        ↓
+HomeView / ChatComposer 组装 FormData
+        ↓
+POST /chat → FastAPI 鉴权、附件解析、输入校验
+        ↓
+stream_chat 读取 current_plan / pending_query
+        ↓
+规则意图识别
+   ┌──────┴────────┐
+命中旅行          未命中规则
+   │                    ↓
+   │              大模型范围分类
+   │             ┌──────┴──────┐
+   │          是旅行问题     非旅行问题
+   │             │              ↓
+   └──────┬──────┘          SSE 范围拒答
+          ↓
+旅行规划 Agent 合并上下文并校验条件
+   ┌──────┴────────┐
+条件不足            条件齐全
+   ↓                    ↓
+ClarificationRequest   高德 / 天气 / 交通 / 搜索适配器
+   ↓                    ↓
+SSE → Pinia → 澄清卡片   规划模型生成 TravelPlan
+   ↓                    ↓
+用户补充后再次提交      SSE → Pinia → 行程面板、日历、RouteMap
+```
+
+信息不足时不会创建“目的地待定”的空计划，也不会提前调用路线、POI、天气或交通适配器。未指定景点时，系统会从已经通过地图验证的城市景点推荐中选择路线锚点，不会从未经验证的文本地点生成路线。计划生成后自动展开行程面板；`RouteMap` 优先使用高德 JS API 进行缩放、拖拽和自动适配。
 
 ## 环境变量说明
 
@@ -165,6 +233,11 @@ http://127.0.0.1:8000
 ### 地图 / 天气
 
 - `AMAP_WEB_API_KEY`
+- `AMAP_STATIC_MAP_KEY`（可选；静态地图权限与 Web Service Key 分开时使用）
+- `VITE_AMAP_JS_KEY`（可选；浏览器端高德 JS API 2.0）
+- `VITE_AMAP_SECURITY_JS_CODE`（可选；高德 JS API 安全密钥）
+
+`VITE_*` 变量会进入浏览器构建产物，只能使用已在高德控制台配置域名白名单的 Web 端 Key；不要把 Web Service Key 或其他服务端密钥写入 `VITE_*` 变量。
 
 ### 航班 Bridge
 
@@ -244,6 +317,8 @@ python -m services.integration_health --live --only flight_mcp
 ```
 
 高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。航班查询应配置授权的 VariFlight、Flight MCP 或官方/合作方航班 API。
+
+旅行计划中的路线预览使用高德路径规划返回的折线数据。后端默认通过高德静态地图服务渲染图片，Web Service key 不会下发到浏览器；静态地图请求异常时会返回基于真实路线折线生成的 SVG 示意图。要在浏览器中启用可缩放、可拖拽的高德 JS 地图，请申请 Web 端（JS API）Key 和安全密钥，并在项目根目录 `.env` 配置 `VITE_AMAP_JS_KEY`、`VITE_AMAP_SECURITY_JS_CODE`，然后重新构建前端。浏览器 Key 必须在高德控制台配置域名白名单；没有这两个变量时仍使用静态地图。
 
 ## 文件支持
 

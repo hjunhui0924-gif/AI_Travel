@@ -63,6 +63,19 @@ export interface AnswerSegment {
   source_ids: string[];
 }
 
+export interface ClarificationOption {
+  key: string;
+  label: string;
+  description?: string;
+  value?: string;
+}
+
+export interface ClarificationRequest {
+  code: string;
+  prompt: string;
+  options: ClarificationOption[];
+}
+
 export interface HistoryMessage {
   role: "user" | "assistant";
   content: string;
@@ -71,6 +84,8 @@ export interface HistoryMessage {
   activities?: ActivityEvent[];
   sources?: SourceInfo[];
   answer_segments?: AnswerSegment[];
+  clarification?: ClarificationRequest | null;
+  scope_refusal?: boolean;
   search_enabled?: boolean;
   plan_id?: string | null;
   plan_version?: number | null;
@@ -91,6 +106,20 @@ export interface TransportOption {
   arrive_date: string;
   seat_count: number | null;
   source_ids: string[];
+}
+
+export interface RoutePlan {
+  mode: string;
+  origin: string;
+  destination: string;
+  duration: string;
+  distance: string;
+  summary: string;
+  origin_address: string;
+  destination_address: string;
+  origin_location: string;
+  destination_location: string;
+  polyline: [number, number][];
 }
 
 export interface PlanItem {
@@ -171,6 +200,8 @@ export interface TravelPlan {
   projection_end_date: string;
   origin: string;
   destination: string;
+  destination_scope?: string;
+  destination_cities?: string[];
   travelers: number;
   preferences: string[];
   summary: string;
@@ -190,6 +221,7 @@ export interface TravelPlan {
   previous_version: number | null;
   out_of_range_items: PlanItem[];
   transport_options: TransportOption[];
+  route_plans?: RoutePlan[];
 }
 
 export interface PlanVersionSummary {
@@ -232,6 +264,8 @@ export interface DonePayload {
   ok: boolean;
   final_text: string;
   answer_segments: AnswerSegment[];
+  clarification?: ClarificationRequest | null;
+  scope_refusal?: boolean;
   activities: ActivityEvent[];
   sources: SourceInfo[];
   trip_plan: TravelPlan | null;

@@ -1,6 +1,14 @@
 from agents import travel_agent
 from adapters.variflight_adapter import VariFlightError
-from agents.schemas import Evidence, PlanDay, PlanItem, PoiRecommendation, TransportOption, TravelPlan
+from agents.schemas import (
+    Evidence,
+    PlanDay,
+    PlanItem,
+    PoiRecommendation,
+    RoutePlan,
+    TransportOption,
+    TravelPlan,
+)
 from services import poi_recommender
 from services.rail_service import RailOptionsResult
 
@@ -32,6 +40,76 @@ def test_calendar_date_is_not_mistaken_for_trip_duration():
     assert query.start_date.endswith("-09-02")
     assert query.days == 1
     assert query.duration_is_assumed is True
+
+
+def test_explicit_place_list_is_split_into_route_anchors():
+    query = travel_agent.build_travel_query(
+        "2026年9月2日到9月4日去杭州，包含西湖、灵隐寺和河坊街，慢节奏。",
+        [],
+    )
+
+    assert query.named_places[:3] == ["西湖", "灵隐寺", "河坊街"]
+
+
+def test_province_trip_asks_for_city_route_before_calling_external_adapters(monkeypatch):
+    calls: list[str] = []
+
+    monkeypatch.setattr(travel_agent, "recommend_pois", lambda *args, **kwargs: calls.append("poi"))
+    monkeypatch.setattr(travel_agent, "get_route_plans", lambda *args, **kwargs: calls.append("route"))
+    monkeypatch.setattr(travel_agent, "get_rail_options", lambda *args, **kwargs: calls.append("rail"))
+    monkeypatch.setattr(travel_agent, "get_flight_options", lambda *args, **kwargs: calls.append("flight"))
+    monkeypatch.setattr(travel_agent, "get_weather_summary", lambda *args, **kwargs: calls.append("weather"))
+
+    response = travel_agent.plan_travel("江苏五日游", [], search_enabled=False)
+
+    assert response.trip_plan is None
+    assert response.clarification is not None
+    assert response.clarification.code == "destination_cities"
+    assert response.clarification.options
+    assert "江苏" in response.clarification.prompt
+    assert calls == []
+
+
+def test_province_route_choice_becomes_city_anchors():
+    query = travel_agent.build_travel_query("江苏五日游，选择 A：南京 + 扬州", [])
+
+    assert query.destination == "江苏"
+    assert query.destination_scope == "province"
+    assert query.destination_cities == ["南京", "扬州"]
+    assert query.named_places[:2] == ["南京", "扬州"]
+
+
+def test_clarification_response_renders_choices_without_a_placeholder_plan():
+    response = travel_agent.plan_travel("江苏五日游", [], search_enabled=False)
+
+    rendered = travel_agent.render_travel_response(response)
+
+    assert response.trip_plan is None
+    assert "江苏范围比较大" in rendered
+    assert response.clarification is not None
+    assert response.clarification.options[0].label == "南京 + 扬州"
+    assert response.clarification.options[1].label == "苏州 + 无锡"
+    assert "出发地待定" not in rendered
+
+
+def test_clarified_province_route_generates_a_plan_after_city_choice(monkeypatch):
+    monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
+    monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_route_plans", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_weather_summary", lambda location, forecast=False: "")
+
+    response = travel_agent.plan_travel(
+        "江苏五日游\n用户补充：选择 A，从上海出发",
+        [],
+        search_enabled=False,
+    )
+
+    assert response.clarification is None
+    assert response.trip_plan is not None
+    assert response.trip_plan.destination == "江苏"
+    assert response.trip_plan.destination_cities == ["南京", "扬州"]
+    assert response.trip_plan.origin == "上海"
 
 
 def test_explicit_date_range_is_capped_with_structured_risk():
@@ -71,6 +149,46 @@ def test_plan_builds_calendar_dates_and_uses_search_switch(monkeypatch):
     assert len(response.trip_plan.days) == 3
     assert any("步行" in item.label for item in response.trip_plan.constraints)
     assert response.trip_plan.days[0].items[0].title == "西湖边餐厅"
+
+
+def test_generic_city_trip_builds_route_from_verified_poi_recommendations(monkeypatch):
+    attractions = [
+        PoiRecommendation(name="广州塔", category="景点", address="阅江西路", summary="高德景点"),
+        PoiRecommendation(name="北京路", category="景点", address="北京路", summary="高德景点"),
+    ]
+    route_calls: list[list[str]] = []
+
+    def fake_route(query):
+        route_calls.append(list(query.named_places))
+        if query.named_places != ["广州塔", "北京路"]:
+            return []
+        return [
+            RoutePlan(
+                mode="driving",
+                origin="广州塔",
+                destination="北京路",
+                origin_location="113.3302,23.1135",
+                destination_location="113.2708,23.1259",
+                polyline=[[113.3302, 23.1135], [113.2708, 23.1259]],
+            )
+        ]
+
+    monkeypatch.setattr(travel_agent, "get_route_plans", fake_route)
+    monkeypatch.setattr(
+        travel_agent,
+        "recommend_pois",
+        lambda query, **kwargs: (attractions, [], [], []),
+    )
+    monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_weather_summary", lambda location, forecast=False: "")
+
+    response = travel_agent.plan_travel("2026-09-01 去广州玩五天", [], search_enabled=False)
+
+    assert route_calls == [[], ["广州塔", "北京路"]]
+    assert response.trip_plan is not None
+    assert len(response.trip_plan.route_plans) == 1
+    assert response.trip_plan.route_plans[0].polyline
 
 
 def test_replan_preserves_locked_items_and_reports_date_conflict(monkeypatch):

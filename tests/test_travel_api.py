@@ -10,7 +10,7 @@ from starlette.requests import Request
 
 import app as app_module
 from agents import agent as agent_module
-from agents.schemas import PlanDay, PlanItem, TravelPlan, TravelPlanResponse
+from agents.schemas import PlanDay, PlanItem, RoutePlan, TravelPlan, TravelPlanResponse
 from services.travel_store import (
     delete_travel_thread,
     ensure_guest_access,
@@ -72,6 +72,86 @@ def test_guest_travel_plan_and_calendar_endpoints():
         delete_travel_thread(thread_id)
 
 
+def test_guest_route_map_endpoint_keeps_key_server_side(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+        route_plans=[
+            RoutePlan(
+                mode="walking",
+                origin="西湖",
+                destination="灵隐寺",
+                origin_location="120.121358,30.222692",
+                destination_location="120.101406,30.240826",
+                polyline=[[120.121358, 30.222692], [120.101406, 30.240826]],
+            )
+        ],
+    )
+    app_module.save_plan_version(plan)
+    monkeypatch.setattr(
+        app_module,
+        "fetch_static_route_map",
+        lambda routes: (b"fake-png", "image/png"),
+    )
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.get(f"/travel/plans/{thread_id}/map")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("image/png")
+        assert response.content == b"fake-png"
+        assert "AMAP_WEB_API_KEY" not in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_guest_route_map_endpoint_falls_back_to_svg(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+        route_plans=[
+            RoutePlan(
+                mode="driving",
+                origin="西湖",
+                destination="灵隐寺",
+                polyline=[[120.0, 30.0], [120.1, 30.1]],
+            )
+        ],
+    )
+    app_module.save_plan_version(plan)
+    monkeypatch.setattr(app_module, "fetch_static_route_map", lambda routes: None)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.get(f"/travel/plans/{thread_id}/map")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("image/svg+xml")
+        assert response.headers["x-route-map-fallback"] == "true"
+        assert "路线示意图" in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
 def test_chat_done_contains_structured_plan_and_version(monkeypatch):
     thread_id = f"guest_{uuid4().hex}"
     expected_versions = []
@@ -120,6 +200,109 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
         done_again = json.loads([line[6:] for line in second.text.splitlines() if line.startswith("data:")][-1])
         assert done_again["trip_plan"]["version"] == 2
         assert expected_versions == [0, 1]
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_chat_clarification_for_province_trip_is_structured_and_persisted():
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.post(
+            "/chat",
+            data={"message": "江苏五日游", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert response.status_code == 200
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data:")
+        ]
+        done = events[-1]
+        assert done["trip_plan"] is None
+        assert done["clarification"]["code"] == "destination_cities"
+        assert len(done["clarification"]["options"]) >= 3
+
+        history = client.get(f"/history/{thread_id}")
+        assert history.status_code == 200
+        assistant = history.json()["messages"][-1]
+        assert assistant["clarification"]["code"] == "destination_cities"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_chat_clarification_follow_up_merges_original_requirement(monkeypatch):
+    from agents import travel_agent
+
+    monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
+    monkeypatch.setattr(travel_agent, "get_route_plans", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
+    monkeypatch.setattr(travel_agent, "get_weather_summary", lambda location, forecast=False: "")
+
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    def done_payload(response):
+        return json.loads(
+            [line[6:] for line in response.text.splitlines() if line.startswith("data:")][-1]
+        )
+
+    try:
+        first = client.post(
+            "/chat",
+            data={"message": "江苏五日游", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert done_payload(first)["clarification"]["code"] == "destination_cities"
+
+        second = client.post(
+            "/chat",
+            data={
+                "message": "选择 A，从上海出发",
+                "thread_id": thread_id,
+                "search_enabled": "false",
+            },
+        )
+        done = done_payload(second)
+        assert done["clarification"] is None
+        assert done["trip_plan"]["destination"] == "江苏"
+        assert done["trip_plan"]["destination_cities"] == ["南京", "扬州"]
+        assert done["trip_plan"]["origin"] == "上海"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_chat_rejects_non_travel_question_after_scope_classification(monkeypatch):
+    class FakeModel:
+        def invoke(self, messages):
+            return AIMessage(content='{"is_travel_request": false}')
+
+    class UnexpectedGeneralAgent:
+        def stream(self, *args, **kwargs):
+            raise AssertionError("non-travel questions must not reach a general agent")
+
+    monkeypatch.setattr(agent_module, "model", FakeModel())
+    monkeypatch.setattr(agent_module, "agent_without_search", UnexpectedGeneralAgent())
+
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.post(
+            "/chat",
+            data={"message": "帮我写一封邮件", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert response.status_code == 200
+        assert "只支持旅行相关" in response.text
+        assert '"scope_refusal": true' in response.text
+        assert '"trip_plan": null' in response.text
     finally:
         delete_travel_thread(thread_id)
 
