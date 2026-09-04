@@ -51,7 +51,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 ## 5. 当前代码基线与已知问题
 
 - app.py 提供 FastAPI /chat 和 SSE 流。
-- agents/agent.py 负责旅行范围分类、旅行路由、搜索、checkpoint 和活动/来源缓冲；未识别为旅行的问题走范围拒答，不进入通用问答。
+- agents/agent.py 负责旅行范围分类、旅行路由、checkpoint 和活动/来源缓冲；旅行搜索由 `TravelSupervisor` 和 `services/travel_search.py` 负责；未识别为旅行的问题走范围拒答，不进入通用问答。
 - agents/travel_agent.py 负责旅行意图、交通、路线、POI、天气和时间轴编排。
 - agents/schemas.py 已有 TravelQuery、TravelPlanResponse、TransportOption、TimelineItem、PoiRecommendation 等雏形。
 - adapters/amap_adapter.py 已经能取得 POI、评分、人均、地址和距离等字段。
@@ -375,9 +375,51 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 - 用户输入链路已收敛为：`HomeView / ChatComposer` → `POST /chat` → FastAPI 鉴权与附件解析 → `stream_chat` → 规则识别 / 大模型范围分类 → 旅行规划或范围拒答 → SSE → Pinia 与行程页面。
 - 省级或条件不完整的旅行需求返回 `ClarificationRequest`，保存 `pending_query`，用户选择路线或补充城市后再生成正式 `TravelPlan`；不创建“目的地待定”空计划。
-- 普通城市请求未指定景点时，先从已通过地图验证的景点推荐中选取 2～4 个路线锚点再调用路线适配器；不会从未经验证的文本地点生成路线。计划生成后自动打开行程面板，使路线地图立即可见。
+- 普通城市请求未指定景点时，先从已通过地图验证的景点推荐中选取 2～4 个路线锚点再调用路线适配器；不会从未经验证的文本地点生成路线。计划生成后的自动打开面板属于历史行为，当前改为“行程计划”按钮红点通知。
 - 旅行正文、澄清和范围拒答均拆分为多个 SSE 文本事件，并在旅行规划耗时阶段先刷新执行步骤；前端仍以 `done` 作为最终一致性信号。
 - 首屏搜索提交使用共享背景和展开式转场；景点悬停使用意图确认与淡入淡出；顶部栏支持滚动收缩；路线面板支持高德 JS 地图的缩放、拖拽、自动适配和起终点标记，并保留静态路线图降级方案。
 - 当前本地开发端口约定为 Vite `5173`、FastAPI `8001`；高德浏览器端配置使用 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SECURITY_JS_CODE`，服务端配置使用 Web Service Key。
 - README、前端进程记录、前后端交接契约和领域上下文已同步以上行为与边界；未新增独立流程文档，流程说明集中在 README 和交接文档中。
 - 本轮验证：`python -m pytest -q` 为 **125 passed**、1 个既有 Starlette 依赖弃用警告；`python -m compileall -q agents services adapters bridges app.py tests`、`npm run typecheck`、`npm run build` 和 `git diff --check` 均通过；真实浏览器流程确认 72 个文本 SSE 事件、3 条路线图例、行程面板打开且无控制台错误。
+
+## 23. Supervisor 工具决策与交通分页（2026-09-02）
+
+- `TravelSupervisor` 负责在可执行的旅行需求上选择 provider 工具：铁路、航班、地点、路线、天气和联网搜索；大模型只决定工具和顺序，工具参数、权限、超时、来源绑定和最终计划校验仍由代码负责。
+- `plan_travel()` 接收 Supervisor 的结构化结果，避免同一轮重复调用已执行的 adapter；模型调用失败、遗漏必需交通工具或输出不完整时回退到确定性旅行规划。
+- `travel_mode` 现在真正写入 `TravelQuery`；`rail_query` 与 `flight_query` 严格分流，显式比较需求才同时查询。高铁/动车表达只保留 G、D、C 字头；12306 余票结果没有可靠票价时保持空值。
+- 新增 `TransportPage` 和 `/travel/plans/{thread_id}/transport`，支持首次 5 条、加载更多和自然语言追加交通候选；返回项带 provider、查询状态和来源，不由模型生成车次或航班。
+- 旅行聊天输出改为摘要，详细结果仍由结构化行程面板展示；聊天容器独立使用液态玻璃层，背景图片、地图和交通卡片保持清晰分层。
+- 本阶段验证：真实高铁、航班、POI/路线流程与分页流程通过；全量 `pytest -q` 为 **137 passed**、1 个既有 Starlette 依赖弃用警告；`compileall`、前端 `typecheck/build` 和 `git diff --check` 均通过。
+
+## 24. 模型动作门控与局部玻璃工作台（2026-09-03）
+
+- 意图路由调整为关键词/规则优先；只有未命中时才进入一次旅行范围大模型兜底，非旅行内容继续稳定拒答，不进入通用问答 Agent。
+- TravelSupervisor 增加受约束动作契约：`clarify`、`answer`、`plan`、`refuse`。模型负责选择工具和本轮动作，代码继续负责工具白名单、参数、权限、来源、重复调用限制及结果校验。
+- 查询车票、航班、地点或天气时不再默认创建 TravelPlan；只有用户明确提出规划且取得非演示交通、真实路线几何或有来源地点时才允许保存计划。没有有效 provider 数据时只回答并说明“暂不生成行程计划”。
+- 计划生成后不自动打开行程面板；前端在“行程计划”按钮显示未读红点，用户主动打开后清除提醒。
+- 工作台改为固定视口布局：页面风景背景保持独立，只有聊天容器使用半透明液态玻璃；外层页面不滚动，聊天容器内部滚动，流式回答不会改变工作台尺寸。
+- 本阶段验证：后端全量 `pytest -q` 为 **152 passed**、1 个既有 Starlette 依赖弃用警告；前端 `npm run typecheck`、`npm run build`、`git diff --check` 通过；Chrome 1440×900 与 390×844 检查确认页面无滚动，只有聊天容器可滚动，内容增长时容器高度保持不变。
+- 本阶段补充修正：工作台宽度收敛到 1120px；聊天容器下沿不再绘制硬分隔线；顶部栏只响应探索页滚动，工作台聊天滚动保持顶部栏固定。Chrome 回归确认宽高、滚动根和红点通知均符合预期。
+- 2026-09-03 底部层叠修正：根据反馈将搜索框从消息玻璃工作台中拆出，消息容器收窄到 860px，使其与独立搜索框宽度更接近；`.workspace-chat-scroll-region` 仍是唯一滚动根，开发入口桌面/移动端实测无溢出，顶部栏保持固定。
+- 移动端补充修正：计划通知浮层上移到独立搜索框上方，避免通知卡覆盖输入区域。
+
+## 25. 提示词边界与真实功能回归（2026-09-04）
+
+- Supervisor 系统提示词不再拼接用户原话、目的地、日期等用户可控字段；固定规则通过 `SystemMessage` 传递，原始请求、结构化旅行上下文和附件元数据通过带有 `<UNTRUSTED_USER_DATA>` 标记的独立 `HumanMessage` 传递。
+- 增加提示词边界回归：恶意用户文本不会进入 Supervisor 系统消息；关键词识别增加否定语境处理，类似“写邮件，不涉及旅行”的内容不会因包含“旅行”二字而误进入旅行规划。
+- 真实接口回归：3 类无关/提示词注入问题均被范围分类为非旅行并拒答，`trip_plan=null` 且未调用旅行工具；“江苏五日游”返回 `destination_cities` 澄清且不生成空计划。
+- 真实杭州规划回归：Supervisor 实际选择天气、POI 和路线工具，返回 `decision=plan`；计划为上海→杭州、3 天、2 人，3 个唯一日期、13 个日程项、路线折线和来源齐全，日程/交通来源引用均可解析，provider 状态为成功或明确未请求。
+- 浏览器回归：用户输入、流式回答、打开行程计划面板和交互地图均可用；无关问题页面正确拒答；桌面页面无横向/纵向溢出，地图缩放控件存在，浏览器无严重错误。
+
+## 26. 清理未使用旧产物（2026-09-04）
+
+- 清除 `static/assets/` 中当前 `static/index.html` 未引用的 29 个历史 Vite JS/CSS 构建包；保留当前入口使用的 JS、CSS、品牌图和首页景点图。
+- 清除前端入口未引用的 4 张旧景点图片：原始天安门、原始长城和原始西湖素材；同步移除 `image-sources.md` 中对应的过期文件记录。
+- 清除根目录 Python/pytest 缓存、旧服务日志、旧 Drission 测试 profile，以及 `work/` 中明确属于浏览器回归的 20 个 profile 和 25 张截图；未整体删除 `work/`，并保留运行数据库和其他素材。
+
+## 27. 清理退役通用 Agent（2026-09-04）
+
+- 删除 `agents/agent.py` 中已不再参与请求链路的通用 LangGraph Agent、旧网页搜索/天气工具、通用提示词和 Chroma/Embedding 文档检索实现。
+- 保留 `agents/agent.py` 当前仍被 API 使用的模型初始化、旅行范围识别、Travel Supervisor 调度、流式 SSE、历史 checkpoint、来源/计划缓冲和会话清理能力。
+- 删除只覆盖退役通用网页搜索和通用 Agent 的测试；旅行联网搜索仍由 `services/travel_search.py` 和 `TravelSupervisor` 负责。
+- 移除 `chromadb` 依赖、Embedding 环境变量示例和 `resources/chroma_runtime/` 运行缓存说明；文本附件仍由 `utils/file_utils.py` 做有界解析与段落切分。

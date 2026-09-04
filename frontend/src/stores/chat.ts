@@ -8,6 +8,7 @@ import type {
   HistoryMessage,
   ClarificationRequest,
   SourceInfo,
+  TransportPage,
 } from "../types/api";
 import { useSessionStore } from "./session";
 import { usePlanStore } from "./plan";
@@ -26,6 +27,7 @@ export interface ChatMessage {
   search_enabled?: boolean;
   plan_id?: string | null;
   plan_version?: number | null;
+  transport_page?: TransportPage | null;
   /** local-only flags */
   streaming?: boolean;
   failed?: boolean;
@@ -219,12 +221,20 @@ export const useChatStore = defineStore("chat", {
             current.answer_segments = payload.answer_segments ?? [];
             current.clarification = payload.clarification ?? null;
             current.scope_refusal = payload.scope_refusal ?? false;
+            current.transport_page = payload.transport_page ?? null;
             current.activities = payload.activities ?? current.activities;
             current.sources = payload.sources ?? current.sources;
             if (payload.trip_plan) {
               current.plan_id = payload.trip_plan.plan_id;
               current.plan_version = payload.trip_plan.version;
-              plan.applyPlan(payload.trip_plan);
+              plan.applyPlan(payload.trip_plan, { markUnread: !plan.panelOpen });
+            }
+            if (payload.transport_options?.length && payload.transport_page) {
+              plan.appendTransportOptions(
+                payload.transport_options,
+                payload.transport_page,
+                payload.sources ?? [],
+              );
             }
             plan.setMessageSources(payload.sources ?? []);
             this.streaming = false;

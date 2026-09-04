@@ -1,6 +1,6 @@
 ---
 name: search-fallback-playbook
-description: Handle cases in AI_Agent where no domain-specific API is available and the agent must fall back to web search with current-date context, location extraction, query rewriting, result filtering, and staleness warnings. Use when Codex needs to improve fallback quality for latest or real-time questions.
+description: Handle travel cases in AI_Agent where no domain-specific API is available and the TravelSupervisor must fall back to authorized web search with current-date context, location extraction, result filtering, and staleness warnings. Use when Codex needs to improve travel search fallback quality.
 ---
 
 # Search Fallback Playbook

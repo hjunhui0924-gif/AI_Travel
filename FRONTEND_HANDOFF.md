@@ -8,7 +8,7 @@
 
 联网搜索是显式开关：`search_enabled=false` 时后端不得调用网页搜索；`true` 时网页搜索只用于发现地点和热度信号。网页候选必须经过地图/POI 验证才进入地点卡。不要显示或保存大众点评评价正文，也不要把“网红/热门”当成评分。
 
-产品范围是旅行规划，不提供通用问答。消息先经过确定性旅行意图识别；规则未命中时只允许一次受约束的大模型范围分类和旅行字段抽取。模型确认非旅行、输出无效或调用失败时，后端返回稳定的范围拒答，不泄漏内部异常，也不继续调用通用聊天模型。
+产品范围是旅行规划，不提供通用问答。消息先经过关键词/规则优先的旅行意图识别；规则未命中时只允许一次受约束的大模型范围分类和旅行字段抽取。进入可执行的旅行需求后，旅行 Supervisor 由大模型根据需求选择 provider 工具（铁路、航班、地点、路线、天气或联网搜索），并决定本轮是 `clarify`、`answer`、`plan` 还是 `refuse`；工具参数、权限、来源、数据真实性和最终计划门控仍由代码校验。模型确认非旅行、输出无效或调用失败时，后端返回稳定的范围拒答或安全回退，不泄漏内部异常，也不继续调用通用聊天模型。
 
 目的地范围较宽或关键条件不足时，后端返回 `ClarificationRequest` 而不是创建空计划。前端应展示有限路线选项或自定义输入；用户补充后，后端合并 `pending_query` 再执行正式规划。
 
@@ -18,8 +18,9 @@
 HomeView / ChatComposer
   → POST /chat（multipart/form-data）
   → FastAPI 鉴权与附件解析
-  → stream_chat：规则识别 →（必要时）模型范围分类
-  → 旅行规划 Agent：条件校验 → 数据适配器 → TravelPlan
+  → stream_chat：关键词/规则识别 →（未命中时）模型范围分类
+  → 旅行 Supervisor：模型选择工具 → provider 结果 → 模型决定动作
+  → 代码校验动作与数据 → 仅在明确规划且有有效数据时生成 TravelPlan
   → SSE activity/source/text/done
   → Pinia chat/plan store → 消息、行程、日历、RouteMap
 ```
@@ -201,6 +202,10 @@ data: {
   "sources": [],
   "clarification": null,
   "scope_refusal": false,
+  "decision": "answer|clarify|plan|refuse",
+  "decision_reason": "简要动作原因",
+  "transport_options": [],
+  "transport_page": null,
   "trip_plan": null,
   "attachments": []
 }
@@ -209,17 +214,18 @@ data: {
 - `activity` 可用于显示“正在分析、查询地点、整理行程”等过程；不要把 `detail` 当作事实字段。
 - `source` 和 `done.sources` 只用于来源卡；优先用 `evidence_id` 去重。来源可能是来源卡字段，也可能是完整 `Evidence` 字段，未知字段应忽略。
 - `text.delta` 只做聊天文本增量拼接；旅行规划正文、澄清回复和范围拒答都会拆成多个增量事件，前端不应等待完整正文后再渲染。
-- 旅行请求完成时 `done.trip_plan` 为结构化 TravelPlan；超出旅行范围的问题 `done.trip_plan` 为 `null`，并将 `done.scope_refusal` 设为 `true`。
+- `done.transport_options` 和 `done.transport_page` 仅用于“加载更多”类后续交通查询；如果本轮生成了完整计划，交通候选的权威列表仍在 `done.trip_plan.transport_options`。
+- 旅行请求完成时，只有 Supervisor 决定 `plan` 且通过有效数据门控，`done.trip_plan` 才是结构化 TravelPlan；查询/推荐类回答的 `done.trip_plan` 为 `null`。超出旅行范围的问题 `done.trip_plan` 为 `null`，并将 `done.scope_refusal` 设为 `true`。
 - 当旅行需求缺少关键条件时，`done.trip_plan` 为 `null`，`done.clarification` 为 `{code,prompt,options}`；前端应展示澄清问题和结构化选项，不要把这一轮当成失败。
 - `clarification.options` 的每项包含 `key`、`label`、可选的 `description` 和 `value`。有 `value` 的选项可以直接作为下一轮 `message` 提交；没有 `value` 的选项表示需要用户自行输入。
-- 规则未识别的消息会经过一次旅行范围分类；分类为非旅行问题时，系统只返回范围说明，不调用通用问答 Agent。
+- 关键词/规则未识别的消息会经过一次旅行范围分类；分类为非旅行问题时，系统只返回范围说明，不调用通用问答 Agent。分类为旅行后，Supervisor 继续决定需要的工具和动作。
 - `done.final_text` 是可直接展示的文本，不包含内部 metadata 标记。前端不要从它解析日历。
 - `done.answer_segments` 是句子级引用的权威结构；只有其中存在有效网页引用时才按它渲染引用组件，否则直接渲染 `done.final_text` 的完整 Markdown。不要把两条路径同时完整渲染造成重复文本。
 - 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。鉴权/输入错误可以返回具体提示；服务内部异常只返回稳定的通用提示，详细异常只写服务端日志。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
 
 附件限制：图片支持 `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`；文档支持 `.pdf`、`.txt`、`.md`、`.csv`、`.docx`、`.doc`、`.xlsx`、`.xls`。单个文件最大 10MB。`.doc` 只返回兼容性提示，不保证可靠解析。图片附件的 `image_url` 可能是内联 `data:` URL 或有时效的 OSS URL，不应假设它永久有效；历史消息中的图片通过用户消息的 `attachments`/`image_urls` 返回，而 `done.attachments` 当前只列出文本附件。
 
-推荐处理逻辑：以 `done` 作为本轮结束信号；如果 `done.trip_plan` 非空，直接刷新计划卡、日历和来源卡，并自动打开行程面板，让路线地图立即可见。不要仅凭某一条 `activity` 判断计划已保存。
+推荐处理逻辑：以 `done` 作为本轮结束信号；如果 `done.trip_plan` 非空，刷新计划卡、日历和来源卡，但保持行程面板关闭，在“行程计划”按钮显示未读红点；用户主动打开面板后清除红点。不要仅凭某一条 `activity` 判断计划已保存。
 
 ## 5. TravelPlan 结构
 
@@ -246,6 +252,7 @@ data: {
   "summary": "...",
   "days": [],
   "transport_options": [],
+  "transport_pages": [],
   "out_of_range_items": [],
   "route_plans": [],
   "facts": [],
@@ -274,6 +281,24 @@ data: {
 `calendar_truncated=true` 时，`end_date` 仍是真实请求结束日期，`days` 只投影当前前 31 天；使用 `projection_end_date` 和 `projected_days`，不要从 `risks` 文本推断。
 
 `route_plans` 是已通过地点解析的路线预览数据。每个路线包含 `mode`、`origin`、`destination`、`duration`、`distance`、`origin_location`、`destination_location` 和 `polyline`（经度/纬度点数组）。用户未指定景点时，后端会从已通过地图验证的城市景点推荐中选择路线锚点；不会从未经验证的回答文本生成路线。前端不要从 `detail` 或回答文本解析路线；`RouteMap.vue` 在配置 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SECURITY_JS_CODE` 时优先加载高德 JS API 2.0，支持缩放、拖拽、路线自动适配和起终点标记；没有浏览器端 Key 时调用 `GET /travel/plans/{thread_id}/map`（可选 `?version=n`）读取服务端静态地图。没有路线几何时接口返回 404；静态地图请求异常时接口返回基于真实折线的 SVG 示意图，并带 `X-Route-Map-Fallback: true` 响应头。浏览器端 Key 必须限制高德控制台域名白名单，服务端 Web Service Key 不得写入 `VITE_*` 变量。
+
+### `TravelPlan.transport_pages`
+
+每种已请求的交通类型可有一个分页状态：
+
+```json
+{
+  "mode": "rail",
+  "offset": 0,
+  "limit": 5,
+  "returned_count": 5,
+  "total_count": 38,
+  "has_more": true,
+  "filter": "high_speed"
+}
+```
+
+首次结果通常只展示 5 条。前端可在行程面板调用 `GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5`，或提交“再给我 3 条高铁”等后续消息。接口返回的候选必须直接展示 provider 字段和来源，不能由模型补造。`filter=high_speed` 表示铁路结果仅包含 G、D、C 字头；没有真实票价时 `price` 为空，不得显示货币符号。
 
 ### PlanDay
 
@@ -427,6 +452,16 @@ POI 卡使用 `name`、`category`、`address`、`distance`、`rating`、`rating_
 
 返回指定版本：`{status:"success", plan: TravelPlan}`。不存在或无权限均为 404。
 
+### `GET /travel/plans/{thread_id}/transport`
+
+返回当前计划中已请求交通类型的下一页候选：
+
+```text
+GET /travel/plans/{thread_id}/transport?mode=rail&offset=5&limit=5&version=1
+```
+
+响应包含 `options`、`page`、`sources` 和 `errors`。`page.total_count` 是 provider 返回并经过筛选后的候选总数，`page.has_more` 表示是否还可继续加载。前端首次展示 5 条时，下一页通常从 `offset=5` 开始。重复请求会重新调用对应 provider，不应让大模型补写候选。
+
 ## 7. 修改计划项与重规划
 
 ### `PATCH /travel/plans/{thread_id}/items/{item_id}`
@@ -551,3 +586,11 @@ SSE 来源卡使用 `summary`；`TravelPlan` 和重规划响应中的 `Evidence`
 模型内部的 `[[cite:web_...]]` 标记已经由后端移除，绝不能显示。流式 `text.delta` 已经清理；`done.final_text` 是规范的干净文本。`search_enabled=false` 绝不能产生网页搜索句子引用。
 
 如果历史消息或兼容旧数据中的 `answer_segments` 为空，直接渲染清理后的 `content`，不要自行补造引用关系。
+
+## 12. 工作台滚动与层叠契约（2026-09-03）
+
+- 工作台模式下 `.workspace-chat-surface` 是固定尺寸的消息玻璃容器；输入区 `.composer` 独立位于其下方，页面风景背景仍在两者外独立渲染。
+- `.workspace-chat-scroll-region` 是唯一允许纵向滚动的元素。外层 `.chat-scroll` 和页面本身必须保持 `overflow: hidden`，流式消息增长不能改变工作台高度，也不能触发顶部栏收缩。
+- 消息玻璃容器宽度上限为 860px（移动端自适应到可用宽度），与 780px 的独立输入框保持接近的视觉比例；输入区不得被消息玻璃背景包住，也不应在两者之间添加不透明横向分隔层。工作台底边保持透明。
+- 移动端计划通知浮层应位于独立输入区上方，不能覆盖搜索字段或发送按钮。
+- 切换到工作台时，如果需要重置滚动位置，应定位 `.workspace-chat-scroll-region`，不要把 `.workspace-chat-surface` 当作滚动根。

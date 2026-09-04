@@ -16,13 +16,28 @@ const emit = defineEmits<{
 }>();
 
 const chat = useChatStore();
-const scrollEl = ref<HTMLElement | null>(null);
+const homeScrollEl = ref<HTMLElement | null>(null);
+const workspaceScrollEl = ref<HTMLElement | null>(null);
 const showScrollBottom = ref(false);
 let stickToBottom = true;
 let lastScrollState = false;
 
+function activeScrollEl() {
+  return props.workspace ? workspaceScrollEl.value : homeScrollEl.value;
+}
+
 function syncScrollState() {
-  const el = scrollEl.value;
+  if (props.workspace) {
+    // Workspace scrolling belongs to the conversation surface. Keep the
+    // product header spatially fixed instead of turning the chat scroll into
+    // a second header transition.
+    if (lastScrollState) {
+      lastScrollState = false;
+      emit("scroll-state", false);
+    }
+    return;
+  }
+  const el = activeScrollEl();
   if (!el) return;
   const compact = el.scrollTop > 28;
   if (compact === lastScrollState) return;
@@ -31,7 +46,7 @@ function syncScrollState() {
 }
 
 function onScroll() {
-  const el = scrollEl.value;
+  const el = activeScrollEl();
   if (!el) return;
   const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
   stickToBottom = distance < 80;
@@ -42,7 +57,7 @@ function onScroll() {
 async function scrollToBottom(force = false) {
   if (!force && !stickToBottom) return;
   await nextTick();
-  const el = scrollEl.value;
+  const el = activeScrollEl();
   if (el) el.scrollTop = el.scrollHeight;
 }
 
@@ -93,7 +108,7 @@ function submitHomePrompt(prompt: string) {
 
 <template>
   <div
-    ref="scrollEl"
+    ref="homeScrollEl"
     class="chat-scroll"
     :class="{ 'chat-scroll-home': !props.workspace && !chat.historyLoading, 'chat-scroll-workspace': props.workspace }"
     @scroll="onScroll"
@@ -109,12 +124,21 @@ function submitHomePrompt(prompt: string) {
       @submit-prompt="submitHomePrompt"
       @background-change="emit('background-change', $event)"
     />
-    <div v-else-if="props.workspace" key="workspace" class="chat-inner">
-        <MessageItem
-          v-for="(msg, i) in chat.messages"
-          :key="i"
-          :message="msg"
-        />
+    <div v-else-if="props.workspace" key="workspace" class="workspace-chat-surface">
+      <div
+        ref="workspaceScrollEl"
+        class="workspace-chat-scroll-region"
+        aria-label="旅行对话"
+        @scroll="onScroll"
+      >
+        <div class="chat-inner">
+          <MessageItem
+            v-for="(msg, i) in chat.messages"
+            :key="i"
+            :message="msg"
+          />
+        </div>
+      </div>
     </div>
   </div>
   <button

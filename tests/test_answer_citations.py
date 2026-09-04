@@ -149,22 +149,6 @@ def test_conflicting_source_identity_cannot_be_cited():
     assert result.used_source_ids == []
 
 
-def test_web_search_permission_guard_blocks_direct_tool_use(monkeypatch):
-    class ExplodingSearcher:
-        def invoke(self, payload):
-            raise AssertionError("searcher must not be called")
-
-    monkeypatch.setattr(agent_module, "_raw_web_search", ExplodingSearcher())
-    agent_module._reset_runtime_buffers()
-    agent_module._web_search_allowed_var.set(False)
-    try:
-        result = agent_module.perform_web_search("最新旅行信息")
-    finally:
-        agent_module._reset_runtime_buffers()
-
-    assert "未开启联网搜索" in result
-
-
 def test_stream_sanitizer_holds_incomplete_marker_without_leaking_it():
     assert strip_citation_markers_for_stream("依据如下[[cite:web_") == "依据如下"
     assert strip_citation_markers_for_stream("依据如下[[cite:web_\n下一行") == "依据如下"

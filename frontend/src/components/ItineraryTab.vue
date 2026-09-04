@@ -12,6 +12,7 @@ const plan = usePlanStore();
 const p = computed(() => plan.displayPlan);
 const day = computed(() => plan.selectedDay);
 const routePlans = computed(() => p.value?.route_plans ?? []);
+const transportPages = computed(() => p.value?.transport_pages ?? []);
 
 const outOfRangeOpen = ref(true);
 
@@ -25,6 +26,18 @@ const calendarToggled = ref<boolean | null>(null);
 const calendarOpen = computed(() => calendarToggled.value ?? !!p.value);
 function toggleCalendar() {
   calendarToggled.value = !calendarOpen.value;
+}
+
+function transportLabel(mode: string): string {
+  return mode === "flight" ? "航班" : "车次";
+}
+
+function transportLoadedCount(page: { offset: number; returned_count: number; total_count: number }): string {
+  return `${Math.min(page.offset + page.returned_count, page.total_count)} / ${page.total_count}`;
+}
+
+function loadMoreTransport(mode: "rail" | "flight") {
+  void plan.loadMoreTransport(mode);
 }
 
 async function onVersionChange(e: Event) {
@@ -87,6 +100,7 @@ const dateRangeText = computed(() => {
 
   <template v-if="p">
     <div v-if="plan.error" class="error-banner">{{ plan.error }}</div>
+    <div v-if="plan.transportError" class="notice-block risk">{{ plan.transportError }}</div>
     <div v-if="plan.conflict409" class="conflict-banner">
       计划已被更新（当前 v{{ plan.conflict409.currentVersion }}），你的修改未提交。请基于最新计划重试。
       <button type="button" @click="plan.conflict409 = null">知道了</button>
@@ -161,6 +175,21 @@ const dateRangeText = computed(() => {
     <!-- Transport options -->
     <template v-if="p.transport_options?.length">
       <div class="section-title">交通候选</div>
+      <div v-if="transportPages.length" class="transport-page-summary">
+        <div v-for="page in transportPages" :key="page.mode" class="transport-page-row">
+          <span>{{ transportLabel(page.mode) }}：已显示 {{ transportLoadedCount(page) }}</span>
+          <button
+            v-if="page.has_more"
+            class="transport-more-btn"
+            type="button"
+            :disabled="plan.transportLoadingMode !== '' || plan.viewingVersion !== null"
+            @click="loadMoreTransport(page.mode === 'flight' ? 'flight' : 'rail')"
+          >
+            {{ plan.transportLoadingMode === page.mode ? "加载中…" : `加载更多${transportLabel(page.mode)}` }}
+          </button>
+          <span v-else class="transport-page-complete">已全部展示</span>
+        </div>
+      </div>
       <TransportCard
         v-for="(t, i) in p.transport_options"
         :key="i"

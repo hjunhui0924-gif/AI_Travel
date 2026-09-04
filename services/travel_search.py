@@ -133,11 +133,10 @@ def discover_travel_places(
         try:
             raw = active_searcher.invoke({"query": query})
         except Exception as exc:
-            message = f"{query}: {exc}"
-            result.errors.append(message)
+            result.errors.append(f"旅行网页搜索失败：{type(exc).__name__}")
             result.status = "partial" if result.candidates else "failed"
             if activity_logger:
-                activity_logger("tool", "旅行网页搜索失败", str(exc))
+                activity_logger("tool", "旅行网页搜索失败", type(exc).__name__)
             continue
 
         if not isinstance(raw, dict) or "results" not in raw or not isinstance(raw["results"], list):

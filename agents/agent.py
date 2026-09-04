@@ -1,39 +1,28 @@
 import json
-import hashlib
 import os
 import re
 import sqlite3
 import time
 from contextvars import ContextVar
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from langchain.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
-from langchain_core.tools import tool
-from langchain_tavily import TavilySearch
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-try:
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-    from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-    from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
-except Exception:
-    chromadb = None
-    ChromaSettings = None
-    DefaultEmbeddingFunction = None
-    OpenAIEmbeddingFunction = None
-
 from utils.oss_utils import delete_oss_object
-from utils.weather_utils import current_cn_datetime, format_weather_text, has_amap_key
-from agents.schemas import TravelPlan
-from agents.travel_agent import plan_travel, render_travel_response
+from agents.schemas import TransportOption, TransportPage, TravelPlan
+from agents.travel_agent import (
+    _build_clarification,
+    plan_travel,
+    prepare_travel_query,
+    render_travel_response,
+)
+from agents.travel_supervisor import TravelSupervisorResult, run_travel_supervisor
 from services.travel_store import (
     delete_travel_thread,
     get_current_plan,
@@ -42,8 +31,7 @@ from services.travel_store import (
     save_plan_version,
     save_travel_turn,
 )
-from services.travel_search import _is_denied_source, _normalize_url
-from services.travel_search import web_evidence_id
+from services.transport_service import get_transport_page
 from services.answer_citations import (
     deduplicate_sources,
     parse_answer_citations,
@@ -60,6 +48,8 @@ DB_PATH = RESOURCES_DIR / "ai_agent_threads.db"
 CN_TZ = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_THREAD_TITLE = "新会话"
+# These legacy markers are retained so pre-cleanup checkpoint histories remain
+# readable and sanitized. No current request builds them.
 ATTACHMENT_START = "<ATTACHMENT_CONTEXT>"
 ATTACHMENT_END = "</ATTACHMENT_CONTEXT>"
 SEARCH_START = "<SEARCH_CONTEXT>"
@@ -68,21 +58,15 @@ ACTIVITY_START = "__ACTIVITY__"
 ACTIVITY_END = "__END_ACTIVITY__"
 ASSISTANT_META_START = "__ASSISTANT_META__"
 ASSISTANT_META_END = "__END_ASSISTANT_META__"
-MAX_RELEVANT_CHUNKS = 6
-CHROMA_DIR = RESOURCES_DIR / "chroma_runtime"
 TRAVEL_STREAM_CHUNK_SIZE = 72
 TRAVEL_STREAM_DELAY_SECONDS = 0.028
 
 _activity_log_var: ContextVar[list[dict] | None] = ContextVar("activity_log", default=None)
 _source_cards_var: ContextVar[list[dict] | None] = ContextVar("source_cards", default=None)
 _travel_plan_var: ContextVar[dict | None] = ContextVar("travel_plan", default=None)
-_web_search_allowed_var: ContextVar[bool | None] = ContextVar("web_search_allowed", default=None)
-
-_chroma_client = None
-_chroma_embedding_function = None
 
 
-def _today_cn() -> date:
+def _today_cn():
     return datetime.now(CN_TZ).date()
 
 
@@ -110,7 +94,6 @@ def _reset_runtime_buffers() -> None:
     _activity_log_var.set([])
     _source_cards_var.set([])
     _travel_plan_var.set(None)
-    _web_search_allowed_var.set(None)
 
 
 def _log_activity(stage: str, title: str, detail: str = "", state: str = "completed") -> None:
@@ -238,491 +221,7 @@ def _resolve_model_settings() -> dict:
     }
 
 
-def _resolve_embedding_settings() -> dict:
-    return {
-        "api_key": (
-            os.getenv("EMBEDDING_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-            or os.getenv("DASHSCOPE_API_KEY")
-            or ""
-        ),
-        "base_url": (
-            os.getenv("EMBEDDING_BASE_URL")
-            or os.getenv("LLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("DASHSCOPE_BASE_URL")
-            or None
-        ),
-        "model": (
-            os.getenv("EMBEDDING_MODEL")
-            or os.getenv("OPENAI_EMBEDDING_MODEL")
-            or "text-embedding-3-small"
-        ),
-    }
-
-
-def _get_chroma_embedding_function():
-    global _chroma_embedding_function
-    if _chroma_embedding_function is not None:
-        return _chroma_embedding_function
-
-    settings = _resolve_embedding_settings()
-    if OpenAIEmbeddingFunction and settings["api_key"]:
-        _chroma_embedding_function = OpenAIEmbeddingFunction(
-            api_key=settings["api_key"],
-            api_base=settings["base_url"],
-            model_name=settings["model"],
-        )
-        return _chroma_embedding_function
-
-    if DefaultEmbeddingFunction:
-        _chroma_embedding_function = DefaultEmbeddingFunction()
-        return _chroma_embedding_function
-
-    return None
-
-
-def _get_chroma_client():
-    global _chroma_client
-    if _chroma_client is not None:
-        return _chroma_client
-    if not chromadb or not ChromaSettings:
-        return None
-
-    CHROMA_DIR.mkdir(exist_ok=True)
-    _chroma_client = chromadb.Client(
-        ChromaSettings(
-            is_persistent=True,
-            persist_directory=str(CHROMA_DIR),
-            anonymized_telemetry=False,
-        )
-    )
-    return _chroma_client
-
-
 model = init_chat_model(**_resolve_model_settings())
-
-_raw_web_search = None
-
-
-def _get_raw_web_search():
-    """Create the web search client only after a request opts into search."""
-
-    global _raw_web_search
-    if _raw_web_search is not None:
-        return _raw_web_search
-    if TavilySearch is None or not os.getenv("TAVILY_API_KEY"):
-        return None
-    try:
-        _raw_web_search = TavilySearch(
-            max_results=6,
-            topic="general",
-            include_images=False,
-            include_answer=False,
-            include_raw_content=False,
-            search_depth="advanced",
-            handle_tool_error=True,
-            handle_validation_error="搜索参数无效，请简化关键词后重试。",
-        )
-    except Exception as exc:
-        _log_activity("tool", "联网搜索初始化失败", str(exc))
-        return None
-    return _raw_web_search
-
-
-def _is_time_sensitive_query(query: str) -> bool:
-    keywords = [
-        "最新",
-        "今天",
-        "今日",
-        "当前",
-        "现在",
-        "实时",
-        "latest",
-        "today",
-        "current",
-        "now",
-        "live",
-    ]
-    lowered = query.lower()
-    return any(keyword in lowered for keyword in keywords) or any(keyword in query for keyword in keywords)
-
-
-def _extract_dates(text: str) -> list[date]:
-    candidates = []
-    patterns = [
-        r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})",
-        r"(20\d{2})年(\d{1,2})月(\d{1,2})日",
-    ]
-    for pattern in patterns:
-        for match in re.findall(pattern, text):
-            try:
-                year, month, day = map(int, match)
-                candidates.append(date(year, month, day))
-            except ValueError:
-                continue
-    return candidates
-
-
-def _search_queries(query: str) -> list[str]:
-    today = _today_cn()
-    queries = [query]
-    if _is_time_sensitive_query(query):
-        queries.extend(
-            [
-                f"{query} {today.isoformat()}",
-                f"{query} {today.year}",
-                f"{query} today",
-            ]
-        )
-    deduped = []
-    for item in queries:
-        if item not in deduped:
-            deduped.append(item)
-    return deduped
-
-
-def _is_weather_query(query: str) -> bool:
-    keywords = [
-        "天气",
-        "气温",
-        "下雨",
-        "降雨",
-        "温度",
-        "风力",
-        "湿度",
-        "weather",
-        "forecast",
-        "temperature",
-        "rain",
-    ]
-    lowered = query.lower()
-    return any(keyword in lowered for keyword in keywords) or any(keyword in query for keyword in keywords)
-
-
-def _is_forecast_query(query: str) -> bool:
-    keywords = ["预报", "明天", "后天", "未来", "forecast", "tomorrow"]
-    lowered = query.lower()
-    return any(keyword in lowered for keyword in keywords) or any(keyword in query for keyword in keywords)
-
-
-def _extract_weather_location(query: str) -> str:
-    known_locations = [
-        "上海",
-        "北京",
-        "广州",
-        "深圳",
-        "杭州",
-        "苏州",
-        "南京",
-        "成都",
-        "重庆",
-        "武汉",
-        "西安",
-        "天津",
-    ]
-    for location in known_locations:
-        if location in query:
-            return location
-    cleaned = query
-    for token in ["今天天气", "今日天气", "天气", "气温", "预报", "实时", "最新", "明天", "后天"]:
-        cleaned = cleaned.replace(token, " ")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned or "上海"
-
-
-@tool
-def current_datetime() -> str:
-    """Get the current date and time in Asia/Shanghai for time-sensitive reasoning."""
-    now = current_cn_datetime()
-    return (
-        f"当前日期: {now['date']}\n"
-        f"当前时间: {now['time']}\n"
-        f"当前时区: {now['timezone']}\n"
-        f"星期: {now['weekday']}"
-    )
-
-
-def weather_lookup_impl(location: str, forecast: bool = False) -> str:
-    if not has_amap_key():
-        _log_activity("tool", "天气接口不可用", "未配置 AMAP_WEB_API_KEY")
-        return "当前未配置高德天气 API Key，无法调用天气接口。"
-
-    mode = "天气预报" if forecast else "实时天气"
-    _log_activity("tool", f"调用{mode}接口", location, state="running")
-    try:
-        text = format_weather_text(location, forecast=forecast)
-    except Exception as exc:
-        _log_activity("tool", f"{mode}接口失败", str(exc))
-        return f"{mode}查询失败: {exc}"
-
-    _log_activity("tool", f"{mode}接口完成", location)
-    return text
-
-
-@tool
-def weather_lookup(location: str, forecast: bool = False) -> str:
-    """Get current weather or forecast for a Chinese location. Use for weather questions before falling back to web search."""
-    return weather_lookup_impl(location, forecast)
-
-
-def _collect_query_terms(query: str) -> set[str]:
-    lowered = query.lower()
-    words = set(re.findall(r"[a-z0-9_]{2,}", lowered))
-    chinese_chars = re.findall(r"[\u4e00-\u9fff]", query)
-    bigrams = set("".join(chinese_chars[index:index + 2]) for index in range(len(chinese_chars) - 1))
-    return {term for term in words.union(bigrams) if term.strip()}
-
-
-def _score_chunk(query_terms: set[str], chunk_text: str) -> int:
-    if not query_terms:
-        return 0
-    lowered = chunk_text.lower()
-    score = 0
-    for term in query_terms:
-        occurrences = lowered.count(term.lower())
-        if occurrences:
-            score += occurrences * max(len(term), 1)
-    return score
-
-
-def _lexical_select_relevant_chunks(query: str, chunks: list[dict]) -> list[dict]:
-    if not chunks:
-        return []
-    query_terms = _collect_query_terms(query)
-    scored = []
-    for index, chunk in enumerate(chunks):
-        score = _score_chunk(query_terms, chunk.get("text", ""))
-        scored.append((score, index, chunk))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    selected = [chunk for score, _index, chunk in scored if score > 0][:MAX_RELEVANT_CHUNKS]
-    return selected or chunks[: min(MAX_RELEVANT_CHUNKS, len(chunks))]
-
-
-def _attachment_file_key(attachment: dict) -> str:
-    payload = f"{attachment.get('name', '')}|{attachment.get('extension', '')}|{attachment.get('content', '')}"
-    return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
-
-
-def _select_relevant_chunks_via_chroma(query: str, attachment: dict) -> list[dict]:
-    chunks = attachment.get("chunks", [])
-    if not chunks:
-        return []
-
-    client = _get_chroma_client()
-    embedding_function = _get_chroma_embedding_function()
-    if client is None or embedding_function is None:
-        return []
-
-    collection_name = f"attachment_{uuid4().hex}"
-    file_key = _attachment_file_key(attachment)
-    chunk_lookup = {}
-    ids = []
-    documents = []
-    metadatas = []
-    for index, chunk in enumerate(chunks):
-        chunk_id = f"{file_key}_{index}"
-        ids.append(chunk_id)
-        documents.append(chunk.get("text", ""))
-        metadatas.append(
-            {
-                "file_key": file_key,
-                "label": chunk.get("label", f"chunk_{index + 1}"),
-                "chunk_index": index,
-            }
-        )
-        chunk_lookup[chunk_id] = chunk
-
-    collection = None
-    try:
-        collection = client.create_collection(name=collection_name, embedding_function=embedding_function)
-        collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        result = collection.query(query_texts=[query], n_results=min(MAX_RELEVANT_CHUNKS, len(ids)))
-    except Exception:
-        if collection is not None:
-            try:
-                client.delete_collection(collection_name)
-            except Exception:
-                pass
-        return []
-
-    try:
-        result_ids = (result.get("ids") or [[]])[0]
-        selected = [chunk_lookup[item_id] for item_id in result_ids if item_id in chunk_lookup]
-        return selected
-    finally:
-        try:
-            client.delete_collection(collection_name)
-        except Exception:
-            pass
-
-
-def _select_relevant_chunks(query: str, chunks: list[dict], attachment: dict | None = None) -> list[dict]:
-    if attachment:
-        selected = _select_relevant_chunks_via_chroma(query, attachment)
-        if selected:
-            return selected
-    return _lexical_select_relevant_chunks(query, chunks)
-
-
-def perform_web_search(query: str) -> str:
-    if _web_search_allowed_var.get() is False:
-        _log_activity("search", "跳过联网搜索", "当前请求未授予联网搜索权限")
-        return "当前请求未开启联网搜索，无法执行网页搜索。"
-
-    weather_result = None
-    if _is_weather_query(query) and has_amap_key():
-        location = _extract_weather_location(query)
-        forecast = _is_forecast_query(query)
-        _log_activity("think", "识别到天气问题", f"地点: {location}，模式: {'预报' if forecast else '实时'}")
-        weather_result = weather_lookup_impl(location=location, forecast=forecast)
-
-    raw_web_search = _get_raw_web_search()
-    if not raw_web_search:
-        if weather_result and "失败" not in weather_result:
-            _log_activity("search", "未使用网页搜索", "已命中天气专用接口")
-            return weather_result
-        _log_activity("search", "跳过联网搜索", "未配置 Tavily API Key")
-        return "当前未配置 Tavily 搜索能力，无法执行联网搜索。"
-
-    today = _today_cn()
-    time_sensitive = _is_time_sensitive_query(query)
-
-    _log_activity(
-        "think",
-        "判断是否需要时效检查",
-        "当前问题包含最新/实时特征，搜索结果会校验日期。" if time_sensitive else "当前问题时效性较弱，将按常规搜索处理。",
-    )
-
-    merged_results = []
-    seen_urls = set()
-    for search_query in _search_queries(query):
-        _log_activity("search", "执行联网搜索", search_query, state="running")
-        try:
-            result = raw_web_search.invoke({"query": search_query})
-        except Exception as exc:
-            _log_activity("tool", "web_search 失败", str(exc))
-            return f"联网搜索失败: {exc}"
-
-        if not isinstance(result, dict) or "results" not in result or not isinstance(result["results"], list):
-            _log_activity("tool", "web_search 返回格式无效", "结果缺少 results 列表")
-            return "联网搜索失败：搜索服务返回格式无效。"
-
-        for item in result["results"]:
-            if not isinstance(item, dict):
-                continue
-            raw_title = str(item.get("title") or "").strip()
-            raw_content = str(item.get("content") or "").strip()
-            url = str(item.get("url") or "").strip()
-            normalized_url = _normalize_url(url)
-            denied_marker = any(
-                marker in f"{raw_title} {raw_content}".lower()
-                for marker in ("dianping.com", "大众点评")
-            )
-            if not normalized_url:
-                _log_activity("search", "过滤无来源链接的网页结果", raw_title or "未命名结果")
-                continue
-            if _is_denied_source(normalized_url) or denied_marker:
-                _log_activity("search", "过滤受限网页来源", normalized_url)
-                continue
-            if normalized_url and normalized_url in seen_urls:
-                continue
-            if normalized_url:
-                seen_urls.add(normalized_url)
-            safe_item = dict(item)
-            safe_item["url"] = normalized_url or url
-            merged_results.append(safe_item)
-
-    if not merged_results:
-        _log_activity("tool", "web_search 完成", "未找到结果")
-        return "没有找到可用的联网搜索结果。"
-
-    processed = []
-    for index, item in enumerate(merged_results, start=1):
-        title = (item.get("title") or "未命名结果").strip()
-        url = (item.get("url") or "").strip()
-        summary = str(item.get("content") or "").strip().replace("\n", " ")
-        found_dates = _extract_dates(f"{title} {summary}")
-        latest_date = max(found_dates) if found_dates else None
-        processed.append(
-            {
-                "rank": index,
-                "title": title,
-                "url": url,
-                "summary": summary,
-                "latest_date": latest_date,
-                "evidence_id": web_evidence_id(
-                    url=url,
-                    title=title,
-                    anchor="",
-                    query=query,
-                ),
-            }
-        )
-
-    if time_sensitive:
-        processed.sort(
-            key=lambda item: (
-                item["latest_date"] is not None,
-                item["latest_date"].toordinal() if item["latest_date"] else -1,
-                -item["rank"],
-            ),
-            reverse=True,
-        )
-
-    freshest_date = max((item["latest_date"] for item in processed if item["latest_date"]), default=None)
-    staleness_warning = ""
-    if time_sensitive and freshest_date:
-        delta = (today - freshest_date).days
-        if delta > 3:
-            staleness_warning = (
-                f"搜索结果中能识别出的最新日期是 {freshest_date.isoformat()}，"
-                f"距离当前日期 {today.isoformat()} 已超过 {delta} 天。"
-            )
-    elif time_sensitive and not freshest_date:
-        staleness_warning = (
-            f"搜索结果里没有识别到明确日期，无法确认是否与当前日期 {today.isoformat()} 同步。"
-        )
-
-    lines = [f"搜索关键词: {query}"]
-    if time_sensitive:
-        lines.append(f"当前日期: {today.isoformat()}")
-    if weather_result and "失败" not in weather_result:
-        lines.extend(["", weather_result])
-        _log_activity("tool", "优先使用天气接口", "网页搜索结果仅作为补充来源")
-    if staleness_warning:
-        lines.extend(["", f"时效警告: {staleness_warning}"])
-        _log_activity("search", "识别到时效风险", staleness_warning)
-
-    lines.extend(["", "检索结果:"])
-    for index, item in enumerate(processed[:6], start=1):
-        date_label = item["latest_date"].isoformat() if item["latest_date"] else "未识别"
-        lines.append(f"{index}. 标题: {item['title']}")
-        lines.append(f"   日期线索: {date_label}")
-        lines.append(f"   摘要: {item['summary'] or '无摘要'}")
-        lines.append(f"   链接: {item['url'] or '无链接'}")
-        lines.append(f"   Citation ID: {item['evidence_id']}")
-        if item["url"]:
-            _log_source_card(
-                item["title"],
-                item["url"],
-                item["summary"][:160],
-                date_label,
-                evidence_id=item["evidence_id"],
-                source_type="web_search",
-                provider="Tavily",
-                supports=["web_search_result"],
-            )
-
-    _log_activity("tool", "web_search 完成", f"返回 {min(len(processed), 6)} 条候选结果")
-    return "\n".join(lines)
-
-
-@tool
-def web_search(query: str) -> str:
-    """Search the public web for fresh or time-sensitive information when the user explicitly enabled web search."""
-    return perform_web_search(query)
 
 
 connection = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -753,149 +252,6 @@ def has_checkpoint_data(thread_id: str) -> bool:
         return True
     return row is not None
 
-TRAVEL_AGENT_SYSTEM_PROMPT = f"""
-你是一个旅行规划专用 AI 助手，当前日期是 {_today_cn().isoformat()}。
-
-服务边界：
-1. 只处理旅行和出行相关事项，包括目的地选择、路线、交通、住宿、景点、餐饮、天气、预算、预约信息和行程安排。
-2. 如果用户的问题与旅行无关，不要回答该问题，不要编写代码、文章、作业或提供其他领域的解决方案；只礼貌说明你目前只支持旅行规划，并邀请用户描述目的地、日期或出行需求。
-3. 旅行条件不完整时，先澄清关键条件；不要猜测目的地、日期、交通班次、营业时间或价格。
-4. 如果用户上传了文件或图片，只在它们与旅行计划、车票、酒店、预约或目的地信息有关时使用；无法确认与旅行有关时，先请求用户说明用途。
-5. 只有在用户明确开启联网搜索，且问题需要最新外部信息时，才调用 web_search。
-6. 如果搜索结果出现时效警告、旧日期或无法识别日期，必须明确告诉用户结果可能不是今天/当前的数据。
-7. 不要暴露内部私有推理，只输出结论、必要依据和工具结果。
-""".strip()
-
-# Keep the old name as a compatibility alias for code that imported the
-# prompt constant, but both LangGraph agents now carry the travel-only policy.
-BASE_SYSTEM_PROMPT = TRAVEL_AGENT_SYSTEM_PROMPT
-
-SEARCH_DISABLED_APPENDIX = """
-当前这轮对话未开启联网搜索。即使你知道有 web_search 工具，也不要调用。
-"""
-
-SEARCH_ENABLED_APPENDIX = """
-当前这轮对话已开启联网搜索。
-如果用户在问最新、今天、实时、当前值，必须优先参考工具返回中的日期线索，过滤过旧结果。
-
-When the web_search tool returns a ``Citation ID: web_...``, use the exact
-internal marker ``[[cite:web_...]]`` immediately after each sentence that is
-directly supported by that web result. Repeat the marker when a sentence has
-more than one supporting result. Never invent citation IDs, cite map/weather/
-rail/flight adapter data with this marker, output the marker as a URL, or
-mention this internal protocol to the user.
-"""
-
-agent_without_search = create_agent(
-    model=model,
-    tools=[current_datetime, weather_lookup],
-    system_prompt=BASE_SYSTEM_PROMPT + SEARCH_DISABLED_APPENDIX,
-    checkpointer=checkpoint,
-)
-
-agent_with_search = create_agent(
-    model=model,
-    tools=[current_datetime, weather_lookup, web_search],
-    system_prompt=BASE_SYSTEM_PROMPT + SEARCH_ENABLED_APPENDIX,
-    checkpointer=checkpoint,
-)
-
-
-def _build_attachment_block(attachments: list[dict], query: str) -> str:
-    if not attachments:
-        return ""
-
-    blocks = []
-    for index, attachment in enumerate(attachments, start=1):
-        header = [
-            f"[文件{index}]",
-            f"名称: {attachment['name']}",
-            f"类型: {attachment['extension']}",
-            f"大小: {attachment['size_bytes']} bytes",
-        ]
-        if attachment.get("note"):
-            header.append(f"说明: {attachment['note']}")
-
-        if attachment.get("modality") == "image":
-            storage_label = "OSS URL" if attachment.get("storage") == "oss" else "内联图片"
-            header.append(f"处理方式: 图片会直接发送给多模态模型。图片来源: {storage_label}")
-            blocks.append("\n".join(header))
-            continue
-
-        header.append(f"切分片段数: {attachment.get('chunk_count', 0)}")
-        if attachment.get("preview"):
-            header.append("文件摘要预览:")
-            header.append(attachment["preview"])
-
-        relevant_chunks = _select_relevant_chunks(query, attachment.get("chunks", []), attachment=attachment)
-        if relevant_chunks:
-            header.append("与当前问题最相关的片段:")
-            for chunk in relevant_chunks:
-                header.append(chunk["label"])
-                header.append(chunk["text"])
-        elif attachment.get("content"):
-            header.append("提取内容:")
-            header.append(attachment["content"])
-        blocks.append("\n".join(header))
-
-    return (
-        f"\n\n{ATTACHMENT_START}\n"
-        "以下是系统从用户上传文件中整理出的上下文，请优先基于这些内容回答：\n\n"
-        + "\n\n".join(blocks)
-        + f"\n{ATTACHMENT_END}"
-    )
-
-
-def _build_search_block(search_enabled: bool) -> str:
-    state = "enabled" if search_enabled else "disabled"
-    message = "联网搜索已开启。" if search_enabled else "联网搜索未开启。"
-    return f"\n\n{SEARCH_START}\nstate: {state}\n{message}\n{SEARCH_END}"
-
-
-def build_user_prompt(message: str, attachments: list[dict], search_enabled: bool) -> str:
-    display_text = message.strip()
-    if not display_text and attachments:
-        display_text = "请结合我上传的文件或图片给出分析和回答。"
-    if not display_text:
-        display_text = "请继续。"
-    return display_text + _build_attachment_block(attachments, display_text) + _build_search_block(search_enabled)
-
-
-def _build_user_content(message: str, attachments: list[dict], search_enabled: bool):
-    prompt_text = build_user_prompt(message, attachments, search_enabled)
-    image_attachments = [
-        attachment
-        for attachment in attachments
-        if attachment.get("modality") == "image" and attachment.get("image_url")
-    ]
-
-    if not image_attachments:
-        return prompt_text
-
-    content = [{"type": "text", "text": prompt_text}]
-    for attachment in image_attachments:
-        content.append({"type": "image_url", "image_url": {"url": attachment["image_url"]}})
-    return content
-
-
-def _encode_metadata(attachments: list[dict], search_enabled: bool) -> str:
-    payload = {
-        "attachments": [
-            {
-                "name": attachment["name"],
-                "extension": attachment["extension"],
-                "modality": attachment.get("modality", "text"),
-                "image_url": attachment.get("image_url"),
-                "storage": attachment.get("storage", ""),
-                "object_key": attachment.get("object_key", ""),
-            }
-            for attachment in attachments
-        ],
-        "search_enabled": search_enabled,
-    }
-    return json.dumps(payload, ensure_ascii=False)
-
-
 def _extract_text_content(content) -> str:
     if isinstance(content, str):
         return content
@@ -908,25 +264,6 @@ def _extract_text_content(content) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content or "")
-
-
-def _build_display_text(user_text: str, attachments: list[dict], search_enabled: bool) -> str:
-    safe_text = user_text.strip() or "请结合我上传的文件或图片回答。"
-    metadata = _encode_metadata(attachments, search_enabled)
-    return f"{safe_text}\n\n{ACTIVITY_START}{metadata}{ACTIVITY_END}"
-
-
-def _build_current_travel_plan_block(plan: TravelPlan) -> str:
-    day_lines = []
-    for day in plan.days[:7]:
-        titles = [item.title for item in day.items[:6]]
-        day_lines.append(f"{day.date}: {'、'.join(titles) if titles else '暂无安排'}")
-    return (
-        f"\n\n当前已保存旅行计划（仅作对话上下文，不是私有推理）："
-        f"{plan.destination or '未定目的地'}，{plan.start_date} 至 {plan.end_date}，第 {plan.version} 版。\n"
-        + "\n".join(day_lines)
-        + "\n如用户提出旅行相关修改，应优先基于该计划重规划并保留已锁定项目。"
-    )
 
 
 def _message_mentions_travel_context(message: str) -> bool:
@@ -967,7 +304,21 @@ def _message_mentions_replan(message: str) -> bool:
     )
 
 
+NEGATED_TRAVEL_RE = re.compile(
+    r"(?:不涉及|与.{0,8}无关|不是(?:在问)?|非|无需|不要|不需要)\s*"
+    r"(?:旅行|旅游|出行|行程|路线|交通|车票|机票|酒店|景点|天气)",
+    re.IGNORECASE,
+)
+
+
+def _remove_negated_travel_signals(message: str) -> str:
+    """Keep negated travel words from becoming false positive route signals."""
+
+    return NEGATED_TRAVEL_RE.sub(" ", str(message or ""))
+
+
 def _is_travel_query(message: str, attachments: list[dict]) -> bool:
+    signal_text = _remove_negated_travel_signals(message)
     travel_keywords = [
         "\u65c5\u884c",
         "\u51fa\u884c",
@@ -994,18 +345,17 @@ def _is_travel_query(message: str, attachments: list[dict]) -> bool:
         "\u5c11\u8d70\u8def",
         "\u91cd\u65b0\u89c4\u5212",
     ]
-    if any(keyword in message for keyword in travel_keywords):
+    if any(keyword in signal_text for keyword in travel_keywords):
         return True
 
     # Common natural-language trip requests do not always contain the literal
     # word "旅行" (for example, "帮我安排杭州三日游"). Route those through
-    # the structured planner as well, otherwise they fall into the generic
-    # chat model and no TravelPlan can be persisted.
-    if re.search(r"(?:\d+|[一二两三四五六七八九十百]+)\s*[天日](?:游|旅行|旅游)", message):
+    # the structured planner so a TravelPlan can be persisted when appropriate.
+    if re.search(r"(?:\d+|[一二两三四五六七八九十百]+)\s*[天日](?:游|旅行|旅游)", signal_text):
         return True
-    if re.search(r"(?:规划|安排|定制|设计).{0,24}(?:行程|路线|景点|游玩|旅游|旅行)", message):
+    if re.search(r"(?:规划|安排|定制|设计).{0,24}(?:行程|路线|景点|游玩|旅游|旅行)", signal_text):
         return True
-    if re.search(r"(?:去|到).{0,20}(?:玩|游玩|旅游|旅行)", message):
+    if re.search(r"(?:去|到).{0,20}(?:玩|游玩|旅游|旅行)", signal_text):
         return True
 
     if not attachments:
@@ -1020,15 +370,37 @@ def _looks_like_unclassified_travel_query(message: str, attachments: list[dict])
     """Return whether an unmatched user turn needs scope classification.
 
     This product is travel-only, so every non-empty turn that missed the
-    deterministic travel rules must go through the classifier. The old
-    keyword gate intentionally disappeared: otherwise an unrelated question
-    could fall through to a general-purpose answer agent.
+    deterministic travel rules must go through the classifier. The classifier
+    is the only scope fallback; there is no generic answer path.
     """
 
     if _is_travel_query(message, attachments):
         return False
     text = str(message or "").strip()
     return bool(text or attachments)
+
+
+def _travel_route_kind(
+    message: str,
+    attachments: list[dict],
+    current_plan: TravelPlan | None = None,
+) -> str:
+    """Choose the cheap first-pass route before any model scope fallback.
+
+    Explicit travel language is intentionally handled without a classifier
+    call. A short follow-up can also inherit the active travel context. Only
+    content that misses both signals is eligible for the model scope
+    classifier; the caller may then refuse it safely when the classifier says
+    it is unrelated to travel.
+    """
+
+    if _is_travel_query(message, attachments):
+        return "keyword"
+    if current_plan and (_message_mentions_travel_context(message) or _message_mentions_replan(message)):
+        return "context"
+    if _looks_like_unclassified_travel_query(message, attachments):
+        return "model_fallback"
+    return "out_of_scope"
 
 
 def _coerce_model_bool(value: object) -> bool:
@@ -1249,6 +621,123 @@ def _stream_scope_refusal(message: str):
     yield from _stream_answer_chunks(TRAVEL_SCOPE_REFUSAL, {"scope_refusal": True})
 
 
+def _parse_transport_more_request(
+    message: str,
+    current_plan: TravelPlan,
+) -> tuple[str, int] | None:
+    """Recognize a request for another page of an existing transport result."""
+
+    text = str(message or "").strip()
+    if not text or not any(token in text for token in ("更多", "再给", "再看", "另外", "其他", "剩下", "加载")):
+        return None
+    pages = list(current_plan.transport_pages or [])
+    if not pages:
+        return None
+
+    if any(token in text for token in ("高铁", "动车")):
+        mode = "rail"
+    elif any(token in text for token in ("航班", "飞机", "机票")):
+        mode = "flight"
+    elif len(pages) == 1:
+        mode = pages[0].mode
+    else:
+        return None
+    if not any(page.mode == mode for page in pages):
+        return None
+
+    count = 5
+    if "全部" in text:
+        count = 20
+    else:
+        match = re.search(r"(\d{1,2})\s*(?:条|个|趟|班)?", text)
+        if match:
+            count = max(1, min(20, int(match.group(1))))
+    return mode, count
+
+
+def _transport_page_text(options: list[TransportOption], mode: str, page: TransportPage) -> str:
+    label = "车次" if mode == "rail" else "航班"
+    if not options:
+        return f"当前没有更多{label}了（已显示 {page.total_count} 条）。"
+    lines = [
+        f"已补充 {len(options)} 条{label}（当前显示 {min(page.offset + page.returned_count, page.total_count)} / {page.total_count} 条）。",
+        "",
+    ]
+    for option in options:
+        date_text = f"{option.depart_date or ''} {option.depart_time} → {option.arrive_date or ''} {option.arrive_time}".strip()
+        details = [option.title, date_text, option.duration or "时长待补充"]
+        if option.price:
+            details.append(f"票价 {option.price}")
+        lines.append(f"- {' | '.join(details)}")
+        if option.summary:
+            lines.append(f"  {option.summary}")
+        if option.seats:
+            lines.append(f"  座席/说明：{' / '.join(option.seats)}")
+    return "\n".join(lines).strip()
+
+
+def _stream_transport_more_response(
+    message: str,
+    thread_id: str,
+    current_plan: TravelPlan,
+    *,
+    mode: str,
+    limit: int,
+    user_id: int | None = None,
+):
+    existing_page = next(page for page in current_plan.transport_pages if page.mode == mode)
+    offset = existing_page.offset + existing_page.returned_count
+    try:
+        result = get_transport_page(current_plan, mode, offset=offset, limit=limit)
+    except Exception as exc:
+        _log_activity("tool", "加载更多交通候选失败", type(exc).__name__)
+        yield from _stream_answer_chunks(
+            "暂时无法加载更多交通候选，请稍后重试。",
+            {"travel": True, "transport_options": [], "transport_page": asdict(existing_page)},
+        )
+        return
+
+    for source in result.sources:
+        _log_source_card(
+            title=source.title,
+            url=source.url,
+            summary=source.snippet,
+            evidence_id=source.evidence_id,
+            source_type=source.source_type,
+            provider=source.provider,
+            retrieved_at=source.retrieved_at,
+        )
+    page = result.pages[0] if result.pages else existing_page
+    rendered = _transport_page_text(result.options, mode, page)
+    source_dicts = [asdict(source) for source in result.sources]
+    if thread_id:
+        try:
+            save_travel_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                role="user",
+                content=message.strip(),
+                search_enabled=False,
+            )
+            save_travel_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                role="assistant",
+                content=rendered + encode_assistant_metadata([], source_dicts, [], search_enabled=False),
+                search_enabled=False,
+            )
+        except Exception:
+            _log_activity("storage", "更多交通候选历史保存失败", "turn log write failed")
+    yield from _stream_answer_chunks(
+        rendered,
+        {
+            "travel": True,
+            "transport_options": [asdict(option) for option in result.options],
+            "transport_page": asdict(page),
+        },
+    )
+
+
 def _stream_travel_response(
     message: str,
     thread_id: str,
@@ -1268,6 +757,46 @@ def _stream_travel_response(
     previous_message = str((pending_query or {}).get("raw_text") or "").strip()
     if previous_message and previous_message != message.strip():
         planning_message = f"{previous_message}\n用户补充：{message.strip()}"
+    supervisor_result: TravelSupervisorResult | None = None
+    should_run_supervisor = bool(thread_id)
+    if should_run_supervisor:
+        try:
+            supervisor_query = prepare_travel_query(
+                planning_message,
+                attachments,
+                current_plan=current_plan,
+                extraction_hint=extraction_hint,
+            )
+            blocking_clarification = _build_clarification(supervisor_query)
+            if blocking_clarification is not None:
+                # Missing/ambiguous destination is a hard safety gate. Do not
+                # spend provider quota or let the model invent a city route.
+                _log_activity("think", "需要补充旅行条件", blocking_clarification.code)
+            else:
+                _log_activity("think", "规划工具选择", "由旅行 Supervisor 判断所需数据源", state="running")
+                supervisor_result = run_travel_supervisor(
+                    model,
+                    planning_message,
+                    attachments,
+                    supervisor_query,
+                    search_enabled=search_enabled,
+                    activity_logger=_log_activity,
+                )
+                if supervisor_result.fallback_used:
+                    _log_activity(
+                        "think",
+                        "规划工具选择降级",
+                        "Supervisor 未完成工具决策，改用确定性规划路径",
+                    )
+                else:
+                    _log_activity(
+                        "think",
+                        "规划工具选择完成",
+                        f"模型决定：{supervisor_result.decision or '兼容默认动作'}",
+                    )
+        except Exception as exc:
+            _log_activity("think", "规划工具选择降级", type(exc).__name__)
+            supervisor_result = None
     plan_kwargs = {
         "thread_id": thread_id,
         "search_enabled": search_enabled,
@@ -1276,6 +805,8 @@ def _stream_travel_response(
     }
     if extraction_hint is not None:
         plan_kwargs["extraction_hint"] = extraction_hint
+    if supervisor_result is not None:
+        plan_kwargs["supervisor_result"] = supervisor_result
     response = plan_travel(planning_message, attachments, **plan_kwargs)
     _log_activity("tool", "Build travel context", "Travel context ready")
 
@@ -1323,32 +854,13 @@ def _stream_travel_response(
                         retrieved_at=evidence.retrieved_at,
                         supports=evidence.supports,
                     )
-            try:
-                save_travel_turn(
-                    thread_id=thread_id,
-                    user_id=user_id,
-                    role="user",
-                    content=message.strip() or "请结合附件生成旅行计划。",
-                    attachments=[
-                        {
-                            "name": attachment.get("name", ""),
-                            "extension": attachment.get("extension", ""),
-                            "modality": attachment.get("modality", "text"),
-                            "image_url": attachment.get("image_url"),
-                        }
-                        for attachment in attachments
-                    ],
-                    search_enabled=search_enabled,
-                )
-            except Exception as exc:
-                _log_activity("storage", "旅行请求历史保存失败", str(exc))
-    if response.clarification is not None and thread_id:
+    if thread_id:
         try:
             save_travel_turn(
                 thread_id=thread_id,
                 user_id=user_id,
                 role="user",
-                content=message.strip() or "请补充旅行需求。",
+                content=message.strip() or "请结合附件回答旅行问题。",
                 attachments=[
                     {
                         "name": attachment.get("name", ""),
@@ -1361,7 +873,7 @@ def _stream_travel_response(
                 search_enabled=search_enabled,
             )
         except Exception as exc:
-            _log_activity("storage", "旅行需求澄清历史保存失败", str(exc))
+            _log_activity("storage", "旅行请求历史保存失败", str(exc))
     rendered_with_markers = render_travel_response(response)
     source_dicts = deduplicate_sources([asdict(source) for source in response.sources])
     parsed_answer = parse_answer_citations(
@@ -1371,7 +883,7 @@ def _stream_travel_response(
     )
     rendered = parsed_answer.final_text
     answer_segments = parsed_answer.answer_segments
-    if (saved_plan is not None or response.clarification is not None) and thread_id:
+    if thread_id:
         try:
             save_travel_turn(
                 thread_id=thread_id,
@@ -1385,6 +897,9 @@ def _stream_travel_response(
                     search_enabled=search_enabled,
                     clarification=asdict(response.clarification) if response.clarification else None,
                     pending_query=response.pending_query,
+                    scope_refusal=response.scope_refusal,
+                    decision=response.decision,
+                    decision_reason=response.decision_reason,
                 ),
                 search_enabled=search_enabled,
                 plan=saved_plan,
@@ -1399,6 +914,9 @@ def _stream_travel_response(
             "trip_plan": asdict(saved_plan) if saved_plan is not None and thread_id else None,
             "answer_segments": answer_segments,
             "clarification": asdict(response.clarification) if response.clarification else None,
+            "scope_refusal": response.scope_refusal,
+            "decision": response.decision,
+            "decision_reason": response.decision_reason,
         },
     )
 
@@ -1411,7 +929,6 @@ def stream_chat(
     user_id: int | None = None,
 ):
     _reset_runtime_buffers()
-    _web_search_allowed_var.set(bool(search_enabled))
 
     _log_activity("think", "分析用户问题", message.strip() or "结合上传内容回答", state="running")
     if attachments:
@@ -1433,9 +950,25 @@ def stream_chat(
 
     current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
     pending_query = _get_pending_travel_query(thread_id, user_id=user_id)
-    if _is_travel_query(message, attachments) or (
-        current_plan and (_message_mentions_travel_context(message) or _message_mentions_replan(message))
-    ):
+    if current_plan:
+        more_request = _parse_transport_more_request(message, current_plan)
+        if more_request is not None:
+            mode, limit = more_request
+            return _stream_transport_more_response(
+                message,
+                thread_id,
+                current_plan,
+                mode=mode,
+                limit=limit,
+                user_id=user_id,
+            )
+    route_kind = _travel_route_kind(message, attachments, current_plan)
+    if route_kind in {"keyword", "context"}:
+        _log_activity(
+            "think",
+            "旅行请求已识别",
+            "关键词命中" if route_kind == "keyword" else "沿用当前旅行上下文",
+        )
         return _stream_travel_response(
             message,
             thread_id,
@@ -1445,7 +978,8 @@ def stream_chat(
             pending_query=pending_query,
         )
 
-    if _looks_like_unclassified_travel_query(message, attachments):
+    if route_kind == "model_fallback":
+        _log_activity("think", "进入旅行范围兜底识别", "关键词未命中，交由大模型判断是否为旅行问题")
         extraction_hint = _extract_travel_intent_with_model(
             message,
             attachments,
@@ -1484,6 +1018,8 @@ def _strip_internal_sections(text: str) -> str:
 
 
 def _extract_metadata(text: str) -> dict:
+    """Read metadata from a legacy checkpoint message, if one has it."""
+
     match = re.search(rf"{re.escape(ACTIVITY_START)}([\s\S]*?){re.escape(ACTIVITY_END)}", text)
     if not match:
         return {}
@@ -1527,6 +1063,8 @@ def encode_assistant_metadata(
     clarification: dict | None = None,
     pending_query: dict | None = None,
     scope_refusal: bool = False,
+    decision: str = "",
+    decision_reason: str = "",
 ) -> str:
     payload = {
         "activities": activities or [],
@@ -1541,6 +1079,10 @@ def encode_assistant_metadata(
         payload["pending_query"] = pending_query
     if scope_refusal:
         payload["scope_refusal"] = True
+    if decision:
+        payload["decision"] = decision
+    if decision_reason:
+        payload["decision_reason"] = decision_reason
     return f"\n\n{ASSISTANT_META_START}{json.dumps(payload, ensure_ascii=False)}{ASSISTANT_META_END}"
 
 
@@ -1958,31 +1500,6 @@ def derive_session_title(messages: list[dict]) -> str:
         if attachments:
             return f"文件问答: {attachments[0]['name'][:8]}"
     return DEFAULT_THREAD_TITLE
-
-
-def list_threads() -> list[dict]:
-    rows = connection.execute(
-        """
-        SELECT thread_id, MAX(sort_rowid) AS latest_rowid
-        FROM (
-            SELECT thread_id, rowid AS sort_rowid FROM checkpoints
-            UNION ALL
-            SELECT thread_id, rowid AS sort_rowid FROM writes
-        )
-        GROUP BY thread_id
-        ORDER BY latest_rowid DESC
-        """
-    ).fetchall()
-
-    sessions = []
-    for thread_id, _latest_rowid in rows:
-        try:
-            messages = get_messages(thread_id)
-        except Exception:
-            messages = []
-        title = derive_session_title(messages) if messages else thread_id
-        sessions.append({"thread_id": thread_id, "title": title})
-    return sessions
 
 
 def delete_checkpoint_thread(thread_id: str) -> None:

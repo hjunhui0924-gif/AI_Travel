@@ -18,6 +18,7 @@ from agents.schemas import (
     PoiRecommendation,
     RoutePlan,
     TimelineItem,
+    TransportPage,
     TransportOption,
     TravelConstraint,
     TravelFact,
@@ -25,12 +26,14 @@ from agents.schemas import (
     TravelPlanResponse,
     TravelQuery,
 )
+from agents.travel_supervisor import TravelSupervisorResult
 from services.flight_service import get_flight_options
 from services.poi_recommender import PoiRecommendationResult, recommend_pois
 from services.rail_service import get_rail_options
 from services.route_service import get_route_plans
 from services.trip_extractor import extract_attachment_notes, extract_named_places
 from services.trip_planner import build_timeline
+from services.transport_dates import is_valid_clock_time
 from services.weather_service import get_weather_summary
 from services.answer_citations import citation_marker
 
@@ -443,6 +446,7 @@ def build_travel_query(
         end_date=end_date,
         days=days,
         travelers=travelers,
+        travel_mode=travel_mode,
         preferences=preferences,
         constraints=_extract_constraints(message, preferences),
         duration_is_assumed=not _has_explicit_duration(message) and not isinstance(hinted_days, int),
@@ -492,8 +496,86 @@ def _inherit_previous_requirement(query: TravelQuery, current_plan: TravelPlan |
     return query
 
 
+def prepare_travel_query(
+    message: str,
+    attachments: list[dict],
+    *,
+    current_plan: TravelPlan | None = None,
+    extraction_hint: dict | None = None,
+) -> TravelQuery:
+    """Build the normalized requirement used by both planner and supervisor."""
+
+    return _inherit_previous_requirement(
+        build_travel_query(message, attachments, extraction_hint=extraction_hint),
+        current_plan,
+    )
+
+
 def _should_include_explore(query: TravelQuery) -> bool:
     return query.intent in {"trip_plan", "nearby_explore", "trip_replan"}
+
+
+def _has_effective_travel_data(
+    query: TravelQuery,
+    transport_options: list[TransportOption],
+    route_plans: list[RoutePlan],
+    poi_items: list[PoiRecommendation],
+    weather_summary: str,
+) -> bool:
+    """Return whether provider-backed facts are sufficient for a plan."""
+
+    if any(_is_effective_transport_option(option) for option in transport_options):
+        return True
+    if any(len(route.polyline) >= 2 for route in route_plans):
+        return True
+    if any(item.source_ids and not item.is_placeholder for item in poi_items):
+        return True
+    # Weather is useful context, but by itself cannot support a concrete
+    # itinerary. Require a transport result, route geometry, or a verified
+    # place before creating a TravelPlan.
+    return False
+
+
+def _is_effective_transport_option(option: TransportOption) -> bool:
+    """Reject placeholder transport objects before they can create a plan."""
+
+    return bool(
+        _is_well_formed_transport_option(option)
+        and not option.is_demo
+    )
+
+
+def _is_well_formed_transport_option(option: TransportOption) -> bool:
+    return bool(
+        str(option.title or "").strip()
+        and str(option.provider or "").strip()
+        and is_valid_clock_time(option.depart_time)
+        and is_valid_clock_time(option.arrive_time)
+    )
+
+
+def _plan_is_explicitly_requested(query: TravelQuery) -> bool:
+    """Avoid turning a plain discovery/query turn into a saved itinerary."""
+
+    if query.intent == "trip_replan":
+        return True
+    if query.intent in {"rail_query", "flight_query", "transport_compare"} and not any(
+        token in str(query.raw_text or "")
+        for token in ("规划", "安排", "行程", "攻略", "游玩")
+    ):
+        return False
+    return any(
+        token in str(query.raw_text or "")
+        for token in ("规划", "安排", "生成行程", "制定行程", "行程安排", "定制行程", "设计行程", "几日游", "日游")
+    ) or bool(
+        re.search(
+            r"(?:去|到).{0,20}(?:玩|游玩).{0,8}(?:\d+|[一二两三四五六七八九十]+)\s*[天日]",
+            str(query.raw_text or ""),
+        )
+    )
+
+
+NO_PROVIDER_DATA_NOTICE = "本次没有拿到可用于规划的有效旅行数据，暂不生成行程计划。"
 
 
 def _route_anchor_names_from_recommendations(
@@ -514,6 +596,23 @@ def _route_anchor_names_from_recommendations(
         if len(names) >= 4:
             break
     return names
+
+
+def _transport_page_from_result(mode: str, result, query: TravelQuery) -> TransportPage:
+    high_speed = mode == "rail" and any(
+        token in str(query.raw_text or "")
+        for token in ("高铁", "动车", "G字头", "D字头", "C字头")
+    )
+    returned_count = len(result) if isinstance(result, (list, tuple)) else 0
+    return TransportPage(
+        mode=mode,
+        offset=max(0, int(getattr(result, "offset", 0))),
+        limit=max(1, int(getattr(result, "limit", 5))),
+        returned_count=returned_count,
+        total_count=max(returned_count, int(getattr(result, "total_count", returned_count))),
+        has_more=bool(getattr(result, "has_more", False)),
+        filter="high_speed" if high_speed else "all",
+    )
 
 
 def _build_clarification(query: TravelQuery) -> ClarificationRequest | None:
@@ -721,6 +820,7 @@ def _build_structured_plan(
     thread_id: str,
     search_enabled: bool,
     transport_options: list[TransportOption],
+    transport_pages: list[TransportPage],
     route_plans: list[RoutePlan],
     poi_items: list[PoiRecommendation],
     poi_groups: list[PoiGroup],
@@ -909,6 +1009,7 @@ def _build_structured_plan(
         summary=_build_summary(query),
         days=days,
         transport_options=list(transport_options),
+        transport_pages=list(transport_pages),
         route_plans=list(route_plans),
         out_of_range_items=out_of_range_items,
         facts=facts,
@@ -933,10 +1034,17 @@ def plan_travel(
     current_plan: TravelPlan | None = None,
     activity_logger=None,
     extraction_hint: dict | None = None,
+    supervisor_result: TravelSupervisorResult | None = None,
 ) -> TravelPlanResponse:
-    query = _inherit_previous_requirement(
-        build_travel_query(message, attachments, extraction_hint=extraction_hint),
-        current_plan,
+    query = (
+        supervisor_result.query
+        if supervisor_result is not None and not supervisor_result.fallback_used
+        else prepare_travel_query(
+            message,
+            attachments,
+            current_plan=current_plan,
+            extraction_hint=extraction_hint,
+        )
     )
     clarification = _build_clarification(query)
     if clarification is not None:
@@ -947,28 +1055,70 @@ def plan_travel(
             summary="我可以帮你规划这趟旅行，但需要先确认一个关键信息。",
             clarification=clarification,
             pending_query=asdict(query),
+            decision="clarify",
+            decision_reason="旅行需求缺少可执行的目的地范围。",
         )
+    model_decision = (
+        supervisor_result.decision
+        if supervisor_result is not None and not supervisor_result.fallback_used
+        else ""
+    )
+    if model_decision not in {"answer", "plan", "clarify", "refuse"}:
+        # Direct calls and a failed Supervisor retain the deterministic
+        # planner's historical default. A live Supervisor must provide an
+        # explicit action before it can influence plan creation.
+        model_decision = "plan"
+    plan_requested = _plan_is_explicitly_requested(query)
+    if model_decision == "plan" and not plan_requested:
+        model_decision = "answer"
     has_cross_city_route = bool(query.origin and query.destination and query.origin != query.destination)
 
     should_fetch_transport = query.intent in {"rail_query", "flight_query", "transport_compare", "trip_plan", "trip_replan"}
-    rail_requested = should_fetch_transport and not (
-        query.intent == "flight_query" and query.travel_mode == "flight"
-    )
-    flight_requested = should_fetch_transport and not (
-        query.intent == "rail_query" and query.travel_mode == "rail"
-    )
+    if query.intent == "transport_compare":
+        # An explicit comparison is the one case where both providers are
+        # intentionally queried.
+        rail_requested = should_fetch_transport
+        flight_requested = should_fetch_transport
+    elif query.intent == "rail_query" or query.travel_mode == "rail":
+        rail_requested = should_fetch_transport
+        flight_requested = False
+    elif query.intent == "flight_query" or query.travel_mode == "flight":
+        rail_requested = False
+        flight_requested = should_fetch_transport
+    else:
+        # A general trip plan may benefit from both transport options.
+        rail_requested = should_fetch_transport
+        flight_requested = should_fetch_transport
     rail_options: list[TransportOption] = []
     flight_options: list[TransportOption] = []
+    transport_pages: list[TransportPage] = []
     alerts: list[str] = []
     risks: list[str] = []
     conflicts: list[str] = []
     diagnostics: list[str] = []
     adapter_status: dict[str, str] = {}
 
-    if rail_requested and query.origin and query.destination and query.date:
+    if supervisor_result is not None and not supervisor_result.fallback_used:
+        rail_options = [item for item in supervisor_result.transport_options if item.mode == "rail"]
+        flight_options = [item for item in supervisor_result.transport_options if item.mode == "flight"]
+        transport_pages = list(supervisor_result.transport_pages)
+        route_plans = list(supervisor_result.route_plans)
+        poi_items = list(supervisor_result.poi_items)
+        poi_groups = list(supervisor_result.poi_groups)
+        poi_sources = list(supervisor_result.sources)
+        poi_errors = []
+        weather_summary = supervisor_result.weather_summary
+        adapter_status.update(supervisor_result.adapter_status)
+        diagnostics.extend(
+            list(dict.fromkeys([*supervisor_result.errors, *supervisor_result.diagnostics]))
+        )
+        if supervisor_result.fallback_used:
+            diagnostics.append("Supervisor 未完成工具决策，已回退确定性旅行规划。")
+    elif rail_requested and query.origin and query.destination and query.date:
         try:
             rail_result = get_rail_options(query)
             rail_options = list(rail_result)
+            transport_pages.append(_transport_page_from_result("rail", rail_result, query))
             rail_errors = list(getattr(rail_result, "errors", []) or [])
             if rail_errors:
                 adapter_status["rail"] = "partial" if rail_options else "failed"
@@ -984,10 +1134,13 @@ def plan_travel(
     else:
         adapter_status["rail"] = "not_requested"
 
-    if flight_requested and query.origin and query.destination and query.date:
+    if supervisor_result is not None and not supervisor_result.fallback_used:
+        pass
+    elif flight_requested and query.origin and query.destination and query.date:
         try:
             flight_result = get_flight_options(query)
             flight_options = list(flight_result)
+            transport_pages.append(_transport_page_from_result("flight", flight_result, query))
             flight_errors = list(getattr(flight_result, "errors", []) or [])
             if flight_errors:
                 adapter_status["flight"] = "partial" if flight_options else "failed"
@@ -1006,12 +1159,37 @@ def plan_travel(
             adapter_status["flight"] = "failed"
             diagnostics.append(_flight_failure_detail(exc))
             alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
-    else:
+    elif supervisor_result is None or supervisor_result.fallback_used:
         adapter_status["flight"] = "not_requested"
-    transport_options = rail_options + flight_options
+    rail_options = [item for item in rail_options if _is_well_formed_transport_option(item)]
+    flight_options = [item for item in flight_options if _is_well_formed_transport_option(item)]
+    if supervisor_result is not None and not supervisor_result.fallback_used:
+        # The supervisor has already made the provider calls. Keep only the
+        # selected mode results and do not call adapters a second time.
+        transport_options = rail_options + flight_options
+    else:
+        transport_options = rail_options + flight_options
 
-    include_explore = _should_include_explore(query)
-    if include_explore:
+    include_explore = _should_include_explore(query) or (
+        model_decision == "plan" and plan_requested
+    )
+    if supervisor_result is not None and not supervisor_result.fallback_used:
+        if include_explore:
+            has_route_geometry = any(len(route.polyline) >= 2 for route in route_plans)
+            if not has_route_geometry and not query.named_places:
+                route_anchor_names = _route_anchor_names_from_recommendations(poi_items)
+                if len(route_anchor_names) >= 2:
+                    route_query = deepcopy(query)
+                    route_query.named_places = route_anchor_names
+                    # A model-led run may choose POI without choosing a route.
+                    # Do not silently make another provider call here; the
+                    # supervisor owns tool selection for this turn.
+            web_search_status = adapter_status.get("web_search", "not_requested")
+        else:
+            route_plans = []
+            poi_items, poi_groups, poi_sources, poi_errors = [], [], [], []
+            web_search_status = "not_requested"
+    elif include_explore:
         try:
             route_result = get_route_plans(query)
             route_plans = list(route_result)
@@ -1096,7 +1274,9 @@ def plan_travel(
         adapter_status["poi"] = "not_requested"
 
     weather_requested = _should_include_weather(query)
-    if weather_requested:
+    if supervisor_result is not None and not supervisor_result.fallback_used:
+        adapter_status.setdefault("weather", "success" if weather_summary else "not_requested")
+    elif weather_requested:
         try:
             weather_summary = get_weather_summary(query.destination or query.city, forecast=True)
             adapter_status["weather"] = "success" if weather_summary else "empty"
@@ -1147,11 +1327,118 @@ def plan_travel(
             )
         )
 
+    if model_decision == "refuse":
+        return TravelPlanResponse(
+            intent=query.intent,
+            summary=(supervisor_result.answer if supervisor_result else "抱歉，这个请求不在旅行规划服务范围内。"),
+            transport_options=transport_options,
+            route_plans=route_plans,
+            poi_recommendations=poi_items,
+            poi_groups=poi_groups,
+            weather_summary=weather_summary,
+            alerts=alerts,
+            diagnostics=diagnostics,
+            adapter_status=adapter_status,
+            sources=sources,
+            decision="refuse",
+            decision_reason=(supervisor_result.decision_reason if supervisor_result else "模型未授权生成旅行计划。"),
+            scope_refusal=True,
+        )
+
+    if model_decision == "clarify":
+        model_clarification = ClarificationRequest(
+            code="model_clarification",
+            prompt=(
+                supervisor_result.answer.strip()
+                if supervisor_result is not None and supervisor_result.answer.strip()
+                else "我还需要补充出发地、日期或其他旅行条件，才能继续处理。"
+            ),
+        )
+        return TravelPlanResponse(
+            intent=query.intent,
+            summary="我还需要补充一些旅行条件，才能继续处理。",
+            transport_options=transport_options,
+            route_plans=route_plans,
+            transport_pages=transport_pages,
+            poi_recommendations=poi_items,
+            poi_groups=poi_groups,
+            weather_summary=weather_summary,
+            alerts=alerts,
+            diagnostics=diagnostics,
+            adapter_status=adapter_status,
+            sources=sources,
+            clarification=model_clarification,
+            pending_query=asdict(query),
+            decision="clarify",
+            decision_reason=(supervisor_result.decision_reason if supervisor_result else "旅行条件仍不完整。"),
+        )
+
+    if model_decision == "answer" or (
+        supervisor_result is None and not _plan_is_explicitly_requested(query)
+    ):
+        has_effective_data = _has_effective_travel_data(
+            query, transport_options, route_plans, poi_items, weather_summary
+        )
+        if not has_effective_data:
+            alerts.extend(item for item in poi_errors if item not in alerts)
+            alerts.append(NO_PROVIDER_DATA_NOTICE)
+        answer = (
+            supervisor_result.answer
+            if supervisor_result is not None and supervisor_result.answer
+            else _build_summary(query)
+        )
+        return TravelPlanResponse(
+            intent=query.intent,
+            summary=answer,
+            transport_options=transport_options,
+            route_plans=route_plans,
+            transport_pages=transport_pages,
+            poi_recommendations=poi_items,
+            poi_groups=poi_groups,
+            weather_summary=weather_summary,
+            alerts=alerts,
+            extracted_context=query.attachment_notes,
+            diagnostics=diagnostics,
+            adapter_status=adapter_status,
+            sources=sources,
+            decision="answer",
+            decision_reason=(supervisor_result.decision_reason if supervisor_result else "本轮未明确要求生成行程。"),
+        )
+
+    if not _has_effective_travel_data(query, transport_options, route_plans, poi_items, weather_summary):
+        alerts.extend(item for item in poi_errors if item not in alerts)
+        alerts.append(NO_PROVIDER_DATA_NOTICE)
+        no_data_summary = (
+            supervisor_result.answer.strip()
+            if supervisor_result is not None and supervisor_result.answer.strip()
+            else ""
+        )
+        if no_data_summary and NO_PROVIDER_DATA_NOTICE not in no_data_summary:
+            no_data_summary = f"{no_data_summary}\n\n{NO_PROVIDER_DATA_NOTICE}"
+        return TravelPlanResponse(
+            intent=query.intent,
+            summary=no_data_summary or NO_PROVIDER_DATA_NOTICE,
+            transport_options=transport_options,
+            route_plans=route_plans,
+            transport_pages=transport_pages,
+            poi_recommendations=poi_items,
+            poi_groups=poi_groups,
+            weather_summary=weather_summary,
+            alerts=alerts,
+            extracted_context=query.attachment_notes,
+            diagnostics=diagnostics,
+            adapter_status=adapter_status,
+            sources=sources,
+            decision="answer",
+            decision_reason="没有有效 provider 数据。",
+        )
+
     plan = _build_structured_plan(
         query,
         thread_id=thread_id,
         search_enabled=search_enabled,
         transport_options=transport_options,
+        transport_pages=transport_pages,
         route_plans=route_plans,
         poi_items=poi_items,
         poi_groups=poi_groups,
@@ -1169,6 +1456,7 @@ def plan_travel(
         summary=_build_summary(query),
         transport_options=transport_options,
         route_plans=route_plans,
+        transport_pages=transport_pages,
         timeline=timeline,
         poi_recommendations=poi_items,
         poi_groups=poi_groups,
@@ -1180,10 +1468,59 @@ def plan_travel(
         trip_plan=plan,
         sources=plan.sources,
         conflicts=plan.conflicts,
+        decision="plan",
+        decision_reason=(supervisor_result.decision_reason if supervisor_result else "已明确提出行程规划需求，且取得有效数据。"),
     )
 
 
 def render_travel_response(response: TravelPlanResponse) -> str:
+    """Render a compact conversational summary for persisted plans.
+
+    The structured plan panel is the canonical home for full route, ticket,
+    POI, and weather details. Chat should explain what is ready and point the
+    user there instead of duplicating a raw provider dump.
+    """
+
+    if response.trip_plan is not None:
+        plan = response.trip_plan
+        lines = [response.summary]
+        lines.append(
+            f"计划日期：{plan.start_date} 至 {plan.end_date}（第 {plan.version or 1} 版草案）"
+        )
+
+        if plan.transport_pages:
+            for page in plan.transport_pages:
+                label = "车次" if page.mode == "rail" else "航班" if page.mode == "flight" else "交通候选"
+                lines.append(
+                    f"已查询到 {page.total_count or page.returned_count} 条{label}，当前先展示 {page.returned_count} 条。"
+                )
+        elif response.transport_options:
+            mode_counts: dict[str, int] = {}
+            for option in response.transport_options:
+                mode_counts[option.mode] = mode_counts.get(option.mode, 0) + 1
+            label = "、".join(
+                f"{count} 条{'车次' if mode == 'rail' else '航班' if mode == 'flight' else '交通'}"
+                for mode, count in mode_counts.items()
+            )
+            lines.append(f"已查询到 {label}。")
+        route_count = sum(1 for route in response.route_plans if len(route.polyline) >= 2)
+        if route_count:
+            lines.append(f"已生成 {route_count} 段地图路线。")
+        if response.poi_recommendations:
+            lines.append(f"已整理 {len(response.poi_recommendations)} 个已验证地点。")
+        if response.weather_summary:
+            lines.append("已附加目的地天气参考。")
+        if response.alerts or plan.risks or plan.conflicts:
+            issue_count = len(response.alerts) + len(plan.risks) + len(plan.conflicts)
+            lines.append(f"当前有 {issue_count} 条提醒或风险，请在“状态”中查看详情。")
+
+        lines.append("详细行程已同步到行程计划面板，可查看每日安排、路线地图和数据来源。")
+        return "\n\n".join(lines).strip()
+
+    return _render_detailed_travel_response(response)
+
+
+def _render_detailed_travel_response(response: TravelPlanResponse) -> str:
     lines = [response.summary]
     if response.clarification:
         lines.extend(["", response.clarification.prompt])

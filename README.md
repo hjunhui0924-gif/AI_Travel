@@ -26,6 +26,8 @@
 - 旅行范围识别：规则优先；规则未命中时由大模型做受约束的旅行范围分类和字段抽取，非旅行问题礼貌拒答
 - 交互式路线地图：配置高德 Web 端 JS API 后支持缩放、拖拽、路线自适应和起终点标记
 - 流式回答：旅行规划、澄清和范围拒答均通过 SSE 分段回传，前端按增量文本渲染
+- 大模型主导决策：关键词/规则先做低成本意图识别，未命中时由大模型范围兜底；旅行 Supervisor 再选择工具并决定追问、回答或生成计划，代码负责权限、参数、来源、数据真实性和最终计划门控
+- 交通候选分页：首次展示 5 条车次/航班，支持“加载更多”或继续询问“再给我 N 条”，每页保留总数与查询来源
 - 可视化回答：对出行类问题优先渲染更结构化的结果面板，而不是纯文本长回复
 - 多会话管理：支持新建、切换、删除历史会话
 - 登录与会话隔离：不同账号只能看到自己的聊天记录
@@ -70,7 +72,6 @@
 - Backend: `FastAPI`
 - Agent orchestration: `LangChain`, `LangGraph`
 - Frontend: `Vue 3 + TypeScript + Vite + Pinia`
-- Vector retrieval: `ChromaDB`
 - Web search: `Tavily`（可选）
 - Map / Weather: `AMap Web API`（可选）
 - 旅行识别：规则优先，未命中的消息由大模型做旅行范围分类和结构化抽取兜底，不提供通用问答
@@ -186,18 +187,26 @@ stream_chat 读取 current_plan / pending_query
    │             │              ↓
    └──────┬──────┘          SSE 范围拒答
           ↓
-旅行规划 Agent 合并上下文并校验条件
-   ┌──────┴────────┐
-条件不足            条件齐全
-   ↓                    ↓
-ClarificationRequest   高德 / 天气 / 交通 / 搜索适配器
-   ↓                    ↓
-SSE → Pinia → 澄清卡片   规划模型生成 TravelPlan
-   ↓                    ↓
-用户补充后再次提交      SSE → Pinia → 行程面板、日历、RouteMap
+旅行规划 Supervisor 由大模型判断需要哪些工具及本轮动作
+          ↓
+高德 / 天气 / 交通 / 搜索工具按需调用
+          ↓
+大模型读取工具结果 → clarify / answer / plan / refuse
+          ↓
+代码校验动作和数据 → 仅在 plan 条件满足时生成 TravelPlan
+          ↓
+SSE → Pinia → 行程面板、日历、RouteMap
+          ↑
+条件不足 → ClarificationRequest → 用户补充后再次提交
 ```
 
-信息不足时不会创建“目的地待定”的空计划，也不会提前调用路线、POI、天气或交通适配器。未指定景点时，系统会从已经通过地图验证的城市景点推荐中选择路线锚点，不会从未经验证的文本地点生成路线。计划生成后自动展开行程面板；`RouteMap` 优先使用高德 JS API 进行缩放、拖拽和自动适配。
+信息不足时不会创建“目的地待定”的空计划，也不会提前调用路线、POI、天气或交通适配器。未指定景点时，系统会从已经通过地图验证的城市景点推荐中选择路线锚点，不会从未经验证的文本地点生成路线。只有用户明确需要规划且拿到有效 provider 数据时才生成 TravelPlan；生成后不自动展开面板，而是在“行程计划”按钮显示红点，`RouteMap` 优先使用高德 JS API 进行缩放、拖拽和自动适配。
+
+完成的旅行计划在聊天区只显示摘要；车票、路线、天气、POI 和风险详情放在行程计划面板中，避免把原始 provider 数据堆成一长段文本。聊天工作台的消息容器使用局部液态玻璃层，页面风景背景保持独立；等待内容增长时使用稳定滚动槽，减少水平跳动。
+
+旅行 Supervisor 的边界是“模型决定需要什么工具和本轮动作，代码决定工具能否执行以及是否允许保存计划”：API Key、用户权限、联网搜索开关、参数合法性、超时、来源绑定、演示数据标记和最终 `TravelPlan` 校验仍由代码控制。查询车票/航班/地点时默认只回答，不创建行程；模型决策无效、模型失败或没有有效 provider 数据时，不保存计划并向用户说明原因。
+
+提示词边界：Supervisor 的 `SystemMessage` 只包含固定角色、工具白名单、调用限制、联网搜索权限和动作协议；用户原话、服务端提取的旅行字段和附件元数据统一放在独立的 `HumanMessage` 中，并标记为不可信数据。范围分类器同样不允许用户内容进入系统消息。用户内容、附件内容和网页搜索结果都不能改变系统规则、工具权限或会话权限。
 
 ## 环境变量说明
 
@@ -217,15 +226,6 @@ SSE → Pinia → 澄清卡片   规划模型生成 TravelPlan
 - `DEEPSEEK_API_KEY`
 - `DEEPSEEK_BASE_URL`
 
-### 文件检索 / Embedding
-
-- `EMBEDDING_API_KEY`
-- `EMBEDDING_BASE_URL`
-- `EMBEDDING_MODEL`
-- `OPENAI_EMBEDDING_MODEL`
-
-如果不单独配置，会优先复用主模型 key。
-
 ### 搜索与时效信息
 
 - `TAVILY_API_KEY`
@@ -238,6 +238,16 @@ SSE → Pinia → 澄清卡片   规划模型生成 TravelPlan
 - `VITE_AMAP_SECURITY_JS_CODE`（可选；高德 JS API 安全密钥）
 
 `VITE_*` 变量会进入浏览器构建产物，只能使用已在高德控制台配置域名白名单的 Web 端 Key；不要把 Web Service Key 或其他服务端密钥写入 `VITE_*` 变量。
+
+### 交通候选分页
+
+`TravelPlan.transport_pages` 记录每种交通类型的 `offset`、`limit`、`returned_count`、`total_count`、`has_more` 和筛选条件。前端可调用：
+
+```text
+GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
+```
+
+分页接口只重新查询并整理 provider 数据，不由大模型补写车次或航班。铁路查询表达“高铁/动车”时只保留 G、D、C 字头；12306 余票接口没有可靠票价时不显示金额。
 
 ### 航班 Bridge
 
@@ -341,19 +351,16 @@ python -m services.integration_health --live --only flight_mcp
 - `.webp`
 - `.gif`
 
-## 文档检索说明
+## 文件上下文说明
 
-上传文本附件后，系统会先解析内容，再进入本地 Chroma 检索流程。  
-当前策略更偏向“旅行问答主流程 + 文件补充上下文”，适合：
+上传文本附件后，系统会在服务端解析并按页、工作表或段落切分为有界上下文，随后由旅行范围分类与旅行 Supervisor 按当前需求使用。当前策略更偏向“旅行问答主流程 + 文件补充上下文”，适合：
 
 - 行程单解读
 - 酒店 / 车票 /机票截图辅助识别
 - 攻略文档补充问答
 - 会议出差资料和行程需求一起提问
 
-Chroma 运行时目录默认写入：
-
-- `resources/chroma_runtime/`
+系统不会再为附件创建本地向量库；无法可靠提取的内容会保留明确提示，不会被当作已验证事实。
 
 ## 适用场景
 

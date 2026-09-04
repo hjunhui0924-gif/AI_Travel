@@ -1,5 +1,5 @@
 <script setup lang="ts">
-defineProps<{ hasMessages?: boolean }>();
+defineProps<{ hasMessages?: boolean; hasPlan?: boolean; hasNewPlan?: boolean }>();
 const emit = defineEmits<{ open: [] }>();
 </script>
 
@@ -19,9 +19,10 @@ const emit = defineEmits<{ open: [] }>();
       </svg>
     </span>
     <span class="workspace-plan-dock-copy">
-      <strong>行程计划</strong>
-      <small>{{ hasMessages ? "查看当前对话的旅行安排" : "先探索，再把灵感装进行程" }}</small>
+      <strong>行程计划<span v-if="hasNewPlan" class="workspace-plan-dock-new-label">有新安排</span></strong>
+      <small>{{ hasPlan ? (hasNewPlan ? "刚生成一份旅行安排，点击查看" : "查看当前对话的旅行安排") : "先探索，再把灵感装进行程" }}</small>
     </span>
+    <span v-if="hasNewPlan" class="workspace-plan-dock-badge" aria-label="有新的行程计划"></span>
     <svg class="workspace-plan-dock-arrow" viewBox="0 0 24 24" aria-hidden="true">
       <path d="M7 12h10" />
       <path d="m13 7 5 5-5 5" />

@@ -4,6 +4,7 @@ import type {
   AuthMeResponse,
   CalendarResponse,
   DonePayload,
+  Evidence,
   HistoryMessage,
   PlanDay,
   PlanItem,
@@ -11,6 +12,8 @@ import type {
   SourceInfo,
   ThreadInfo,
   TravelPlan,
+  TransportOption,
+  TransportPage,
   UserInfo,
 } from "../types/api";
 import {
@@ -146,6 +149,30 @@ export function getTravelPlanMap(threadId: string, version?: number | null) {
   return apiDownload(
     `/travel/plans/${encodeURIComponent(threadId)}/map${query}`,
   );
+}
+
+export function getTransportPage(
+  threadId: string,
+  mode: "rail" | "flight",
+  offset: number,
+  limit = 5,
+  version?: number | null,
+) {
+  const params = new URLSearchParams({
+    mode,
+    offset: String(Math.max(0, offset)),
+    limit: String(Math.max(1, Math.min(20, limit))),
+  });
+  if (version) params.set("version", String(version));
+  return apiGet<{
+    status: string;
+    plan_id: string;
+    version: number;
+    options: TransportOption[];
+    page: TransportPage | null;
+    sources: Evidence[];
+    errors: string[];
+  }>(`/travel/plans/${encodeURIComponent(threadId)}/transport?${params.toString()}`);
 }
 
 export interface PlanShareInfo {

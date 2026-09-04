@@ -10,7 +10,17 @@ from starlette.requests import Request
 
 import app as app_module
 from agents import agent as agent_module
-from agents.schemas import PlanDay, PlanItem, RoutePlan, TravelPlan, TravelPlanResponse
+from agents.schemas import (
+    Evidence,
+    PlanDay,
+    PlanItem,
+    RoutePlan,
+    TransportPage,
+    TransportOption,
+    TransportQueryPage,
+    TravelPlan,
+    TravelPlanResponse,
+)
 from services.travel_store import (
     delete_travel_thread,
     ensure_guest_access,
@@ -156,7 +166,16 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
     thread_id = f"guest_{uuid4().hex}"
     expected_versions = []
 
-    def fake_plan(message, attachments, *, thread_id="", search_enabled=False, current_plan=None, activity_logger=None):
+    def fake_plan(
+        message,
+        attachments,
+        *,
+        thread_id="",
+        search_enabled=False,
+        current_plan=None,
+        activity_logger=None,
+        supervisor_result=None,
+    ):
         plan = TravelPlan(
             plan_id="",
             thread_id=thread_id,
@@ -204,6 +223,158 @@ def test_chat_done_contains_structured_plan_and_version(monkeypatch):
         delete_travel_thread(thread_id)
 
 
+def test_replan_uses_supervisor_before_composing_new_plan(monkeypatch):
+    from agents.travel_supervisor import TravelSupervisorResult
+
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    current = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+    )
+    app_module.save_plan_version(current, expected_version=0)
+    captured = {}
+
+    def fake_supervisor(model, message, attachments, query, **kwargs):
+        captured["query"] = query
+        return TravelSupervisorResult(query=query, decision="plan")
+
+    def fake_plan(message, attachments, **kwargs):
+        captured["supervisor_result"] = kwargs.get("supervisor_result")
+        plan = TravelPlan(
+            plan_id="",
+            thread_id=thread_id,
+            version=0,
+            timezone="Asia/Shanghai",
+            start_date="2026-09-02",
+            end_date="2026-09-02",
+            destination="杭州",
+            days=[PlanDay(date="2026-09-02", day_number=1)],
+            transport_options=[TransportOption(mode="rail", title="G123", provider="12306", depart_time="08:00", arrive_time="09:00")],
+        )
+        return TravelPlanResponse(intent="trip_replan", summary="已完成调整。", trip_plan=plan)
+
+    monkeypatch.setattr(app_module, "run_travel_supervisor", fake_supervisor)
+    monkeypatch.setattr(app_module, "plan_travel", fake_plan)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.post(
+            f"/travel/plans/{thread_id}/replan",
+            json={"message": "调整为轻松节奏", "search_enabled": False},
+        )
+
+        assert response.status_code == 200
+        assert captured["query"].destination == "杭州"
+        assert captured["supervisor_result"].decision == "plan"
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_replan_hides_internal_provider_errors(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    current = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+    )
+    app_module.save_plan_version(current, expected_version=0)
+
+    def failing_supervisor(*args, **kwargs):
+        raise RuntimeError("provider-secret-token /private/provider/path")
+
+    monkeypatch.setattr(app_module, "run_travel_supervisor", failing_supervisor)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.post(
+            f"/travel/plans/{thread_id}/replan",
+            json={"message": "调整为轻松节奏", "search_enabled": False},
+        )
+
+        assert response.status_code == 500
+        assert app_module.INTERNAL_SSE_ERROR_MESSAGE in response.text
+        assert "provider-secret-token" not in response.text
+        assert "/private/provider/path" not in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_transport_pagination_endpoint_returns_structured_page(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    plan = TravelPlan(
+        plan_id="",
+        thread_id=thread_id,
+        version=0,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        origin="上海",
+        destination="杭州",
+        days=[PlanDay(date="2026-09-02", day_number=1)],
+        transport_options=[
+            TransportOption(mode="rail", title=f"G10{i}") for i in range(5)
+        ],
+        transport_pages=[
+            TransportPage(mode="rail", returned_count=5, total_count=8, has_more=True, filter="high_speed")
+        ],
+    )
+    app_module.save_plan_version(plan)
+    page = TransportPage(
+        mode="rail",
+        offset=5,
+        limit=3,
+        returned_count=3,
+        total_count=8,
+        has_more=False,
+        filter="high_speed",
+    )
+    option = TransportOption(mode="rail", title="G105", source_ids=["transport_rail_006"])
+    source = Evidence(
+        evidence_id="transport_rail_006",
+        source_type="rail_realtime",
+        provider="12306",
+        title="G105",
+        reliability="adapter_result",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "get_transport_page",
+        lambda *args, **kwargs: TransportQueryPage(options=[option], pages=[page], sources=[source]),
+    )
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    try:
+        response = client.get(
+            f"/travel/plans/{thread_id}/transport?mode=rail&offset=5&limit=3"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["options"][0]["title"] == "G105"
+        assert payload["page"]["has_more"] is False
+        assert payload["page"]["filter"] == "high_speed"
+        assert payload["sources"][0]["provider"] == "12306"
+    finally:
+        delete_travel_thread(thread_id)
+
+
 def test_chat_clarification_for_province_trip_is_structured_and_persisted():
     thread_id = f"guest_{uuid4().hex}"
     guest_token = ensure_guest_access(thread_id)
@@ -236,12 +407,32 @@ def test_chat_clarification_for_province_trip_is_structured_and_persisted():
 
 def test_chat_clarification_follow_up_merges_original_requirement(monkeypatch):
     from agents import travel_agent
+    from agents import travel_supervisor
+    from agents.travel_supervisor import TravelSupervisorResult
 
     monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
     monkeypatch.setattr(travel_agent, "get_route_plans", lambda query: [])
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
     monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
     monkeypatch.setattr(travel_agent, "get_weather_summary", lambda location, forecast=False: "")
+    monkeypatch.setattr(travel_supervisor, "recommend_pois", lambda *args, **kwargs: ([], [], [], []))
+    monkeypatch.setattr(travel_supervisor, "get_route_plans", lambda *args, **kwargs: [])
+    monkeypatch.setattr(travel_supervisor, "get_rail_options", lambda *args, **kwargs: [])
+    monkeypatch.setattr(travel_supervisor, "get_flight_options", lambda *args, **kwargs: [])
+    monkeypatch.setattr(travel_supervisor, "get_weather_summary", lambda *args, **kwargs: "")
+    captured_query = {}
+
+    def fake_supervisor(model, message, attachments, query, **kwargs):
+        captured_query.update(
+            {
+                "destination": query.destination,
+                "destination_cities": list(query.destination_cities),
+                "origin": query.origin,
+            }
+        )
+        return TravelSupervisorResult(query=query, decision="plan")
+
+    monkeypatch.setattr(agent_module, "run_travel_supervisor", fake_supervisor)
 
     thread_id = f"guest_{uuid4().hex}"
     guest_token = ensure_guest_access(thread_id)
@@ -270,9 +461,13 @@ def test_chat_clarification_follow_up_merges_original_requirement(monkeypatch):
         )
         done = done_payload(second)
         assert done["clarification"] is None
-        assert done["trip_plan"]["destination"] == "江苏"
-        assert done["trip_plan"]["destination_cities"] == ["南京", "扬州"]
-        assert done["trip_plan"]["origin"] == "上海"
+        assert done["trip_plan"] is None
+        assert "暂不生成行程计划" in done["final_text"]
+        assert captured_query == {
+            "destination": "江苏",
+            "destination_cities": ["南京", "扬州"],
+            "origin": "上海",
+        }
     finally:
         delete_travel_thread(thread_id)
 
@@ -282,12 +477,7 @@ def test_chat_rejects_non_travel_question_after_scope_classification(monkeypatch
         def invoke(self, messages):
             return AIMessage(content='{"is_travel_request": false}')
 
-    class UnexpectedGeneralAgent:
-        def stream(self, *args, **kwargs):
-            raise AssertionError("non-travel questions must not reach a general agent")
-
     monkeypatch.setattr(agent_module, "model", FakeModel())
-    monkeypatch.setattr(agent_module, "agent_without_search", UnexpectedGeneralAgent())
 
     thread_id = f"guest_{uuid4().hex}"
     guest_token = ensure_guest_access(thread_id)

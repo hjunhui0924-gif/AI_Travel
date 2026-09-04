@@ -9,6 +9,8 @@ import type {
   PlanItem,
   PlanVersionSummary,
   SourceInfo,
+  TransportOption,
+  TransportPage,
   TravelPlan,
 } from "../types/api";
 import { useSessionStore } from "./session";
@@ -34,6 +36,8 @@ export const usePlanStore = defineStore("plan", {
     // The plan is a floating bottom sheet in the workspace. Keep it closed
     // until the user opens the dock so the exploration surface stays clear.
     panelOpen: false,
+    /** A newly generated plan stays unread until the user opens the panel. */
+    planUnread: false,
     activeTab: "itinerary" as PanelTab,
     /** Sources attached to the latest assistant answer (chat-level). */
     messageSources: [] as SourceInfo[],
@@ -44,6 +48,8 @@ export const usePlanStore = defineStore("plan", {
     replanning: false,
     exportingFormat: "" as "" | "markdown" | "json",
     sharing: false,
+    transportLoadingMode: "" as "" | "rail" | "flight",
+    transportError: "",
     shareUrl: "",
     shareCopied: false,
     error: "",
@@ -93,17 +99,20 @@ export const usePlanStore = defineStore("plan", {
       this.highlightedSourceIds = ids;
       this.activeTab = "sources";
       this.panelOpen = true;
+      this.planUnread = false;
     },
-    applyPlan(plan: TravelPlan) {
+    openPanel() {
+      this.panelOpen = true;
+      this.planUnread = false;
+    },
+    applyPlan(plan: TravelPlan, options: { markUnread?: boolean } = {}) {
       this.plan = plan;
       this.viewingPlan = null;
       this.viewingVersion = null;
       this.conflict409 = null;
       this.activeTab = "itinerary";
-      // A newly generated plan should reveal its structured result
-      // immediately. Otherwise the route map stays inside the hidden plan
-      // sheet and users only see the chat background after submitting.
-      this.panelOpen = true;
+      if (options.markUnread === true) this.planUnread = true;
+      if (options.markUnread === false) this.planUnread = false;
       this.dayCache = {};
       for (const day of plan.days) {
         this.dayCache[dayCacheKey(plan.thread_id, plan.version, day.date)] = day;
@@ -152,10 +161,6 @@ export const usePlanStore = defineStore("plan", {
         this.versions = res.versions ?? [];
         if (res.plan) {
           this.plan = res.plan;
-          // Existing plans should behave like newly generated plans: if a
-          // route is available, keep it discoverable after a refresh or
-          // session switch instead of leaving it inside a hidden sheet.
-          this.panelOpen = true;
           this.viewingPlan = null;
           this.viewingVersion = null;
           this.dayCache = {};
@@ -301,6 +306,100 @@ export const usePlanStore = defineStore("plan", {
           return;
         }
         this.error = (e as ApiError).message;
+      }
+    },
+    appendTransportOptions(
+      options: TransportOption[],
+      page: TransportPage,
+      sources: SourceInfo[] = [],
+    ) {
+      if (!this.plan) return;
+      const existing = this.plan.transport_options ?? [];
+      const signature = (option: TransportOption) =>
+        [
+          option.mode,
+          option.title,
+          option.depart_date,
+          option.depart_time,
+          option.arrive_date,
+          option.arrive_time,
+        ].join("|");
+      const seen = new Set(existing.map(signature));
+      const appended = (options ?? []).filter((option) => {
+        const key = signature(option);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      this.plan.transport_options = [...existing, ...appended];
+      const knownSourceIds = new Set(
+        (this.plan.sources ?? []).map((source) => source.evidence_id),
+      );
+      const normalizedSources = (sources ?? [])
+        .filter((source) => source.evidence_id && !knownSourceIds.has(source.evidence_id))
+        .map((source) => ({
+          evidence_id: source.evidence_id ?? "",
+          source_type: source.source_type ?? "unknown",
+          provider: source.provider ?? "unknown",
+          title: source.title ?? "",
+          url: source.url ?? "",
+          snippet: source.snippet ?? source.summary ?? "",
+          retrieved_at: source.retrieved_at ?? source.source_date ?? "",
+          valid_until: source.valid_until ?? "",
+          freshness: source.freshness ?? "unknown",
+          reliability: source.reliability ?? "unknown",
+          supports: source.supports ?? [],
+          is_demo: source.is_demo ?? false,
+        }));
+      this.plan.sources = [...(this.plan.sources ?? []), ...normalizedSources];
+      this.plan.transport_pages = [
+        ...(this.plan.transport_pages ?? []).filter((item) => item.mode !== page.mode),
+        page,
+      ];
+    },
+    async loadMoreTransport(mode: "rail" | "flight", limit = 5) {
+      const session = useSessionStore();
+      if (!session.threadId || !this.plan || this.viewingVersion !== null) return;
+      if (this.transportLoadingMode) return;
+      const threadId = session.threadId;
+      const generation = this.requestGeneration;
+      const page = this.plan.transport_pages?.find((item) => item.mode === mode);
+      if (!page || !page.has_more) return;
+      const offset = page.offset + page.returned_count;
+      this.transportLoadingMode = mode;
+      this.error = "";
+      this.transportError = "";
+      try {
+        const response = await api.getTransportPage(
+          threadId,
+          mode,
+          offset,
+          limit,
+          this.plan.version,
+        );
+        if (
+          generation !== this.requestGeneration ||
+          session.threadId !== threadId ||
+          !this.plan ||
+          this.plan.version !== response.version
+        ) {
+          return;
+        }
+        const returnedPage = response.page;
+        if (returnedPage) {
+          this.appendTransportOptions(response.options ?? [], returnedPage, response.sources ?? []);
+        }
+        if (response.errors?.length) {
+          this.transportError = response.errors.join("；");
+        }
+      } catch (e) {
+        if (generation === this.requestGeneration && session.threadId === threadId) {
+          this.transportError = (e as ApiError).message;
+        }
+      } finally {
+        if (generation === this.requestGeneration && session.threadId === threadId) {
+          this.transportLoadingMode = "";
+        }
       }
     },
     async patchItem(item: PlanItem, payload: PatchItemPayload) {
@@ -486,8 +585,11 @@ export const usePlanStore = defineStore("plan", {
       this.replanning = false;
       this.exportingFormat = "";
       this.sharing = false;
+      this.transportLoadingMode = "";
+      this.transportError = "";
       this.shareUrl = "";
       this.shareCopied = false;
+      this.planUnread = false;
     },
   },
 });

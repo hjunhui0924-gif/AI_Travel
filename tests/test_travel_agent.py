@@ -8,9 +8,11 @@ from agents.schemas import (
     RoutePlan,
     TransportOption,
     TravelPlan,
+    TravelPlanResponse,
 )
 from services import poi_recommender
 from services.rail_service import RailOptionsResult
+from agents.travel_supervisor import TravelSupervisorResult
 
 
 def _fake_recommend(query, *, search_enabled=False, activity_logger=None):
@@ -92,7 +94,54 @@ def test_clarification_response_renders_choices_without_a_placeholder_plan():
     assert "出发地待定" not in rendered
 
 
-def test_clarified_province_route_generates_a_plan_after_city_choice(monkeypatch):
+def test_completed_plan_response_is_a_compact_summary_not_a_raw_data_dump():
+    response = TravelPlanResponse(
+        intent="trip_plan",
+        summary="已为杭州生成一版出行与游玩结合的初步方案。",
+        transport_options=[
+            TransportOption(mode="rail", title="G123", provider="12306"),
+            TransportOption(mode="rail", title="G456", provider="12306"),
+        ],
+        route_plans=[
+            RoutePlan(
+                mode="driving",
+                origin="西湖",
+                destination="灵隐寺",
+                origin_address="不应在聊天摘要中展开的长地址",
+                destination_address="不应在聊天摘要中展开的长地址",
+                polyline=[[120.0, 30.0], [120.1, 30.1]],
+            )
+        ],
+        poi_recommendations=[
+            PoiRecommendation(name="西湖", category="景点"),
+            PoiRecommendation(name="灵隐寺", category="景点"),
+        ],
+        weather_summary="天气详细数据应在结构化区域查看",
+        trip_plan=TravelPlan(
+            plan_id="plan_summary",
+            thread_id="guest_summary",
+            version=1,
+            timezone="Asia/Shanghai",
+            start_date="2026-09-02",
+            end_date="2026-09-04",
+            destination="杭州",
+            days=[],
+        ),
+    )
+
+    rendered = travel_agent.render_travel_response(response)
+
+    assert "已为杭州生成一版出行与游玩结合的初步方案。" in rendered
+    assert "2026-09-02 至 2026-09-04" in rendered
+    assert "2 条车次" in rendered
+    assert "1 段地图路线" in rendered
+    assert "2 个已验证地点" in rendered
+    assert "详细行程已同步到行程计划面板" in rendered
+    assert "不应在聊天摘要中展开的长地址" not in rendered
+    assert "天气详细数据应在结构化区域查看" not in rendered
+
+
+def test_clarified_province_route_waits_for_verified_data_before_creating_plan(monkeypatch):
     monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
     monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
@@ -106,10 +155,9 @@ def test_clarified_province_route_generates_a_plan_after_city_choice(monkeypatch
     )
 
     assert response.clarification is None
-    assert response.trip_plan is not None
-    assert response.trip_plan.destination == "江苏"
-    assert response.trip_plan.destination_cities == ["南京", "扬州"]
-    assert response.trip_plan.origin == "上海"
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert "暂不生成行程计划" in response.summary
 
 
 def test_explicit_date_range_is_capped_with_structured_risk():
@@ -151,10 +199,157 @@ def test_plan_builds_calendar_dates_and_uses_search_switch(monkeypatch):
     assert response.trip_plan.days[0].items[0].title == "西湖边餐厅"
 
 
+def test_transport_query_only_calls_the_requested_provider(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def fake_rail(query):
+        calls.append(("rail", query.travel_mode))
+        return []
+
+    def fake_flight(query):
+        calls.append(("flight", query.travel_mode))
+        return []
+
+    monkeypatch.setattr(travel_agent, "get_rail_options", fake_rail)
+    monkeypatch.setattr(travel_agent, "get_flight_options", fake_flight)
+
+    travel_agent.plan_travel("2026-09-02 从上海到杭州查高铁", [], search_enabled=False)
+
+    assert calls == [("rail", "rail")]
+
+
+def test_flight_query_only_calls_the_flight_provider(monkeypatch):
+    calls: list[tuple[str, str]] = []
+
+    def fake_rail(query):
+        calls.append(("rail", query.travel_mode))
+        return []
+
+    def fake_flight(query):
+        calls.append(("flight", query.travel_mode))
+        return []
+
+    monkeypatch.setattr(travel_agent, "get_rail_options", fake_rail)
+    monkeypatch.setattr(travel_agent, "get_flight_options", fake_flight)
+
+    travel_agent.plan_travel("2026-09-02 从上海到杭州查航班", [], search_enabled=False)
+
+    assert calls == [("flight", "flight")]
+
+
+def test_plan_uses_supervisor_provider_results_without_calling_adapters(monkeypatch):
+    query = travel_agent.build_travel_query("2026-09-02 从上海到杭州查高铁", [])
+    option = TransportOption(
+        mode="rail",
+        title="G123",
+        provider="12306",
+        depart_date="2026-09-02",
+        arrive_date="2026-09-02",
+        depart_time="08:00",
+        arrive_time="09:00",
+    )
+    supervised = TravelSupervisorResult(
+        query=query,
+        tool_calls=[],
+        transport_options=[option],
+        transport_pages=[
+            travel_agent.TransportPage(
+                mode="rail",
+                returned_count=1,
+                total_count=6,
+                has_more=True,
+                filter="high_speed",
+            )
+        ],
+        adapter_status={
+            "rail": "success",
+            "flight": "not_requested",
+            "route": "not_requested",
+            "poi": "not_requested",
+            "weather": "not_requested",
+            "web_search": "not_requested",
+        },
+    )
+    monkeypatch.setattr(
+        travel_agent,
+        "get_rail_options",
+        lambda query: (_ for _ in ()).throw(AssertionError("rail adapter must not run twice")),
+    )
+    monkeypatch.setattr(
+        travel_agent,
+        "get_flight_options",
+        lambda query: (_ for _ in ()).throw(AssertionError("flight adapter must not run")),
+    )
+
+    response = travel_agent.plan_travel(
+        "2026-09-02 从上海到杭州查高铁",
+        [],
+        supervisor_result=supervised,
+    )
+
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert [item.title for item in response.transport_options] == ["G123"]
+    assert response.transport_pages[0].has_more is True
+
+
+def test_model_answer_decision_never_creates_itinerary_from_transport_data():
+    query = travel_agent.build_travel_query("2026-09-02 从上海到杭州查高铁", [])
+    supervised = TravelSupervisorResult(
+        query=query,
+        decision="answer",
+        answer="已查到车次，请在结果中选择。",
+        transport_options=[TransportOption(mode="rail", title="G123", provider="12306")],
+    )
+
+    response = travel_agent.plan_travel(
+        "2026-09-02 从上海到杭州查高铁",
+        [],
+        supervisor_result=supervised,
+    )
+
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert response.summary == "已查到车次，请在结果中选择。"
+
+
+def test_model_plan_decision_is_blocked_when_no_provider_data_exists():
+    query = travel_agent.build_travel_query("2026-09-02 去杭州玩三天", [])
+    supervised = TravelSupervisorResult(query=query, decision="plan")
+
+    response = travel_agent.plan_travel(
+        "2026-09-02 去杭州玩三天",
+        [],
+        supervisor_result=supervised,
+    )
+
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert "暂不生成行程计划" in response.summary
+
+
+def test_model_plan_decision_rejects_placeholder_transport_data():
+    query = travel_agent.build_travel_query("2026-09-02 去杭州玩三天", [])
+    supervised = TravelSupervisorResult(
+        query=query,
+        decision="plan",
+        transport_options=[TransportOption(mode="rail", title="车次")],
+    )
+
+    response = travel_agent.plan_travel(
+        "2026-09-02 去杭州玩三天",
+        [],
+        supervisor_result=supervised,
+    )
+
+    assert response.trip_plan is None
+    assert travel_agent.NO_PROVIDER_DATA_NOTICE in response.summary
+
+
 def test_generic_city_trip_builds_route_from_verified_poi_recommendations(monkeypatch):
     attractions = [
-        PoiRecommendation(name="广州塔", category="景点", address="阅江西路", summary="高德景点"),
-        PoiRecommendation(name="北京路", category="景点", address="北京路", summary="高德景点"),
+        PoiRecommendation(name="广州塔", category="景点", address="阅江西路", summary="高德景点", source_ids=["poi_1"]),
+        PoiRecommendation(name="北京路", category="景点", address="北京路", summary="高德景点", source_ids=["poi_2"]),
     ]
     route_calls: list[list[str]] = []
 
@@ -227,11 +422,9 @@ def test_replan_preserves_locked_items_and_reports_date_conflict(monkeypatch):
         current_plan=current,
     )
 
-    assert any(item.item_id == "locked-1" for item in response.trip_plan.days[0].items)
-    assert any("已锁定项目" in conflict for conflict in response.trip_plan.conflicts)
-    assert [item.item_id for item in response.trip_plan.out_of_range_items] == ["locked-2"]
-    assert response.trip_plan.out_of_range_items[0].date == "2026-09-03"
-    assert response.trip_plan.days[0].has_conflicts is True
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert "暂不生成行程计划" in response.summary
 
 
 def test_no_map_result_does_not_create_placeholder_poi(monkeypatch):
@@ -244,7 +437,8 @@ def test_no_map_result_does_not_create_placeholder_poi(monkeypatch):
     response = travel_agent.plan_travel("杭州附近有什么好吃的", [], search_enabled=False)
 
     assert response.poi_recommendations == []
-    assert "地图接口失败" in response.trip_plan.risks
+    assert "地图接口失败" in response.alerts
+    assert travel_agent.NO_PROVIDER_DATA_NOTICE in response.alerts
 
 
 def test_poi_partial_failure_keeps_successful_anchor_results(monkeypatch):
@@ -410,7 +604,7 @@ def test_replan_replaces_same_id_suggestion_with_locked_snapshot(monkeypatch):
 
 
 def test_repeated_same_day_poi_titles_get_distinct_item_ids(monkeypatch):
-    poi = PoiRecommendation(name="同名餐厅", category="美食")
+    poi = PoiRecommendation(name="同名餐厅", category="美食", source_ids=["poi_same"])
     monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([poi, poi], [], [], []))
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])
     monkeypatch.setattr(travel_agent, "get_flight_options", lambda query: [])
@@ -430,9 +624,10 @@ def test_adapter_failure_is_structured_in_plan(monkeypatch):
 
     response = travel_agent.plan_travel("2026-09-02 从上海去杭州坐飞机", [], search_enabled=False)
 
-    assert response.trip_plan.adapter_status["flight"] == "failed"
-    assert response.trip_plan.diagnostics == ["flight adapter failed: TimeoutError"]
-    assert any("航班数据接口暂时失败" in item for item in response.trip_plan.alerts)
+    assert response.trip_plan is None
+    assert response.adapter_status["flight"] == "failed"
+    assert response.diagnostics == ["flight adapter failed: TimeoutError"]
+    assert any("航班数据接口暂时失败" in item for item in response.alerts)
 
 
 def test_partial_transport_result_is_exposed_in_plan(monkeypatch):
@@ -447,9 +642,10 @@ def test_partial_transport_result_is_exposed_in_plan(monkeypatch):
 
     response = travel_agent.plan_travel("2026-09-02 从上海去杭州坐高铁", [], search_enabled=False)
 
-    assert response.trip_plan.adapter_status["rail"] == "partial"
-    assert response.trip_plan.diagnostics == ["rail row failed: row:dict"]
-    assert any("部分火车结果" in item for item in response.trip_plan.alerts)
+    assert response.trip_plan is None
+    assert response.adapter_status["rail"] == "partial"
+    assert response.diagnostics == ["rail row failed: row:dict"]
+    assert any("部分火车结果" in item for item in response.alerts)
 
 
 def test_long_trip_keeps_requested_end_date_and_marks_calendar_projection(monkeypatch):
@@ -461,10 +657,6 @@ def test_long_trip_keeps_requested_end_date_and_marks_calendar_projection(monkey
 
     response = travel_agent.plan_travel("2026-09-01 去杭州玩 32 天", [], search_enabled=False)
 
-    assert response.trip_plan.end_date == "2026-10-02"
-    assert len(response.trip_plan.days) == 31
-    assert response.trip_plan.requested_days == 32
-    assert response.trip_plan.projected_days == 31
-    assert response.trip_plan.calendar_truncated is True
-    assert response.trip_plan.projection_end_date == "2026-10-01"
-    assert any("超过 31 天" in risk for risk in response.trip_plan.risks)
+    assert response.trip_plan is None
+    assert response.decision == "answer"
+    assert "暂不生成行程计划" in response.summary

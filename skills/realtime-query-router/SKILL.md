@@ -7,7 +7,7 @@ description: Route real-time or date-sensitive travel questions in AI_Agent to t
 
 ## Overview
 
-Use this skill when extending the project for time-sensitive questions.
+Use this skill when extending the travel-only project for time-sensitive questions.
 
 Prefer this routing order:
 
@@ -19,11 +19,12 @@ Prefer this routing order:
 ## Routing Rules
 
 - Weather questions:
-  Use `weather_lookup` first.
+  Use the TravelSupervisor `get_weather` tool first.
 - “Today / latest / current / real-time” questions:
   Always inject current date context before tool selection.
-- Generic current-events questions:
-  Use `web_search`, but include date validation and source cards.
+- Current travel information questions:
+  Use the TravelSupervisor `search_current_travel_info` tool when web search is
+  enabled, with date validation and source cards.
 
 ## Output Rules
 

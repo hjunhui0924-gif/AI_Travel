@@ -392,6 +392,7 @@ a:hover {
 .chat-scroll {
   flex: 1;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 28px 20px 12px;
 }
 .chat-inner {
@@ -4493,6 +4494,13 @@ a:hover {
 }
 
 @media (max-width: 600px) {
+  .main-column.is-workspace .workspace-chat-surface {
+    width: 100%;
+    margin-top: 0;
+    padding: 20px 14px 132px;
+    border-radius: 22px;
+  }
+
   .main-column.is-workspace .chat-scroll {
     padding: 18px 12px 10px;
   }

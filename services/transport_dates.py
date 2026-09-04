@@ -30,6 +30,12 @@ def _time_to_minutes(value: object) -> int | None:
     return hour * 60 + minute
 
 
+def is_valid_clock_time(value: object) -> bool:
+    """Return whether a provider supplied a concrete HH:MM clock value."""
+
+    return _time_to_minutes(value) is not None
+
+
 def _arrival_day_offset(item: dict) -> int | None:
     for key in ("arrive_day_offset", "arrival_day_offset", "day_offset"):
         value = item.get(key)

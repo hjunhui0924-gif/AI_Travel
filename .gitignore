@@ -29,7 +29,6 @@ resources/*.db
 resources/*.db-shm
 resources/*.db-wal
 resources/*.sqlite3
-resources/chroma_runtime/
 uploads/*
 !uploads/.gitkeep
 resources/*

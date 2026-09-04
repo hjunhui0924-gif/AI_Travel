@@ -150,7 +150,7 @@ async function enterWorkspace(prompt: string) {
   if (run !== transitionRun) return;
   workspaceMode.value = true;
   await nextTick();
-  const scrollEl = document.querySelector<HTMLElement>(".chat-scroll");
+  const scrollEl = document.querySelector<HTMLElement>(".workspace-chat-scroll-region");
   if (scrollEl) scrollEl.scrollTop = 0;
   void chat.send(prompt);
   await new Promise<void>((resolve) => window.setTimeout(resolve, 300));
@@ -266,7 +266,13 @@ async function returnToExplore() {
       aria-hidden="true"
       @click="plan.panelOpen = false"
     ></div>
-    <PlanDock v-if="appReady && !plan.panelOpen" :has-messages="Boolean(chat.messages.length)" @open="plan.panelOpen = true" />
+    <PlanDock
+      v-if="appReady && !plan.panelOpen"
+      :has-messages="Boolean(chat.messages.length)"
+      :has-plan="Boolean(plan.plan)"
+      :has-new-plan="plan.planUnread"
+      @open="plan.openPanel()"
+    />
     <PlanPanel />
   </div>
 </template>

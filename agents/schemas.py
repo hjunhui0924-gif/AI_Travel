@@ -66,6 +66,29 @@ class TransportOption:
 
 
 @dataclass(slots=True)
+class TransportPage:
+    """Pagination metadata for provider-backed transport candidates."""
+
+    mode: str
+    offset: int = 0
+    limit: int = 5
+    returned_count: int = 0
+    total_count: int = 0
+    has_more: bool = False
+    filter: str = "all"
+
+
+@dataclass(slots=True)
+class TransportQueryPage:
+    """A page of provider-backed transport options for an explicit query."""
+
+    options: list[TransportOption] = field(default_factory=list)
+    pages: list[TransportPage] = field(default_factory=list)
+    sources: list[Evidence] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class TimelineItem:
     time_label: str
     title: str
@@ -243,6 +266,9 @@ class TravelPlan:
     # is revised in a later turn.
     destination_scope: str = "unknown"
     destination_cities: list[str] = field(default_factory=list)
+    # Pagination state for the provider-backed transport list. Keep it at the
+    # end so older positional TravelPlan constructors remain compatible.
+    transport_pages: list[TransportPage] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -264,6 +290,13 @@ class TravelPlanResponse:
     conflicts: list[str] = field(default_factory=list)
     clarification: "ClarificationRequest | None" = None
     pending_query: dict | None = None
+    transport_pages: list[TransportPage] = field(default_factory=list)
+    # Model-directed conversational action. The deterministic planner may
+    # still be used for provider normalization, but this field controls
+    # whether the result is shown as an answer, clarification, or plan.
+    decision: str = "plan"
+    decision_reason: str = ""
+    scope_refusal: bool = False
 
 
 @dataclass(slots=True)

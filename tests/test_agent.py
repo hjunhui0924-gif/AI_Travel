@@ -1,16 +1,6 @@
 from agents import agent
 from langchain.messages import AIMessage, AIMessageChunk
-from agents.schemas import TravelPlanResponse
-
-
-class FakeWebSearcher:
-    def __init__(self, payload):
-        self.payload = payload
-        self.calls = []
-
-    def invoke(self, payload):
-        self.calls.append(payload)
-        return self.payload
+from agents.schemas import TransportOption, TransportPage, TransportQueryPage, TravelPlan, TravelPlanResponse
 
 
 def test_model_settings_prefer_deepseek_when_generic_llm_is_not_configured(monkeypatch):
@@ -31,6 +21,78 @@ def test_model_settings_prefer_deepseek_when_generic_llm_is_not_configured(monke
 
 def test_common_three_day_trip_request_uses_structured_travel_planner():
     assert agent._is_travel_query("请规划杭州三日游，包含西湖和灵隐寺。", []) is True
+
+
+def test_negated_travel_word_does_not_bypass_scope_classifier(monkeypatch):
+    class FakeModel:
+        def invoke(self, messages):
+            return AIMessage(content='{"is_travel_request": false}')
+
+    monkeypatch.setattr(agent, "model", FakeModel())
+    monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: None)
+
+    message = "请帮我写一封关于人工智能的工作邮件，不涉及旅行"
+    assert agent._is_travel_query(message, []) is False
+    chunks = list(agent.stream_chat(message, "guest_negated_scope_test", False, []))
+    rendered = "".join(
+        item.get("text", "")
+        for chunk, _metadata in chunks
+        if isinstance(chunk, AIMessageChunk)
+        for item in (chunk.content if isinstance(chunk.content, list) else [])
+        if isinstance(item, dict)
+    )
+
+    assert "只支持旅行相关" in rendered
+
+def test_keyword_route_handles_explicit_transport_without_scope_model(monkeypatch):
+    captured = {}
+
+    def unexpected_classifier(*_args, **_kwargs):
+        raise AssertionError("explicit travel keywords should not call the scope classifier")
+
+    monkeypatch.setattr(agent, "_extract_travel_intent_with_model", unexpected_classifier)
+    monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: None)
+
+    def fake_stream(*args, **kwargs):
+        captured.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(agent, "_stream_travel_response", fake_stream)
+
+    list(agent.stream_chat("明天从上海到杭州查高铁", "keyword_route_test", False, []))
+
+    assert captured.get("extraction_hint") is None
+
+
+def test_unmatched_message_uses_scope_model_as_fallback(monkeypatch):
+    calls = []
+
+    class FakeModel:
+        def invoke(self, messages):
+            calls.append(messages)
+            return AIMessage(
+                content=(
+                    '{"is_travel_request": true, "intent": "nearby_explore", '
+                    '"destination": "杭州", "destination_cities": [], '
+                    '"origin": "", "start_date": "", "days": null, '
+                    '"travelers": null, "travel_mode": "", "preferences": []}'
+                )
+            )
+
+    captured = {}
+    monkeypatch.setattr(agent, "model", FakeModel())
+    monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: None)
+
+    def fake_stream(*args, **kwargs):
+        captured.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr(agent, "_stream_travel_response", fake_stream)
+
+    list(agent.stream_chat("周末想找个适合散步的地方", "model_route_test", False, []))
+
+    assert calls
+    assert captured["extraction_hint"]["intent"] == "nearby_explore"
 
 
 def test_model_fallback_extracts_unmatched_travel_request(monkeypatch):
@@ -88,12 +150,7 @@ def test_non_travel_fallback_returns_refusal_instead_of_generic_agent(monkeypatc
         def invoke(self, messages):
             return AIMessage(content='{"is_travel_request": false}')
 
-    class UnexpectedAgent:
-        def stream(self, *args, **kwargs):
-            raise AssertionError("generic agent must not receive an unmatched message")
-
     monkeypatch.setattr(agent, "model", FakeModel())
-    monkeypatch.setattr(agent, "agent_without_search", UnexpectedAgent())
     monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: None)
     monkeypatch.setattr(agent, "_get_pending_travel_query", lambda thread_id, user_id=None: None)
 
@@ -131,6 +188,49 @@ def test_travel_response_yields_incremental_text_chunks(monkeypatch):
 
     assert len(text_parts) > 1
     assert "".join(text_parts) == rendered
+
+
+def test_more_transport_request_returns_next_structured_page(monkeypatch):
+    current_plan = TravelPlan(
+        plan_id="plan_more_transport",
+        thread_id="guest_more_transport",
+        version=1,
+        timezone="Asia/Shanghai",
+        start_date="2026-09-02",
+        end_date="2026-09-02",
+        origin="上海",
+        destination="杭州",
+        transport_pages=[
+            TransportPage(mode="rail", offset=0, returned_count=5, total_count=8, has_more=True, filter="high_speed")
+        ],
+    )
+    next_option = TransportOption(mode="rail", title="G105")
+    next_page = TransportPage(mode="rail", offset=5, returned_count=1, total_count=8, has_more=False, filter="high_speed")
+    captured: dict = {}
+
+    monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: current_plan)
+    monkeypatch.setattr(
+        agent,
+        "get_transport_page",
+        lambda plan, mode, *, offset, limit: captured.update(
+            {"mode": mode, "offset": offset, "limit": limit}
+        ) or TransportQueryPage(options=[next_option], pages=[next_page]),
+    )
+
+    chunks = list(agent.stream_chat("再给我 3 条高铁", "guest_more_transport", False, []))
+    rendered = "".join(
+        item.get("text", "")
+        for chunk, _metadata in chunks
+        if isinstance(chunk, AIMessageChunk)
+        for item in (chunk.content if isinstance(chunk.content, list) else [])
+        if isinstance(item, dict)
+    )
+    metadata = [item for _chunk, item in chunks if item.get("transport_page")][-1]
+
+    assert captured == {"mode": "rail", "offset": 5, "limit": 3}
+    assert "G105" in rendered
+    assert metadata["transport_options"][0]["title"] == "G105"
+    assert metadata["transport_page"]["has_more"] is False
 
 
 def test_pending_clarification_is_reused_for_a_follow_up_turn(monkeypatch):
@@ -209,49 +309,3 @@ def test_pending_travel_clarification_does_not_capture_non_travel_follow_up(monk
     )
 
     assert "只支持旅行相关" in rendered
-
-
-def test_general_web_search_filters_dianping_content_and_source_cards(monkeypatch):
-    searcher = FakeWebSearcher(
-        {
-            "results": [
-                {
-                    "title": "不应暴露的餐厅评价",
-                    "url": "https://www.dianping.com/shop/1",
-                    "content": "不应复制的评价正文",
-                },
-                {
-                    "title": "大众点评无链接结果",
-                    "url": "",
-                    "content": "同样不应复制的评价正文",
-                },
-                {
-                    "title": "杭州官方活动",
-                    "url": "https://example.test/hangzhou",
-                    "content": "公开活动信息",
-                },
-            ]
-        }
-    )
-    monkeypatch.setattr(agent, "_raw_web_search", searcher)
-    agent._reset_runtime_buffers()
-
-    result = agent.perform_web_search("杭州附近有什么活动")
-    sources = agent.consume_source_cards()
-
-    assert "不应复制的评价正文" not in result
-    assert "同样不应复制的评价正文" not in result
-    assert "不应暴露的餐厅评价" not in result
-    assert "杭州官方活动" in result
-    assert all("dianping.com" not in source.get("url", "") for source in sources)
-    assert "Citation ID: web_" in result
-    assert sources[0]["evidence_id"].startswith("web_")
-    assert sources[0]["source_type"] == "web_search"
-
-
-def test_general_web_search_invalid_payload_is_explicit_error(monkeypatch):
-    monkeypatch.setattr(agent, "_raw_web_search", FakeWebSearcher({"results": "invalid"}))
-
-    result = agent.perform_web_search("杭州附近活动")
-
-    assert "格式无效" in result

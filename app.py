@@ -27,6 +27,8 @@ from agents.agent import (
     encode_assistant_metadata,
     get_messages,
     has_checkpoint_data,
+    model,
+    prepare_travel_query,
     stream_chat,
 )
 from services.auth_service import (
@@ -47,7 +49,8 @@ from services.auth_service import (
     list_legacy_thread_ids,
     update_thread_activity,
 )
-from agents.travel_agent import plan_travel, render_travel_response
+from agents.travel_agent import _build_clarification, plan_travel, render_travel_response
+from agents.travel_supervisor import run_travel_supervisor
 from services.travel_store import (
     GUEST_ACCESS_TTL_DAYS,
     PlanVersionConflict,
@@ -73,6 +76,7 @@ from services.travel_store import (
 from utils.file_utils import UnsupportedFileTypeError, parse_uploads
 from utils.oss_utils import delete_oss_object
 from services.travel_exports import render_plan_markdown, render_shared_plan_html
+from services.transport_service import get_transport_page
 from services.answer_citations import (
     deduplicate_sources,
     parse_answer_citations,
@@ -716,6 +720,54 @@ def get_travel_plan_map(
         )
 
 
+@app.get("/travel/plans/{thread_id}/transport")
+def get_travel_transport_page(
+    thread_id: str,
+    request: Request,
+    mode: str = Query(...),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(5, ge=1, le=20),
+    version: int | None = Query(None, ge=1),
+):
+    """Return another page of provider-backed transport candidates."""
+
+    try:
+        user = _authorized_thread_user(request, thread_id)
+        user_id = int(user["id"]) if user else None
+        plan = (
+            get_plan_version(thread_id, version, user_id=user_id)
+            if version is not None
+            else get_current_plan(thread_id, user_id=user_id)
+        )
+        if plan is None:
+            return JSONResponse({"status": "error", "message": "该会话还没有旅行计划。"}, status_code=404)
+        if not any(page.mode == str(mode or "").strip().lower() for page in plan.transport_pages):
+            return JSONResponse(
+                {"status": "error", "message": "当前计划没有该交通类型的分页结果。"},
+                status_code=400,
+            )
+        result = get_transport_page(plan, mode, offset=offset, limit=limit)
+        return {
+            "status": "success",
+            "plan_id": plan.plan_id,
+            "version": plan.version,
+            "options": [asdict(option) for option in result.options],
+            "page": asdict(result.pages[0]) if result.pages else None,
+            "sources": [asdict(source) for source in result.sources],
+            "errors": result.errors,
+        }
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=400)
+    except Exception:
+        logger.exception("transport pagination failed")
+        return JSONResponse(
+            {"status": "error", "message": "交通候选暂时无法加载，请稍后重试。"},
+            status_code=502,
+        )
+
+
 @app.post("/travel/plans/{thread_id}/shares")
 def create_travel_plan_share(
     thread_id: str,
@@ -995,7 +1047,8 @@ def update_travel_item(
             status_code=409,
         )
     except Exception as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+        logger.exception("travel plan item update failed")
+        return JSONResponse({"status": "error", "message": INTERNAL_SSE_ERROR_MESSAGE}, status_code=500)
 
 
 @app.post("/travel/plans/{thread_id}/replan")
@@ -1009,12 +1062,30 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
         if not payload.message.strip():
             return JSONResponse({"status": "error", "message": "请描述想怎么调整行程。"}, status_code=400)
 
+        supervisor_query = prepare_travel_query(
+            payload.message.strip(),
+            [],
+            current_plan=current_plan,
+        )
+        if _build_clarification(supervisor_query) is not None:
+            return JSONResponse(
+                {"status": "error", "message": "重规划还缺少必要的旅行条件。"},
+                status_code=400,
+            )
+        supervisor_result = run_travel_supervisor(
+            model,
+            payload.message.strip(),
+            [],
+            supervisor_query,
+            search_enabled=payload.search_enabled,
+        )
         response = plan_travel(
             payload.message.strip(),
             [],
             thread_id=thread_id,
             search_enabled=payload.search_enabled,
             current_plan=current_plan,
+            supervisor_result=supervisor_result,
         )
         if response.trip_plan is None:
             return JSONResponse({"status": "error", "message": "本次没有生成新的旅行计划。"}, status_code=502)
@@ -1077,7 +1148,8 @@ def replan_travel_plan(thread_id: str, payload: TravelReplanRequest, request: Re
             status_code=409,
         )
     except Exception as exc:
-        return JSONResponse({"status": "error", "message": str(exc)}, status_code=500)
+        logger.exception("travel plan replan failed")
+        return JSONResponse({"status": "error", "message": INTERNAL_SSE_ERROR_MESSAGE}, status_code=500)
 
 
 @app.post("/chat")
@@ -1143,6 +1215,10 @@ async def chat(
             assistant_answer_segments = []
             assistant_clarification = None
             assistant_scope_refusal = False
+            assistant_decision = ""
+            assistant_decision_reason = ""
+            assistant_transport_options = []
+            assistant_transport_page = None
             travel_plan = None
             is_travel_response = False
 
@@ -1173,6 +1249,14 @@ async def chat(
                     assistant_clarification = metadata["clarification"]
                 if isinstance(metadata, dict) and metadata.get("scope_refusal") is True:
                     assistant_scope_refusal = True
+                if isinstance(metadata, dict) and isinstance(metadata.get("decision"), str):
+                    assistant_decision = metadata["decision"]
+                if isinstance(metadata, dict) and isinstance(metadata.get("decision_reason"), str):
+                    assistant_decision_reason = metadata["decision_reason"]
+                if isinstance(metadata, dict) and isinstance(metadata.get("transport_options"), list):
+                    assistant_transport_options = metadata["transport_options"]
+                if isinstance(metadata, dict) and isinstance(metadata.get("transport_page"), dict):
+                    assistant_transport_page = metadata["transport_page"]
                 for activity in consume_activity_log():
                     assistant_activities.append(activity)
                     yield _sse_event("activity", activity)
@@ -1343,7 +1427,11 @@ async def chat(
                     "answer_segments": answer_segments,
                     "clarification": assistant_clarification,
                     "scope_refusal": assistant_scope_refusal,
+                    "decision": assistant_decision,
+                    "decision_reason": assistant_decision_reason,
                     "trip_plan": travel_plan,
+                    "transport_options": assistant_transport_options,
+                    "transport_page": assistant_transport_page,
                     "attachments": [
                         {
                             "name": attachment["name"],

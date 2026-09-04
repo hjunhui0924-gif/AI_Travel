@@ -70,12 +70,12 @@ function submitCustomClarification() {
 function openSources() {
   plan.setMessageSources(props.message.sources ?? []);
   plan.activeTab = "sources";
-  plan.panelOpen = true;
+  plan.openPanel();
 }
 
 function openPlan() {
   plan.activeTab = "itinerary";
-  plan.panelOpen = true;
+  plan.openPanel();
   plan.loadPlan();
 }
 

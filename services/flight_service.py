@@ -1,16 +1,37 @@
 from __future__ import annotations
 
-from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
+import re
+
+from adapters.flight_mcp_adapter import search_flights
 from agents.schemas import TransportOption, TravelQuery
-from services.transport_dates import resolve_transport_dates
+from services.transport_dates import is_valid_clock_time, resolve_transport_dates
+
+
+DEFAULT_TRANSPORT_PAGE_SIZE = 5
+MAX_TRANSPORT_PAGE_SIZE = 20
 
 
 class FlightOptionsResult(list[TransportOption]):
     """List-compatible flight result with malformed-row metadata."""
 
-    def __init__(self, items: list[TransportOption] | None = None, *, errors: list[str] | None = None):
+    def __init__(
+        self,
+        items: list[TransportOption] | None = None,
+        *,
+        errors: list[str] | None = None,
+        offset: int = 0,
+        limit: int = DEFAULT_TRANSPORT_PAGE_SIZE,
+        total_count: int = 0,
+    ):
         super().__init__(items or [])
         self.errors = list(errors or [])
+        self.offset = max(0, offset)
+        self.limit = max(1, limit)
+        self.total_count = max(0, total_count)
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self) < self.total_count
 
     @property
     def partial(self) -> bool:
@@ -26,6 +47,22 @@ def _time_to_minutes(value: str) -> int:
         return int(hour_text) * 60 + int(minute_text)
     except ValueError:
         return 10**9
+
+
+def _is_valid_flight_no(value: object) -> bool:
+    text = str(value or "").strip().upper()
+    if text in {"FLIGHT", "航班"}:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9-]{2,12}", text)) and any(char.isalpha() for char in text)
+
+
+def _is_valid_flight_row(item: dict) -> bool:
+    return (
+        _is_valid_flight_no(item.get("flight_no"))
+        and is_valid_clock_time(item.get("depart_time"))
+        and is_valid_clock_time(item.get("arrive_time"))
+        and bool(str(item.get("provider") or "").strip())
+    )
 
 
 def _price_to_int(value: str) -> int:
@@ -78,9 +115,9 @@ def _dedupe_by_flight_signature(items: list[dict]) -> list[dict]:
     return list(deduped.values())
 
 
-def _select_recommended_flights(raw_options: list[dict], limit: int = 5) -> list[dict]:
+def _rank_recommended_flights(raw_options: list[dict]) -> list[dict]:
     candidates = _dedupe_by_flight_signature(raw_options)
-    if len(candidates) <= limit:
+    if len(candidates) <= DEFAULT_TRANSPORT_PAGE_SIZE:
         return sorted(candidates, key=_selection_key)
 
     buckets = [
@@ -114,16 +151,30 @@ def _select_recommended_flights(raw_options: list[dict], limit: int = 5) -> list
             add_item(bucket_items[0])
 
     for item in sorted_candidates:
-        if len(selected) >= limit:
-            break
         add_item(item)
 
-    return sorted(selected[:limit], key=_display_priority)
+    return sorted(selected, key=_display_priority)
 
 
-def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
+def _select_recommended_flights(
+    raw_options: list[dict],
+    limit: int = DEFAULT_TRANSPORT_PAGE_SIZE,
+    offset: int = 0,
+) -> list[dict]:
+    ordered = _rank_recommended_flights(raw_options)
+    return ordered[offset : offset + limit]
+
+
+def get_flight_options(
+    query: TravelQuery,
+    *,
+    offset: int = 0,
+    limit: int = DEFAULT_TRANSPORT_PAGE_SIZE,
+) -> FlightOptionsResult:
+    offset = max(0, int(offset))
+    limit = min(MAX_TRANSPORT_PAGE_SIZE, max(1, int(limit)))
     if not query.origin or not query.destination or not query.date:
-        return FlightOptionsResult()
+        return FlightOptionsResult(offset=offset, limit=limit)
 
     provider_options = search_flights(query.origin, query.destination, query.date)
     if provider_options is None:
@@ -136,8 +187,25 @@ def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
     errors = list(provider_errors)
     if len(raw_options) != len(provider_options):
         errors.append("malformed provider row")
-    results = FlightOptionsResult(errors=errors)
-    for item in _select_recommended_flights(raw_options, limit=5):
+    valid_options = []
+    malformed_rows = 0
+    for item in raw_options:
+        if _is_valid_flight_row(item):
+            valid_options.append(item)
+        else:
+            malformed_rows += 1
+    if malformed_rows:
+        errors.append("malformed provider row")
+    raw_options = valid_options
+    ordered_options = _rank_recommended_flights(raw_options)
+    total_count = len(ordered_options)
+    results = FlightOptionsResult(
+        errors=errors,
+        offset=offset,
+        limit=limit,
+        total_count=total_count,
+    )
+    for item in ordered_options[offset : offset + limit]:
         try:
             depart_date, arrive_date = resolve_transport_dates(query.date, item)
             summary_parts = [item.get("summary", "")]
@@ -147,13 +215,13 @@ def get_flight_options(query: TravelQuery) -> FlightOptionsResult:
             results.append(
                 TransportOption(
                     mode="flight",
-                    title=item.get("flight_no", "航班"),
-                    depart_time=item.get("depart_time", ""),
-                    arrive_time=item.get("arrive_time", ""),
+                    title=str(item.get("flight_no") or ""),
+                    depart_time=str(item.get("depart_time") or ""),
+                    arrive_time=str(item.get("arrive_time") or ""),
                     duration=item.get("duration", ""),
                     price=item.get("price", ""),
                     summary=" | ".join(part for part in summary_parts if part),
-                    provider=item.get("provider", "FlightTicketMCP" if is_flight_mcp_enabled() else ""),
+                    provider=str(item.get("provider") or ""),
                     seats=[
                         part
                         for part in [

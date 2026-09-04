@@ -82,6 +82,45 @@
   background: transparent !important;
 }
 
+/* Glass belongs to the conversation surface only. The photo remains the
+   page canvas, while this bounded panel gives the message stream a stable,
+   readable layer above it. */
+.main-column.is-workspace .workspace-chat-surface {
+  position: relative;
+  width: min(920px, calc(100% - 20px));
+  max-width: 920px;
+  margin: 12px auto 0;
+  padding: 26px 30px 140px;
+  border: 1px solid rgba(255, 250, 240, 0.22);
+  border-radius: 28px;
+  background:
+    linear-gradient(145deg, rgba(16, 54, 60, 0.7), rgba(5, 28, 34, 0.56)),
+    rgba(7, 34, 39, 0.58);
+  box-shadow:
+    0 26px 70px rgba(3, 18, 22, 0.22),
+    0 1px 0 rgba(255, 250, 240, 0.16) inset;
+  backdrop-filter: blur(20px) saturate(125%);
+  -webkit-backdrop-filter: blur(20px) saturate(125%);
+  isolation: isolate;
+}
+
+.main-column.is-workspace .workspace-chat-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(255, 250, 240, 0.12), transparent 31%),
+    linear-gradient(180deg, rgba(255, 250, 240, 0.05), transparent 20%);
+  pointer-events: none;
+}
+
+.main-column.is-workspace .workspace-chat-surface > .message {
+  position: relative;
+  z-index: 1;
+}
+
 .main-column .home-background,
 .main-column .home-background-shade,
 .main-column .home-background-grain {
@@ -309,6 +348,70 @@
   border-radius: 14px;
   background: rgba(253, 251, 243, 0.86);
   box-shadow: var(--shadow);
+}
+
+.transport-page-summary {
+  display: grid;
+  gap: 6px;
+  margin: -4px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(14, 95, 84, 0.13);
+  border-radius: 10px;
+  color: var(--text-muted);
+  background: rgba(253, 251, 243, 0.58);
+  font-size: 11px;
+}
+
+.transport-page-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.transport-more-btn {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid rgba(14, 95, 84, 0.28);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  background: rgba(217, 233, 222, 0.72);
+  font-size: 10px;
+  transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
+}
+
+.transport-more-btn:hover:not(:disabled),
+.transport-more-btn:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+.transport-more-btn:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.transport-page-complete {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+/* Keep the mobile override after the desktop glass rule so the panel remains
+   a full-width, comfortable surface on narrow screens. */
+@media (max-width: 600px) {
+  .main-column.is-workspace .workspace-chat-surface {
+    width: 100%;
+    margin-top: 0;
+    padding: 20px 14px 132px;
+    border-radius: 22px;
+  }
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .main-column.is-workspace .workspace-chat-surface {
+    background: rgba(5, 28, 34, 0.94);
+  }
 }
 
 .plan-route-cities {
@@ -824,5 +927,189 @@
   .workspace-transition-status {
     animation: none;
     transition: none;
+  }
+}
+
+/* ============================================================
+   Fixed conversation workspace
+   The page remains a photo canvas; only the bounded conversation surface is
+   glass. The outer chat viewport never grows with streamed content, so its
+   inner surface is the only vertical scroll root in workspace mode.
+   ============================================================ */
+
+.main-column.is-workspace {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.main-column.is-workspace > .chat-scroll {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  padding: 12px 24px 0;
+  background: transparent !important;
+  scrollbar-width: none;
+}
+
+.main-column.is-workspace > .chat-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* Reduce the canvas tint in workspace mode so the photograph remains visible
+   through the panel instead of turning into a flat opaque teal block. */
+.main-column.is-workspace > .app-background::after {
+  background:
+    linear-gradient(180deg, rgba(4, 17, 22, 0.48), rgba(5, 24, 29, 0.16) 38%, rgba(5, 24, 29, 0.62) 100%),
+    linear-gradient(90deg, rgba(5, 24, 29, 0.42), transparent 64%, rgba(5, 24, 29, 0.16));
+}
+
+.main-column.is-workspace .workspace-chat-surface {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  max-width: 860px;
+  height: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  margin: 0 auto;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 250, 240, 0.32);
+  border-bottom-color: transparent;
+  border-radius: 30px;
+  background:
+    linear-gradient(135deg, rgba(255, 250, 240, 0.16), rgba(255, 250, 240, 0.035) 42%, rgba(7, 34, 39, 0.12)),
+    rgba(7, 34, 39, 0.18);
+  box-shadow:
+    0 26px 70px rgba(3, 18, 22, 0.22),
+    0 1px 0 rgba(255, 250, 240, 0.2) inset;
+  backdrop-filter: blur(26px) saturate(138%) contrast(106%);
+  -webkit-backdrop-filter: blur(26px) saturate(138%) contrast(106%);
+  isolation: isolate;
+}
+
+.main-column.is-workspace .workspace-chat-surface::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background:
+    radial-gradient(circle at 9% 0%, rgba(255, 250, 240, 0.2), transparent 25%),
+    radial-gradient(circle at 92% 100%, rgba(243, 181, 104, 0.1), transparent 28%),
+    linear-gradient(115deg, rgba(255, 250, 240, 0.07), transparent 35% 70%, rgba(255, 250, 240, 0.035));
+  pointer-events: none;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 28px clamp(18px, 3vw, 36px) 36px;
+  scrollbar-gutter: stable;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region > .chat-inner {
+  width: min(920px, 100%);
+  max-width: 920px;
+  flex: 0 0 auto;
+  min-height: 100%;
+  margin: 0 auto;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region .message {
+  position: relative;
+  z-index: 1;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region::-webkit-scrollbar {
+  width: 8px;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  background: rgba(255, 250, 240, 0.3);
+  background-clip: content-box;
+}
+
+.main-column.is-workspace .workspace-chat-scroll-region::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Keep the composer independent from the message glass. The input control
+   remains centered below the conversation surface without extending its
+   background into the surrounding scenery. */
+.main-column.is-workspace > .composer {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  background: transparent;
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .main-column.is-workspace .workspace-chat-surface {
+    background: rgba(7, 34, 39, 0.62);
+  }
+}
+
+@media (max-width: 700px) {
+  .main-column.is-workspace > .chat-scroll {
+    padding: 8px 10px 0;
+  }
+
+  .main-column.is-workspace .workspace-chat-surface {
+    border-radius: 22px;
+  }
+
+  .main-column.is-workspace .workspace-chat-scroll-region {
+    padding: 20px 16px 28px;
+  }
+
+  /* The mobile plan notification is full-width; lift it above the separate
+     composer so it cannot cover the search field or send button. */
+  .workspace-plan-dock.has-messages {
+    bottom: calc(180px + env(safe-area-inset-bottom));
+  }
+}
+
+/* A plan is a notification, not an unsolicited drawer. */
+.workspace-plan-dock {
+  overflow: visible;
+}
+
+.workspace-plan-dock-new-label {
+  display: inline-flex;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #102f33;
+  background: #f3b568;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  vertical-align: 2px;
+}
+
+.workspace-plan-dock-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 13px;
+  height: 13px;
+  border: 2px solid #08282d;
+  border-radius: 50%;
+  background: #ef6254;
+  box-shadow: 0 0 0 3px rgba(239, 98, 84, 0.18), 0 4px 12px rgba(3, 18, 22, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-plan-dock-badge {
+    box-shadow: 0 0 0 2px rgba(239, 98, 84, 0.18);
   }
 }

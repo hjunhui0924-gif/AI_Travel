@@ -108,6 +108,16 @@ export interface TransportOption {
   source_ids: string[];
 }
 
+export interface TransportPage {
+  mode: "rail" | "flight" | string;
+  offset: number;
+  limit: number;
+  returned_count: number;
+  total_count: number;
+  has_more: boolean;
+  filter?: string;
+}
+
 export interface RoutePlan {
   mode: string;
   origin: string;
@@ -221,6 +231,7 @@ export interface TravelPlan {
   previous_version: number | null;
   out_of_range_items: PlanItem[];
   transport_options: TransportOption[];
+  transport_pages?: TransportPage[];
   route_plans?: RoutePlan[];
 }
 
@@ -266,8 +277,12 @@ export interface DonePayload {
   answer_segments: AnswerSegment[];
   clarification?: ClarificationRequest | null;
   scope_refusal?: boolean;
+  decision?: "answer" | "clarify" | "plan" | "refuse" | string;
+  decision_reason?: string;
   activities: ActivityEvent[];
   sources: SourceInfo[];
   trip_plan: TravelPlan | null;
+  transport_options?: TransportOption[];
+  transport_page?: TransportPage | null;
   attachments: { name: string; modality: string }[];
 }

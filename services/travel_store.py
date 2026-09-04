@@ -27,6 +27,7 @@ from agents.schemas import (
     PlanDay,
     PlanItem,
     RoutePlan,
+    TransportPage,
     TransportOption,
     TravelConstraint,
     TravelFact,
@@ -306,6 +307,21 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             option_values["source_ids"] = _list_value(option_values.get("source_ids"))
             transport_options.append(TransportOption(**option_values))
 
+    transport_pages = []
+    for raw_page in payload.get("transport_pages") or []:
+        if isinstance(raw_page, dict):
+            transport_pages.append(
+                TransportPage(
+                    mode=str(raw_page.get("mode") or ""),
+                    offset=max(0, int(raw_page.get("offset") or 0)),
+                    limit=max(1, int(raw_page.get("limit") or 5)),
+                    returned_count=max(0, int(raw_page.get("returned_count") or 0)),
+                    total_count=max(0, int(raw_page.get("total_count") or 0)),
+                    has_more=bool(raw_page.get("has_more")),
+                    filter=str(raw_page.get("filter") or "all"),
+                )
+            )
+
     sources = []
     for raw_source in payload.get("sources") or []:
         if isinstance(raw_source, dict):
@@ -366,6 +382,7 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             "summary": "",
             "out_of_range_items": [],
             "transport_options": [],
+            "transport_pages": [],
             "route_plans": [],
             "conflicts": [],
             "risks": [],
@@ -390,6 +407,7 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
     values["constraints"] = constraints
     values["sources"] = sources
     values["transport_options"] = transport_options
+    values["transport_pages"] = transport_pages
     values["route_plans"] = route_plans
     values["destination_cities"] = _list_value(values.get("destination_cities"))
     # A malformed/old row should not make a thread impossible to open.
