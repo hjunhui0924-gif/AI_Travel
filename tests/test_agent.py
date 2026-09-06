@@ -3,8 +3,8 @@ from langchain.messages import AIMessage, AIMessageChunk
 from agents.schemas import TransportOption, TransportPage, TransportQueryPage, TravelPlan, TravelPlanResponse
 
 
-def test_model_settings_prefer_deepseek_when_generic_llm_is_not_configured(monkeypatch):
-    for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL"):
+def test_model_settings_prefer_qwen_when_dashscope_is_configured(monkeypatch):
+    for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "DASHSCOPE_MODEL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
     monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deekseek.com/v1")
@@ -13,8 +13,22 @@ def test_model_settings_prefer_deepseek_when_generic_llm_is_not_configured(monke
 
     settings = agent._resolve_model_settings()
 
-    assert settings["model"] == "deepseek-chat"
+    assert settings["model"] == "qwen3.7-flash"
     assert settings["model_provider"] == "openai"
+    assert settings["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert settings["api_key"] == "test-dashscope-key"
+    assert settings["extra_body"] == {"enable_thinking": False}
+
+
+def test_model_settings_fall_back_to_deepseek_without_dashscope(monkeypatch):
+    for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "DASHSCOPE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deekseek.com/v1")
+
+    settings = agent._resolve_model_settings()
+
+    assert settings["model"] == "deepseek-chat"
     assert settings["base_url"] == "https://api.deepseek.com/v1"
     assert settings["api_key"] == "test-deepseek-key"
 

@@ -607,12 +607,53 @@ a:hover {
   gap: 6px;
   align-items: baseline;
 }
+.activity-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+.activity-detail {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.activity-marker {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.42;
+}
 .activity-item .activity-state {
   font-family: var(--font-mono);
   font-size: 11px;
+  white-space: nowrap;
+  opacity: 0.7;
 }
 .activity-item.running .activity-title {
   color: var(--info);
+}
+.activity-item.running .activity-marker {
+  opacity: 1;
+  background: var(--info);
+  box-shadow: 0 0 0 4px var(--info-soft);
+}
+.activity-item.failed .activity-title,
+.activity-item.failed .activity-state {
+  color: var(--danger);
+}
+.activity-item.stopped .activity-title,
+.activity-item.stopped .activity-state {
+  color: var(--accent);
+}
+.activity-item.stopped .activity-marker {
+  background: var(--accent);
+  opacity: 1;
 }
 
 .message-meta-row {
@@ -729,6 +770,15 @@ a:hover {
 .send-btn:hover:not(:disabled) {
   background: #a94e30;
   transform: translateY(-1px);
+}
+.send-btn.is-stop {
+  background: var(--info);
+}
+.send-btn.is-stop:hover:not(:disabled) {
+  background: #0d6e68;
+}
+.send-btn.is-stop .stop-icon {
+  animation: stop-button-pulse 1.4s ease-in-out infinite;
 }
 .send-btn:disabled {
   background: var(--border-strong);
@@ -3704,6 +3754,11 @@ a:hover {
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes stop-button-pulse {
+  0%, 100% { opacity: 0.72; }
+  50% { opacity: 1; }
+}
+
 /* Drawer navigation */
 .sidebar {
   position: fixed;
@@ -4810,6 +4865,66 @@ a:hover {
   margin-top: 6px;
   padding: 7px 0 4px 13px;
   border-left-color: rgba(243, 181, 104, 0.4);
+}
+.main-column.is-workspace .activity-disclaimer {
+  margin: 0 0 8px;
+  color: rgba(255, 250, 240, 0.48);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.main-column.is-workspace .activity-detail {
+  color: rgba(255, 250, 240, 0.54);
+}
+.main-column.is-workspace .activity-state {
+  color: rgba(255, 250, 240, 0.5);
+}
+.main-column.is-workspace .activity-interrupted,
+.main-column.is-workspace .message-interrupted,
+.main-column.is-workspace .message-retry-row {
+  color: #f3b568;
+}
+.activity-interrupted,
+.message-interrupted {
+  margin: 7px 0 0;
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.message-retry-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.message-retry-hint {
+  overflow-wrap: anywhere;
+}
+.message-retry-btn {
+  min-height: 30px;
+  padding: 4px 11px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: transparent;
+  cursor: pointer;
+  transition: color 180ms ease, background 180ms ease, border-color 180ms ease;
+}
+.message-retry-btn:hover:not(:disabled),
+.message-retry-btn:focus-visible {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.message-retry-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+.message-retry-limit {
+  color: var(--text-muted);
 }
 
 .activity-reveal-enter-active,

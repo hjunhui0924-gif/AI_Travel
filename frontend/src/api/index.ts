@@ -88,6 +88,13 @@ export function deleteHistory(threadId: string) {
   return apiDelete<{ status: string }>(`/history/${encodeURIComponent(threadId)}`);
 }
 
+export function cancelChat(threadId: string, requestId: string) {
+  return apiPostJson<{ status: string; cancelled: boolean }>("/chat/cancel", {
+    thread_id: threadId,
+    request_id: requestId,
+  });
+}
+
 export function migrateLegacyThreads(threadIds: string[]) {
   return apiPostJson<{
     status: string;

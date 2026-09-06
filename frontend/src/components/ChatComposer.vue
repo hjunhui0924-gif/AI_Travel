@@ -27,6 +27,10 @@ async function send() {
   await chat.send(text);
 }
 
+function stop() {
+  chat.stopGeneration();
+}
+
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
@@ -117,17 +121,22 @@ function onPaste(e: ClipboardEvent) {
         </button>
         <button
           class="send-btn"
+          :class="{ 'is-stop': chat.loading }"
           type="button"
-          title="发送"
-          :disabled="!ready || chat.loading || (!input.trim() && !chat.pendingFiles.length)"
-          @click="send"
+          :aria-label="chat.loading ? '停止生成' : '发送消息'"
+          :title="chat.loading ? '停止生成' : '发送消息'"
+          :disabled="!ready || (!chat.loading && (!input.trim() && !chat.pendingFiles.length))"
+          @click="chat.loading ? stop() : send()"
         >
           <svg v-if="!chat.loading" width="17" height="17" viewBox="0 0 24 24" fill="none"
             stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="22" y1="2" x2="11" y2="13" />
             <polygon points="22 2 15 22 11 13 2 9 22 2" />
           </svg>
-          <span v-else class="spinner" style="border-top-color: #fff"></span>
+          <svg v-else class="stop-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"
+            aria-hidden="true">
+            <rect x="6.5" y="6.5" width="11" height="11" rx="1.5" />
+          </svg>
         </button>
       </div>
     </div>

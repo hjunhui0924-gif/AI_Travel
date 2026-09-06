@@ -423,3 +423,18 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 保留 `agents/agent.py` 当前仍被 API 使用的模型初始化、旅行范围识别、Travel Supervisor 调度、流式 SSE、历史 checkpoint、来源/计划缓冲和会话清理能力。
 - 删除只覆盖退役通用网页搜索和通用 Agent 的测试；旅行联网搜索仍由 `services/travel_search.py` 和 `TravelSupervisor` 负责。
 - 移除 `chromadb` 依赖、Embedding 环境变量示例和 `resources/chroma_runtime/` 运行缓存说明；文本附件仍由 `utils/file_utils.py` 做有界解析与段落切分。
+
+## 28. 工作摘要与生成停止（2026-09-06）
+
+- 执行步骤 UI 改为展示可验证的工作摘要：旅行需求识别、查询方案、已调用的数据源、结果数量和失败状态；不展示模型内部思维链。
+- `/chat` 支持随机 `request_id`，新增 `/chat/cancel`，使用相同的线程归属和 guest capability 鉴权，并在 Supervisor、Provider 编排和结果整理边界执行协作取消。
+- 前端停止按钮会 abort 当前 SSE、保留已收到文本并标记本轮已停止；已进入 provider 的单次同步网络调用可能完成后才到达取消边界。
+- 新增取消控制单元/API 回归与 Playwright 停止交互验证；完整后端测试为 160 passed、1 个既有 Starlette 依赖弃用警告，前端 typecheck/build 通过。
+
+## 29. Qwen 与 12306 查询降延迟（2026-09-06）
+
+- 未设置通用 `LLM_*` 配置时，DashScope 优先于 DeepSeek；当前模型配置为 `qwen3.7-flash`，默认关闭 Qwen3 Flash 隐藏思考 token，模型请求超时默认 15 秒且不做 SDK 内部重试。
+- 明确的铁路、航班和交通比较请求直接进入确定性 provider 路由，跳过不必要的多轮 Supervisor 工具决策；Supervisor 在其他旅行规划场景仍负责工具选择，Qwen 返回普通文本时保留已验证工具结果并采用安全默认动作，避免重复查询。
+- 12306 站点字典增加本地持久缓存（默认 24 小时），车次原始响应增加 20 秒短缓存；默认单次 HTTP 超时 8 秒、总超时 18 秒，备用 endpoint 默认不重试，可通过 `RAIL_MAX_RETRIES` 显式开启最多 2 次备用尝试。
+- provider 失败/超时通过结构化 `retryable` 字段传给前端；前端显示“重试”按钮，最多允许 2 次手动重试，并复用原始请求与附件。
+- 实测：Qwen3.7 Flash 直连 HTTP 200；上海→杭州高铁首次约 15.3 秒，短缓存命中约 0.5 秒；取消/重试回归与完整测试、类型检查和构建均通过。

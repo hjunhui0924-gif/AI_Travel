@@ -14,6 +14,9 @@ import { useSessionStore } from "./session";
 import { usePlanStore } from "./plan";
 import { useAuthStore } from "./auth";
 
+export const MAX_RETRY_ATTEMPTS = 2;
+const CHAT_REQUEST_TIMEOUT_MS = 45_000;
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
@@ -31,6 +34,13 @@ export interface ChatMessage {
   /** local-only flags */
   streaming?: boolean;
   failed?: boolean;
+  /** The user stopped generation before the server sent a final done event. */
+  interrupted?: boolean;
+  retryable?: boolean;
+  retry_reason?: string;
+  retry_attempts?: number;
+  /** Local-only files retained for a retry of the latest request. */
+  retry_files?: File[];
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
@@ -56,6 +66,9 @@ export const useChatStore = defineStore("chat", {
     requestGeneration: 0,
     historyRequestId: 0,
     activeController: null as AbortController | null,
+    activeRequestId: "",
+    activeThreadId: "",
+    activeTimeoutId: null as number | null,
   }),
   actions: {
     async loadHistory() {
@@ -83,6 +96,8 @@ export const useChatStore = defineStore("chat", {
           answer_segments: m.answer_segments ?? [],
           clarification: m.clarification ?? null,
           scope_refusal: m.scope_refusal ?? false,
+          retryable: m.retryable ?? false,
+          retry_reason: m.retry_reason ?? "",
           search_enabled: m.search_enabled,
           plan_id: m.plan_id ?? null,
           plan_version: m.plan_version ?? null,
@@ -104,13 +119,38 @@ export const useChatStore = defineStore("chat", {
 
     /** Abort the active stream and invalidate all callbacks from that thread. */
     cancelPending() {
+      const requestId = this.activeRequestId;
+      const threadId = this.activeThreadId;
+      if (requestId && threadId) {
+        void api.cancelChat(threadId, requestId).catch(() => undefined);
+      }
       this.requestGeneration += 1;
       this.activeController?.abort();
       this.activeController = null;
+      if (this.activeTimeoutId !== null) {
+        window.clearTimeout(this.activeTimeoutId);
+        this.activeTimeoutId = null;
+      }
+      this.activeRequestId = "";
+      this.activeThreadId = "";
       this.loading = false;
       this.streaming = false;
       this.liveActivities = [];
       this.liveSources = [];
+    },
+
+    /** Stop the current response while keeping the text already received. */
+    stopGeneration() {
+      if (!this.loading && !this.streaming) return;
+      const current = [...this.messages]
+        .reverse()
+        .find((message) => message.role === "assistant" && message.streaming);
+      if (current) {
+        current.streaming = false;
+        current.failed = false;
+        current.interrupted = true;
+      }
+      this.cancelPending();
     },
 
     addFiles(files: FileList | File[]) {
@@ -134,18 +174,35 @@ export const useChatStore = defineStore("chat", {
       this.pendingFiles.splice(index, 1);
     },
 
-    async send(message: string) {
+    async send(
+      message: string,
+      options: {
+        files?: File[];
+        suppressUserMessage?: boolean;
+        retryAttempts?: number;
+        insertAssistantAt?: number;
+        searchEnabled?: boolean;
+      } = {},
+    ) {
       const session = useSessionStore();
       const plan = usePlanStore();
       const text = message.trim();
+      const files = options.files ? [...options.files] : [...this.pendingFiles];
       if (this.loading) return;
       if (!session.threadId) return;
-      if (!text && this.pendingFiles.length === 0) return;
+      if (!text && files.length === 0) return;
 
       const threadId = session.threadId;
+      const activeSearchEnabled = options.searchEnabled ?? this.searchEnabled;
       const requestGeneration = ++this.requestGeneration;
       const controller = new AbortController();
+      const requestId =
+        typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       this.activeController = controller;
+      this.activeRequestId = requestId;
+      this.activeThreadId = threadId;
       const isCurrentRequest = () => {
         return (
           requestGeneration === this.requestGeneration &&
@@ -155,41 +212,77 @@ export const useChatStore = defineStore("chat", {
 
       session.rememberGuestTitle(text);
 
-      this.messages.push({
-        role: "user",
-        content: text,
-        attachments: this.pendingFiles.map((f) => ({
-          name: f.name,
-          modality: f.type.startsWith("image/") ? "image" : "text",
-        })),
-        search_enabled: this.searchEnabled,
-      });
+      if (!options.suppressUserMessage) {
+        this.messages.push({
+          role: "user",
+          content: text,
+          attachments: files.map((f) => ({
+            name: f.name,
+            modality: f.type.startsWith("image/") ? "image" : "text",
+          })),
+          search_enabled: activeSearchEnabled,
+        });
+      }
 
-      const assistantIndex = this.messages.length;
-      this.messages.push({
+      const assistantMessageData: ChatMessage = {
         role: "assistant",
         content: "",
         activities: [],
         sources: [],
         answer_segments: [],
         streaming: true,
-      });
+        retry_attempts: options.retryAttempts ?? 0,
+        retry_files: files,
+        search_enabled: activeSearchEnabled,
+      };
+      const insertAt = options.insertAssistantAt;
+      const assistantIndex =
+        typeof insertAt === "number" && insertAt >= 0 && insertAt <= this.messages.length
+          ? insertAt
+          : this.messages.length;
+      this.messages.splice(assistantIndex, 0, assistantMessageData);
       const assistantMessage = () => this.messages[assistantIndex];
+
+      // 流式合帧：高频文本增量按动画帧合并提交，一帧只做一次内容更新与
+      // 重新渲染，降低长回答逐 token 全量重渲染/滚动的布局开销（2026-09-06）。
+      let pendingText = "";
+      let flushQueued = false;
+      const flushText = () => {
+        if (pendingText) {
+          const current = assistantMessage();
+          if (current) current.content += pendingText;
+          pendingText = "";
+        }
+        flushQueued = false;
+      };
+      const queueTextFlush = () => {
+        if (flushQueued) return;
+        flushQueued = true;
+        requestAnimationFrame(flushText);
+      };
 
       const form = new FormData();
       form.append("message", text);
       form.append("thread_id", threadId);
-      form.append("search_enabled", String(this.searchEnabled));
-      for (const file of this.pendingFiles) {
+      form.append("search_enabled", String(activeSearchEnabled));
+      form.append("request_id", requestId);
+      for (const file of files) {
         form.append("files", file, file.name);
       }
-      this.pendingFiles = [];
+      if (!options.files) this.pendingFiles = [];
 
       this.loading = true;
       this.streaming = true;
       this.liveActivities = [];
       this.liveSources = [];
       let sawDone = false;
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+        void api.cancelChat(threadId, requestId).catch(() => undefined);
+      }, CHAT_REQUEST_TIMEOUT_MS);
+      this.activeTimeoutId = timeoutId;
 
       try {
         await api.streamChat(form, {
@@ -207,16 +300,20 @@ export const useChatStore = defineStore("chat", {
           },
           onText: (delta) => {
             if (!isCurrentRequest()) return;
-            const current = assistantMessage();
-            if (current) current.content += delta;
+            pendingText += delta;
+            queueTextFlush();
           },
           onDone: (payload: DonePayload) => {
             if (!isCurrentRequest()) return;
+            flushText();
             sawDone = true;
             const current = assistantMessage();
             if (!current) return;
             current.streaming = false;
             current.failed = payload.ok === false;
+            current.interrupted = false;
+            current.retryable = payload.retryable ?? false;
+            current.retry_reason = payload.retry_reason ?? "";
             current.content = payload.final_text || current.content;
             current.answer_segments = payload.answer_segments ?? [];
             current.clarification = payload.clarification ?? null;
@@ -242,10 +339,14 @@ export const useChatStore = defineStore("chat", {
           },
           onError: (message) => {
             if (!isCurrentRequest()) return;
+            flushText();
             const current = assistantMessage();
             if (current) {
               current.streaming = false;
               current.failed = true;
+              current.interrupted = false;
+              current.retryable = true;
+              current.retry_reason = message || "服务暂时不可用，可以重试。";
               current.content =
                 current.content || message || "服务异常，请稍后重试。";
             }
@@ -255,32 +356,66 @@ export const useChatStore = defineStore("chat", {
         });
       } catch {
         if (isCurrentRequest()) {
+          flushText();
           const current = assistantMessage();
           if (current) {
             current.streaming = false;
             current.failed = true;
-            current.content = current.content || "网络异常，请稍后重试。";
+            current.retryable = true;
+            current.retry_reason = timedOut
+              ? "本轮请求超时，可以重试。"
+              : "网络异常，可以重试。";
+            current.content = current.content || current.retry_reason;
           }
         }
       } finally {
         if (isCurrentRequest()) {
+          flushText();
           // A stream that ends without done is an incomplete response, not a
           // successful turn. Keep partial text but make the failure explicit.
           const current = assistantMessage();
           if (!sawDone) {
             if (current) {
               current.failed = true;
-              current.content = current.content || "本轮回答未完成，请稍后重试。";
+              current.interrupted = false;
+              current.retryable = true;
+              current.retry_reason = timedOut
+                ? "本轮请求超时，可以重试。"
+                : "本轮回答未完成，可以重试。";
+              current.content = current.content || current.retry_reason;
             }
           }
           if (current) current.streaming = false;
           this.streaming = false;
           this.loading = false;
           this.activeController = null;
+          this.activeRequestId = "";
+          this.activeThreadId = "";
+          window.clearTimeout(timeoutId);
+          if (this.activeTimeoutId === timeoutId) this.activeTimeoutId = null;
           const auth = useAuthStore();
           if (auth.authenticated) session.refreshSessions();
         }
       }
+    },
+
+    retryMessage(message: ChatMessage) {
+      if (this.loading || !message.retryable) return;
+      const index = this.messages.indexOf(message);
+      if (index <= 0 || index >= this.messages.length) return;
+      const userMessage = this.messages[index - 1];
+      if (userMessage.role !== "user") return;
+      const attempts = message.retry_attempts ?? 0;
+      if (attempts >= MAX_RETRY_ATTEMPTS) return;
+      const files = message.retry_files ? [...message.retry_files] : [];
+      this.messages.splice(index, 1);
+      void this.send(userMessage.content, {
+        files,
+        suppressUserMessage: true,
+        retryAttempts: attempts + 1,
+        insertAssistantAt: index,
+        searchEnabled: userMessage.search_enabled ?? false,
+      });
     },
   },
 });

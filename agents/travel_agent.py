@@ -554,6 +554,23 @@ def _is_well_formed_transport_option(option: TransportOption) -> bool:
     )
 
 
+def _provider_retry_info(adapter_status: dict[str, str]) -> tuple[bool, str]:
+    """Return a user-facing retry hint for transient provider failures."""
+
+    labels = {
+        "rail": "铁路",
+        "flight": "航班",
+        "route": "地图路线",
+        "poi": "目的地地点",
+        "weather": "天气",
+        "web_search": "联网搜索",
+    }
+    failed = [labels[key] for key, status in adapter_status.items() if status == "failed" and key in labels]
+    if not failed:
+        return False, ""
+    return True, f"{'、'.join(failed)}数据源暂时不可用，可以点击重试。"
+
+
 def _plan_is_explicitly_requested(query: TravelQuery) -> bool:
     """Avoid turning a plain discovery/query turn into a saved itinerary."""
 
@@ -1035,7 +1052,13 @@ def plan_travel(
     activity_logger=None,
     extraction_hint: dict | None = None,
     supervisor_result: TravelSupervisorResult | None = None,
+    cancellation_check=None,
 ) -> TravelPlanResponse:
+    def check_cancelled() -> None:
+        if cancellation_check:
+            cancellation_check()
+
+    check_cancelled()
     query = (
         supervisor_result.query
         if supervisor_result is not None and not supervisor_result.fallback_used
@@ -1046,6 +1069,7 @@ def plan_travel(
             extraction_hint=extraction_hint,
         )
     )
+    check_cancelled()
     clarification = _build_clarification(query)
     if clarification is not None:
         # Do not create a placeholder TravelPlan or spend provider quota while
@@ -1131,6 +1155,7 @@ def plan_travel(
             adapter_status["rail"] = "failed"
             diagnostics.append(f"rail adapter failed: {type(exc).__name__}")
             alerts.append("高铁数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+        check_cancelled()
     else:
         adapter_status["rail"] = "not_requested"
 
@@ -1159,6 +1184,7 @@ def plan_travel(
             adapter_status["flight"] = "failed"
             diagnostics.append(_flight_failure_detail(exc))
             alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+        check_cancelled()
     elif supervisor_result is None or supervisor_result.fallback_used:
         adapter_status["flight"] = "not_requested"
     rail_options = [item for item in rail_options if _is_well_formed_transport_option(item)]
@@ -1190,6 +1216,7 @@ def plan_travel(
             poi_items, poi_groups, poi_sources, poi_errors = [], [], [], []
             web_search_status = "not_requested"
     elif include_explore:
+        check_cancelled()
         try:
             route_result = get_route_plans(query)
             route_plans = list(route_result)
@@ -1209,6 +1236,7 @@ def plan_travel(
             adapter_status["route"] = "failed"
             diagnostics.append(f"route adapter failed: {type(exc).__name__}")
             alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
+        check_cancelled()
         try:
             poi_result = recommend_pois(
                 query, search_enabled=search_enabled, activity_logger=activity_logger
@@ -1233,6 +1261,7 @@ def plan_travel(
             diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
         else:
             adapter_status["poi"] = poi_status
+        check_cancelled()
 
         # A generic city request such as "广州五日游" has no explicit
         # landmark list, so the first route lookup quite correctly returns
@@ -1266,6 +1295,7 @@ def plan_travel(
                     adapter_status["route"] = "failed"
                     diagnostics.append(f"route adapter failed: {type(exc).__name__}")
                     alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
+                check_cancelled()
     else:
         route_plans = []
         poi_items, poi_groups, poi_sources, poi_errors = [], [], [], []
@@ -1285,12 +1315,15 @@ def plan_travel(
             adapter_status["weather"] = "failed"
             diagnostics.append(f"weather adapter failed: {type(exc).__name__}")
             alerts.append("天气接口暂时失败，行程中的天气判断需要重新查询。")
+        check_cancelled()
     else:
         weather_summary = ""
         adapter_status["weather"] = "not_requested"
 
     adapter_status["web_search"] = "not_requested" if not include_explore else web_search_status
+    retryable, retry_reason = _provider_retry_info(adapter_status)
     risks.extend(poi_errors)
+    check_cancelled()
     timeline = build_timeline(query, transport_options, route_plans, poi_items, poi_groups) if include_explore else []
     if any(option.is_demo for option in transport_options):
         risks.append("当前交通列表含演示数据，只用于联调展示，不可用于购票或判断真实班次。")
@@ -1328,6 +1361,7 @@ def plan_travel(
         )
 
     if model_decision == "refuse":
+        check_cancelled()
         return TravelPlanResponse(
             intent=query.intent,
             summary=(supervisor_result.answer if supervisor_result else "抱歉，这个请求不在旅行规划服务范围内。"),
@@ -1343,9 +1377,11 @@ def plan_travel(
             decision="refuse",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "模型未授权生成旅行计划。"),
             scope_refusal=True,
+            retryable=False,
         )
 
     if model_decision == "clarify":
+        check_cancelled()
         model_clarification = ClarificationRequest(
             code="model_clarification",
             prompt=(
@@ -1371,11 +1407,13 @@ def plan_travel(
             pending_query=asdict(query),
             decision="clarify",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "旅行条件仍不完整。"),
+            retryable=False,
         )
 
     if model_decision == "answer" or (
         supervisor_result is None and not _plan_is_explicitly_requested(query)
     ):
+        check_cancelled()
         has_effective_data = _has_effective_travel_data(
             query, transport_options, route_plans, poi_items, weather_summary
         )
@@ -1403,9 +1441,12 @@ def plan_travel(
             sources=sources,
             decision="answer",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "本轮未明确要求生成行程。"),
+            retryable=retryable,
+            retry_reason=retry_reason,
         )
 
     if not _has_effective_travel_data(query, transport_options, route_plans, poi_items, weather_summary):
+        check_cancelled()
         alerts.extend(item for item in poi_errors if item not in alerts)
         alerts.append(NO_PROVIDER_DATA_NOTICE)
         no_data_summary = (
@@ -1431,8 +1472,11 @@ def plan_travel(
             sources=sources,
             decision="answer",
             decision_reason="没有有效 provider 数据。",
+            retryable=retryable,
+            retry_reason=retry_reason,
         )
 
+    check_cancelled()
     plan = _build_structured_plan(
         query,
         thread_id=thread_id,
@@ -1451,6 +1495,7 @@ def plan_travel(
         current_plan=current_plan,
     )
 
+    check_cancelled()
     return TravelPlanResponse(
         intent=query.intent,
         summary=_build_summary(query),
@@ -1470,6 +1515,8 @@ def plan_travel(
         conflicts=plan.conflicts,
         decision="plan",
         decision_reason=(supervisor_result.decision_reason if supervisor_result else "已明确提出行程规划需求，且取得有效数据。"),
+        retryable=retryable,
+        retry_reason=retry_reason,
     )
 
 

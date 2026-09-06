@@ -1,5 +1,8 @@
 from uuid import uuid4
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from time import sleep
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +30,7 @@ from services.travel_store import (
     save_travel_turn,
     travel_plan_store,
 )
+from services.generation_control import register_generation, unregister_generation
 
 
 def test_guest_travel_plan_and_calendar_endpoints():
@@ -709,6 +713,102 @@ def test_chat_stream_hides_internal_exception_details(monkeypatch):
         assert app_module.INTERNAL_SSE_ERROR_MESSAGE in response.text
         assert "provider-secret-token" not in response.text
         assert "/private/provider/path" not in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_chat_done_exposes_retryable_provider_failure(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+
+    def fake_stream_chat(**_kwargs):
+        yield AIMessageChunk(content=[{"type": "text", "text": "铁路暂时不可用。"}]), {
+            "travel": True,
+            "retryable": True,
+            "retry_reason": "铁路数据源暂时不可用，可以点击重试。",
+        }
+
+    monkeypatch.setattr(app_module, "stream_chat", fake_stream_chat)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+    try:
+        response = client.post(
+            "/chat",
+            data={"message": "查高铁", "thread_id": thread_id, "search_enabled": "false"},
+        )
+        assert response.status_code == 200
+        assert '"retryable": true' in response.text
+        assert "铁路数据源暂时不可用" in response.text
+    finally:
+        delete_travel_thread(thread_id)
+
+
+def test_guest_can_cancel_its_own_in_flight_chat():
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    request_id = f"request_{uuid4().hex}"
+    control = register_generation(request_id, thread_id, None)
+    client = TestClient(app_module.app)
+    client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+    try:
+        response = client.post(
+            "/chat/cancel",
+            json={"request_id": request_id, "thread_id": thread_id},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "success", "cancelled": True}
+        assert control is not None and control.event.is_set()
+    finally:
+        unregister_generation(request_id, control)
+        delete_travel_thread(thread_id)
+
+
+def test_cancelled_chat_keeps_partial_sse_and_skips_done(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    guest_token = ensure_guest_access(thread_id)
+    request_id = f"request_{uuid4().hex}"
+    started = Event()
+
+    def cancellable_stream_chat(**kwargs):
+        yield AIMessageChunk(content=[{"type": "text", "text": "已经开始整理。"}]), {}
+        started.set()
+        while True:
+            kwargs["cancellation_check"]()
+            sleep(0.01)
+
+    monkeypatch.setattr(app_module, "stream_chat", cancellable_stream_chat)
+    chat_client = TestClient(app_module.app)
+    cancel_client = TestClient(app_module.app)
+    chat_client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+    cancel_client.cookies.set(app_module.GUEST_COOKIE_NAME, guest_token)
+
+    def run_chat():
+        return chat_client.post(
+            "/chat",
+            data={
+                "message": "杭州旅行",
+                "thread_id": thread_id,
+                "request_id": request_id,
+                "search_enabled": "false",
+            },
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_chat)
+            assert started.wait(timeout=5)
+            cancelled = cancel_client.post(
+                "/chat/cancel",
+                json={"request_id": request_id, "thread_id": thread_id},
+            )
+            response = future.result(timeout=5)
+
+        assert cancelled.status_code == 200
+        assert cancelled.json()["cancelled"] is True
+        assert response.status_code == 200
+        assert "已经开始整理。" in response.text
+        assert "event: done" not in response.text
+        assert "event: error" not in response.text
     finally:
         delete_travel_thread(thread_id)
 

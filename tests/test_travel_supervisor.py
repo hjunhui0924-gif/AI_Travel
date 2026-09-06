@@ -48,6 +48,18 @@ class FakeDecisionModel(FakeToolCallingModel):
         return AIMessage(content=self.decisions.pop(0))
 
 
+class ToolThenNaturalAnswerModel(FakeToolCallingModel):
+    def __init__(self, calls, answer):
+        super().__init__(calls)
+        self.answer = answer
+
+    def invoke(self, messages):
+        self.invocations.append(messages)
+        if self.calls:
+            return AIMessage(content="", tool_calls=[self.calls.pop(0)])
+        return AIMessage(content=self.answer)
+
+
 def test_supervisor_exposes_model_decision_contract_for_direct_answer():
     model = FakeDecisionModel([
         '{"decision":"answer","answer":"已查到可用信息。","reason":"用户只要求查询"}'
@@ -139,6 +151,31 @@ def test_supervisor_model_decides_rail_tool_and_does_not_call_flight(monkeypatch
     assert [item.title for item in result.transport_options] == ["G123"]
     assert result.transport_pages[0].mode == "rail"
     assert "search_flight" in model.tool_names
+
+
+def test_supervisor_keeps_verified_data_when_qwen_returns_natural_note(monkeypatch):
+    model = ToolThenNaturalAnswerModel(
+        [{"name": "search_poi", "args": {"anchors": []}, "id": "call_poi"}],
+        "已经找到可用地点。",
+    )
+    poi = travel_supervisor.PoiRecommendation(name="西湖", category="景点", source_ids=["poi_1"])
+    monkeypatch.setattr(
+        travel_supervisor,
+        "recommend_pois",
+        lambda *args, **kwargs: ([poi], [], [], []),
+    )
+
+    result = travel_supervisor.run_travel_supervisor(
+        model,
+        "杭州有哪些适合散步的地方",
+        [],
+        _query("杭州有哪些适合散步的地方", "nearby_explore"),
+    )
+
+    assert result.fallback_used is False
+    assert result.decision == "answer"
+    assert result.answer == "已经找到可用地点。"
+    assert result.poi_items[0].name == "西湖"
 
 
 def test_supervisor_rejects_wrong_provider_call_for_explicit_rail_request(monkeypatch):

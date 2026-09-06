@@ -1113,3 +1113,98 @@
     box-shadow: 0 0 0 2px rgba(239, 98, 84, 0.18);
   }
 }
+
+/* ============================================================
+   性能与液态玻璃 pass（2026-09-06）
+   目的：① 工作台各玻璃面从 26px 深磨砂收敛为 16px 清透玻璃 + 30%
+   强度的液态玻璃细节（上缘高光带、稍亮描边、发丝内辉光），底色微补偿
+   以保持正文可读性；② 状态切换 / 全屏照片交叉淡化期间暂停毛玻璃
+   重采样（backdrop-filter），避免照片逐帧变化时整屏反复重新模糊。
+   常驻观感与上一版接近，动画帧开销显著下降。
+   ============================================================ */
+
+/* —— 工作台消息玻璃容器：更清透 + 上缘高光带 + 亮描边 —— */
+.main-column.is-workspace .workspace-chat-surface {
+  border-color: rgba(255, 250, 240, 0.44);
+  background:
+    radial-gradient(120% 64% at 50% -14%, rgba(255, 250, 240, 0.14), rgba(255, 250, 240, 0.04) 38%, rgba(255, 250, 240, 0) 56%),
+    linear-gradient(135deg, rgba(255, 250, 240, 0.12), rgba(255, 250, 240, 0.035) 44%, rgba(7, 34, 39, 0.12)),
+    rgba(7, 34, 39, 0.21);
+  box-shadow:
+    0 26px 70px rgba(3, 18, 22, 0.22),
+    inset 0 1px 0 rgba(255, 250, 240, 0.34),
+    inset 0 0 0 0.5px rgba(255, 250, 240, 0.12);
+  backdrop-filter: blur(16px) saturate(122%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(122%) contrast(102%);
+}
+
+/* —— 顶部栏：更亮的下缘光 + 轻玻璃底色 —— */
+.main-column.is-workspace .header {
+  border-bottom-color: rgba(255, 250, 240, 0.24);
+  background: linear-gradient(180deg, rgba(255, 250, 240, 0.07), rgba(5, 24, 29, 0.28) 72%);
+  backdrop-filter: blur(8px) saturate(120%);
+  -webkit-backdrop-filter: blur(8px) saturate(120%);
+}
+
+/* —— 顶部栏紧凑胶囊（探索页与工作台同款覆盖，特异性与原规则一致） —— */
+.main-column.is-explore .header.is-compact,
+.main-column.is-workspace .header.is-compact {
+  border-color: rgba(255, 250, 240, 0.4);
+  background: rgba(7, 34, 39, 0.64);
+  box-shadow:
+    0 14px 36px rgba(3, 18, 22, 0.22),
+    inset 0 1px 0 rgba(255, 250, 240, 0.3);
+  backdrop-filter: blur(11px) saturate(122%);
+  -webkit-backdrop-filter: blur(11px) saturate(122%);
+}
+
+/* —— 输入框 —— */
+.main-column.is-workspace .composer-inner {
+  border-color: rgba(255, 250, 240, 0.46);
+  background:
+    linear-gradient(180deg, rgba(255, 250, 240, 0.14), rgba(255, 250, 240, 0.05)),
+    rgba(7, 34, 39, 0.2);
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.18),
+    inset 0 1px 0 rgba(255, 250, 240, 0.28);
+  backdrop-filter: blur(9px) saturate(120%);
+  -webkit-backdrop-filter: blur(9px) saturate(120%);
+}
+
+/* —— 底部行程浮层 —— */
+.workspace-plan-dock {
+  border-color: rgba(255, 250, 240, 0.36);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* —— 动画期间暂停毛玻璃重采样（降帧来源消除） —— */
+
+/* 状态切换（遮幕展开/收起阶段） */
+.main-column.is-transitioning .workspace-chat-surface {
+  background: rgba(7, 34, 39, 0.62);
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.main-column.is-transitioning .composer-inner,
+.main-column.is-transitioning .workspace-plan-dock {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* 全屏照片交叉淡化期间（.app-background enter/leave） */
+.main-column:has(.app-background-enter-active) .workspace-chat-surface,
+.main-column:has(.app-background-leave-active) .workspace-chat-surface {
+  background: rgba(7, 34, 39, 0.62);
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+.main-column:has(.app-background-enter-active) .header,
+.main-column:has(.app-background-leave-active) .header,
+.main-column:has(.app-background-enter-active) .composer-inner,
+.main-column:has(.app-background-leave-active) .composer-inner,
+.main-column:has(.app-background-enter-active) .workspace-plan-dock,
+.main-column:has(.app-background-leave-active) .workspace-plan-dock {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}

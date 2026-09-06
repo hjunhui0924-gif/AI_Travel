@@ -86,6 +86,8 @@ export interface HistoryMessage {
   answer_segments?: AnswerSegment[];
   clarification?: ClarificationRequest | null;
   scope_refusal?: boolean;
+  retryable?: boolean;
+  retry_reason?: string;
   search_enabled?: boolean;
   plan_id?: string | null;
   plan_version?: number | null;
@@ -279,6 +281,8 @@ export interface DonePayload {
   scope_refusal?: boolean;
   decision?: "answer" | "clarify" | "plan" | "refuse" | string;
   decision_reason?: string;
+  retryable?: boolean;
+  retry_reason?: string;
   activities: ActivityEvent[];
   sources: SourceInfo[];
   trip_plan: TravelPlan | null;

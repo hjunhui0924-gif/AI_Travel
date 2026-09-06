@@ -38,6 +38,7 @@ from services.answer_citations import (
     strip_citation_markers,
     validate_answer_segments,
 )
+from services.generation_control import GenerationCancelled
 
 load_dotenv()
 
@@ -173,14 +174,22 @@ def _resolve_model_settings() -> dict:
     """Resolve one OpenAI-compatible chat model without ambiguous fallbacks.
 
     A generic LLM_* configuration is treated as an explicit user choice. When
-    it is absent, prefer DeepSeek over DashScope because both providers may be
-    present locally but their quota and model names are not interchangeable.
-    All compatible providers use LangChain's ``openai`` adapter.
+    it is absent, prefer the configured DashScope Qwen model over DeepSeek so
+    the local deployment has one predictable primary provider. All compatible
+    providers use LangChain's ``openai`` adapter.
     """
 
     explicit_key = _env_value("LLM_API_KEY")
     explicit_base_url = _env_value("LLM_BASE_URL")
     explicit_provider = _env_value("LLM_PROVIDER").lower()
+    try:
+        model_timeout = max(5.0, min(120.0, float(_env_value("LLM_TIMEOUT_SECONDS") or "15")))
+    except ValueError:
+        model_timeout = 15.0
+    model_transport = {
+        "timeout": model_timeout,
+        "max_retries": 0,
+    }
 
     if explicit_key or explicit_base_url:
         provider = explicit_provider or "openai"
@@ -190,6 +199,22 @@ def _resolve_model_settings() -> dict:
             "base_url": explicit_base_url or _env_value("OPENAI_BASE_URL") or None,
             "api_key": explicit_key or _env_value("OPENAI_API_KEY"),
             "temperature": 0.2,
+            **model_transport,
+        }
+
+    dashscope_key = _env_value("DASHSCOPE_API_KEY")
+    if dashscope_key:
+        return {
+            "model": _env_value("DASHSCOPE_MODEL") or "qwen3.7-flash",
+            "model_provider": "openai",
+            "base_url": _env_value("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "api_key": dashscope_key,
+            "temperature": 0.2,
+            # Qwen3 Flash is used as a fast tool selector in this workflow;
+            # disable hidden reasoning tokens so a provider lookup does not
+            # spend tens of seconds thinking before the first tool call.
+            "extra_body": {"enable_thinking": False},
+            **model_transport,
         }
 
     deepseek_key = _env_value("DEEPSEEK_API_KEY")
@@ -200,16 +225,7 @@ def _resolve_model_settings() -> dict:
             "base_url": _deepseek_base_url(),
             "api_key": deepseek_key,
             "temperature": 0.2,
-        }
-
-    dashscope_key = _env_value("DASHSCOPE_API_KEY")
-    if dashscope_key:
-        return {
-            "model": _env_value("DASHSCOPE_MODEL") or "qwen-plus",
-            "model_provider": "openai",
-            "base_url": _env_value("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "api_key": dashscope_key,
-            "temperature": 0.2,
+            **model_transport,
         }
 
     return {
@@ -218,6 +234,7 @@ def _resolve_model_settings() -> dict:
         "base_url": _env_value("OPENAI_BASE_URL") or None,
         "api_key": _env_value("OPENAI_API_KEY"),
         "temperature": 0.2,
+        **model_transport,
     }
 
 
@@ -601,24 +618,32 @@ def _iter_stream_text(text: str, *, max_chars: int = TRAVEL_STREAM_CHUNK_SIZE):
         yield pending
 
 
-def _stream_answer_chunks(text: str, metadata: dict):
+def _stream_answer_chunks(text: str, metadata: dict, cancellation_check=None):
     """Yield answer chunks with a small gap so the browser can render a stream."""
 
     chunks = list(_iter_stream_text(text))
     if not chunks:
+        if cancellation_check:
+            cancellation_check()
         yield AIMessageChunk(content=[]), metadata
         return
     for index, part in enumerate(chunks):
+        if cancellation_check:
+            cancellation_check()
         yield AIMessageChunk(content=[{"type": "text", "text": part}]), metadata
         if index < len(chunks) - 1 and TRAVEL_STREAM_DELAY_SECONDS > 0:
             time.sleep(TRAVEL_STREAM_DELAY_SECONDS)
 
 
-def _stream_scope_refusal(message: str):
+def _stream_scope_refusal(message: str, cancellation_check=None):
     """Return a stable refusal when the classifier marks a turn out of scope."""
 
     _log_activity("scope", "非旅行问题", "已按旅行助手服务范围礼貌拒答")
-    yield from _stream_answer_chunks(TRAVEL_SCOPE_REFUSAL, {"scope_refusal": True})
+    yield from _stream_answer_chunks(
+        TRAVEL_SCOPE_REFUSAL,
+        {"scope_refusal": True},
+        cancellation_check=cancellation_check,
+    )
 
 
 def _parse_transport_more_request(
@@ -684,7 +709,10 @@ def _stream_transport_more_response(
     mode: str,
     limit: int,
     user_id: int | None = None,
+    cancellation_check=None,
 ):
+    if cancellation_check:
+        cancellation_check()
     existing_page = next(page for page in current_plan.transport_pages if page.mode == mode)
     offset = existing_page.offset + existing_page.returned_count
     try:
@@ -694,8 +722,11 @@ def _stream_transport_more_response(
         yield from _stream_answer_chunks(
             "暂时无法加载更多交通候选，请稍后重试。",
             {"travel": True, "transport_options": [], "transport_page": asdict(existing_page)},
+            cancellation_check=cancellation_check,
         )
         return
+    if cancellation_check:
+        cancellation_check()
 
     for source in result.sources:
         _log_source_card(
@@ -735,6 +766,7 @@ def _stream_transport_more_response(
             "transport_options": [asdict(option) for option in result.options],
             "transport_page": asdict(page),
         },
+        cancellation_check=cancellation_check,
     )
 
 
@@ -746,12 +778,18 @@ def _stream_travel_response(
     user_id: int | None = None,
     extraction_hint: dict | None = None,
     pending_query: dict | None = None,
+    cancellation_check=None,
 ):
-    _log_activity("think", "Travel intent detected", "Route request to travel orchestrator")
-    _log_activity("tool", "Build travel context", "Extract origin, destination, date, preferences, attachments", state="running")
+    def check_cancelled() -> None:
+        if cancellation_check:
+            cancellation_check()
+
+    _log_activity("think", "识别旅行需求", "已进入旅行规划工作流")
+    _log_activity("think", "整理旅行上下文", "提取出发地、目的地、日期、偏好和附件", state="running")
     # Flush the initial activity events before the synchronous adapter/model
     # work starts. The actual answer is streamed below once the plan is ready.
     yield AIMessageChunk(content=[]), {"travel": True}
+    check_cancelled()
     current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
     planning_message = message
     previous_message = str((pending_query or {}).get("raw_text") or "").strip()
@@ -767,13 +805,30 @@ def _stream_travel_response(
                 current_plan=current_plan,
                 extraction_hint=extraction_hint,
             )
+            check_cancelled()
             blocking_clarification = _build_clarification(supervisor_query)
             if blocking_clarification is not None:
                 # Missing/ambiguous destination is a hard safety gate. Do not
                 # spend provider quota or let the model invent a city route.
-                _log_activity("think", "需要补充旅行条件", blocking_clarification.code)
+                _log_activity("decision", "确认关键旅行条件", "信息还不完整，先向你确认目的地范围")
+            elif supervisor_query.intent in {"rail_query", "flight_query", "transport_compare"}:
+                # Explicit transport requests have a deterministic provider
+                # route. Skipping the multi-turn tool selector here avoids
+                # three extra Qwen calls before the user can see a ticket
+                # result, while plan_travel still owns provider validation and
+                # the final answer/plan gate.
+                labels = {
+                    "rail_query": "铁路",
+                    "flight_query": "航班",
+                    "transport_compare": "铁路与航班",
+                }
+                _log_activity(
+                    "decision",
+                    "按明确交通需求查询",
+                    f"直接查询{labels[supervisor_query.intent]}数据源",
+                )
             else:
-                _log_activity("think", "规划工具选择", "由旅行 Supervisor 判断所需数据源", state="running")
+                _log_activity("decision", "制定数据查询方案", "根据旅行目标选择必要的数据来源", state="running")
                 supervisor_result = run_travel_supervisor(
                     model,
                     planning_message,
@@ -781,22 +836,41 @@ def _stream_travel_response(
                     supervisor_query,
                     search_enabled=search_enabled,
                     activity_logger=_log_activity,
+                    cancellation_check=cancellation_check,
                 )
+                check_cancelled()
                 if supervisor_result.fallback_used:
                     _log_activity(
-                        "think",
-                        "规划工具选择降级",
-                        "Supervisor 未完成工具决策，改用确定性规划路径",
+                        "decision",
+                        "查询方案降级",
+                        "模型未完成工具选择，改用安全的确定性路径",
                     )
                 else:
+                    selected_tools = {
+                        "search_rail": "铁路",
+                        "search_flight": "航班",
+                        "search_poi": "目的地地点",
+                        "plan_route": "地图路线",
+                        "get_weather": "天气",
+                        "search_current_travel_info": "旅行网页信息",
+                    }
+                    tool_labels = [
+                        selected_tools.get(name, name)
+                        for name in supervisor_result.used_tools
+                    ]
                     _log_activity(
-                        "think",
-                        "规划工具选择完成",
-                        f"模型决定：{supervisor_result.decision or '兼容默认动作'}",
+                        "decision",
+                        "查询方案已确定",
+                        "、".join(tool_labels)
+                        if tool_labels
+                        else "本轮无需调用外部数据源",
                     )
+        except GenerationCancelled:
+            raise
         except Exception as exc:
-            _log_activity("think", "规划工具选择降级", type(exc).__name__)
+            _log_activity("decision", "查询方案降级", "模型决策暂不可用，改用安全的确定性路径")
             supervisor_result = None
+    check_cancelled()
     plan_kwargs = {
         "thread_id": thread_id,
         "search_enabled": search_enabled,
@@ -807,20 +881,29 @@ def _stream_travel_response(
         plan_kwargs["extraction_hint"] = extraction_hint
     if supervisor_result is not None:
         plan_kwargs["supervisor_result"] = supervisor_result
+    if cancellation_check:
+        plan_kwargs["cancellation_check"] = cancellation_check
+    _log_activity("tool", "查询旅行数据", "正在请求已选择的数据源", state="running")
+    # Flush the progress event before synchronous provider calls begin so a
+    # slow rail/map endpoint never looks like a frozen agent in the UI.
+    yield AIMessageChunk(content=[]), {"travel": True}
     response = plan_travel(planning_message, attachments, **plan_kwargs)
-    _log_activity("tool", "Build travel context", "Travel context ready")
+    check_cancelled()
+    _log_activity("tool", "旅行数据查询完成", "已收到 provider 返回并开始汇总")
+    _log_activity("think", "旅行上下文已整理", "已准备好后续结果汇总")
 
     if response.transport_options:
-        _log_activity("tool", "Build transport candidates", f"candidate count {len(response.transport_options)}")
+        _log_activity("result", "汇总交通候选", f"已获得 {len(response.transport_options)} 条 provider 结果")
     if response.timeline:
-        _log_activity("tool", "Build itinerary timeline", f"timeline items {len(response.timeline)}")
+        _log_activity("result", "整理行程安排", f"已生成 {len(response.timeline)} 个日程项")
     if response.poi_recommendations:
-        _log_activity("tool", "Recommend nearby places", f"poi count {len(response.poi_recommendations)}")
+        _log_activity("result", "整理目的地推荐", f"已获得 {len(response.poi_recommendations)} 个已验证地点")
     if response.weather_summary:
-        _log_activity("tool", "Attach weather summary", "weather context added")
+        _log_activity("result", "补充天气信息", "天气上下文已加入结果")
 
     saved_plan = response.trip_plan
     if saved_plan is not None and thread_id:
+        check_cancelled()
         try:
             saved_plan = save_plan_version(
                 saved_plan,
@@ -832,11 +915,12 @@ def _stream_travel_response(
                 expected_version=current_plan.version if current_plan else 0,
             )
         except Exception as exc:
-            _log_activity("storage", "旅行计划保存失败", str(exc))
+            _log_activity("storage", "旅行计划未保存", "结果已生成，但持久化失败")
             response.alerts.append("本次计划尚未成功持久化，请刷新当前计划后再继续修改。")
             saved_plan = None
             response.trip_plan = None
         else:
+            check_cancelled()
             response.trip_plan = saved_plan
             response.sources = saved_plan.sources
             response.conflicts = saved_plan.conflicts
@@ -855,6 +939,7 @@ def _stream_travel_response(
                         supports=evidence.supports,
                     )
     if thread_id:
+        check_cancelled()
         try:
             save_travel_turn(
                 thread_id=thread_id,
@@ -873,8 +958,9 @@ def _stream_travel_response(
                 search_enabled=search_enabled,
             )
         except Exception as exc:
-            _log_activity("storage", "旅行请求历史保存失败", str(exc))
+            _log_activity("storage", "请求记录未保存", "本轮结果不影响当前展示")
     rendered_with_markers = render_travel_response(response)
+    check_cancelled()
     source_dicts = deduplicate_sources([asdict(source) for source in response.sources])
     parsed_answer = parse_answer_citations(
         rendered_with_markers,
@@ -884,6 +970,7 @@ def _stream_travel_response(
     rendered = parsed_answer.final_text
     answer_segments = parsed_answer.answer_segments
     if thread_id:
+        check_cancelled()
         try:
             save_travel_turn(
                 thread_id=thread_id,
@@ -891,7 +978,7 @@ def _stream_travel_response(
                 role="assistant",
                 content=rendered
                 + encode_assistant_metadata(
-                    [],
+                    _activity_log(),
                     source_dicts,
                     answer_segments,
                     search_enabled=search_enabled,
@@ -900,12 +987,14 @@ def _stream_travel_response(
                     scope_refusal=response.scope_refusal,
                     decision=response.decision,
                     decision_reason=response.decision_reason,
+                    retryable=response.retryable,
+                    retry_reason=response.retry_reason,
                 ),
                 search_enabled=search_enabled,
                 plan=saved_plan,
             )
         except Exception as exc:
-            _log_activity("storage", "旅行回复历史保存失败", str(exc))
+            _log_activity("storage", "回复记录未保存", "本轮结果不影响当前展示")
 
     yield from _stream_answer_chunks(
         rendered,
@@ -917,7 +1006,10 @@ def _stream_travel_response(
             "scope_refusal": response.scope_refusal,
             "decision": response.decision,
             "decision_reason": response.decision_reason,
+            "retryable": response.retryable,
+            "retry_reason": response.retry_reason,
         },
+        cancellation_check=cancellation_check,
     )
 
 
@@ -927,8 +1019,11 @@ def stream_chat(
     search_enabled: bool,
     attachments: list[dict],
     user_id: int | None = None,
+    cancellation_check=None,
 ):
     _reset_runtime_buffers()
+    if cancellation_check:
+        cancellation_check()
 
     _log_activity("think", "分析用户问题", message.strip() or "结合上传内容回答", state="running")
     if attachments:
@@ -950,6 +1045,8 @@ def stream_chat(
 
     current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
     pending_query = _get_pending_travel_query(thread_id, user_id=user_id)
+    if cancellation_check:
+        cancellation_check()
     if current_plan:
         more_request = _parse_transport_more_request(message, current_plan)
         if more_request is not None:
@@ -961,6 +1058,7 @@ def stream_chat(
                 mode=mode,
                 limit=limit,
                 user_id=user_id,
+                cancellation_check=cancellation_check,
             )
     route_kind = _travel_route_kind(message, attachments, current_plan)
     if route_kind in {"keyword", "context"}:
@@ -976,9 +1074,12 @@ def stream_chat(
             attachments,
             user_id=user_id,
             pending_query=pending_query,
+            cancellation_check=cancellation_check,
         )
 
     if route_kind == "model_fallback":
+        if cancellation_check:
+            cancellation_check()
         _log_activity("think", "进入旅行范围兜底识别", "关键词未命中，交由大模型判断是否为旅行问题")
         extraction_hint = _extract_travel_intent_with_model(
             message,
@@ -994,6 +1095,8 @@ def stream_chat(
                 else None
             ),
         )
+        if cancellation_check:
+            cancellation_check()
         if extraction_hint and extraction_hint.get("is_travel_request") is True:
             return _stream_travel_response(
                 message,
@@ -1003,11 +1106,12 @@ def stream_chat(
                 user_id=user_id,
                 extraction_hint=extraction_hint,
                 pending_query=pending_query,
+                cancellation_check=cancellation_check,
             )
 
     # Travel-only product boundary: an unmatched turn that the classifier did
     # not confirm as travel must never fall through to a general chat model.
-    return _stream_scope_refusal(message)
+    return _stream_scope_refusal(message, cancellation_check=cancellation_check)
 
 
 def _strip_internal_sections(text: str) -> str:
@@ -1065,6 +1169,8 @@ def encode_assistant_metadata(
     scope_refusal: bool = False,
     decision: str = "",
     decision_reason: str = "",
+    retryable: bool = False,
+    retry_reason: str = "",
 ) -> str:
     payload = {
         "activities": activities or [],
@@ -1083,6 +1189,10 @@ def encode_assistant_metadata(
         payload["decision"] = decision
     if decision_reason:
         payload["decision_reason"] = decision_reason
+    if retryable:
+        payload["retryable"] = True
+    if retry_reason:
+        payload["retry_reason"] = retry_reason
     return f"\n\n{ASSISTANT_META_START}{json.dumps(payload, ensure_ascii=False)}{ASSISTANT_META_END}"
 
 
@@ -1157,6 +1267,8 @@ def _stored_turn_messages(turns: list[dict]) -> list[dict]:
                     ),
                     "clarification": metadata.get("clarification"),
                     "scope_refusal": metadata.get("scope_refusal") is True,
+                    "retryable": metadata.get("retryable") is True,
+                    "retry_reason": str(metadata.get("retry_reason") or ""),
                     "plan_id": turn.get("plan_id"),
                     "plan_version": turn.get("plan_version"),
                 }
@@ -1202,6 +1314,8 @@ def _checkpoint_message_item(msg) -> dict | None:
             ),
             "clarification": metadata.get("clarification"),
             "scope_refusal": metadata.get("scope_refusal") is True,
+            "retryable": metadata.get("retryable") is True,
+            "retry_reason": str(metadata.get("retry_reason") or ""),
         }
     return None
 

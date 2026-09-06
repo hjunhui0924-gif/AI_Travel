@@ -317,6 +317,7 @@ def run_travel_supervisor(
     *,
     search_enabled: bool = False,
     activity_logger=None,
+    cancellation_check=None,
 ) -> TravelSupervisorResult:
     """Run the model/tool loop and collect typed results for plan composition."""
 
@@ -504,12 +505,16 @@ def run_travel_supervisor(
     called_tool_names: set[str] = set()
     tool_call_count = 0
     for _step in range(MAX_SUPERVISOR_STEPS):
+        if cancellation_check:
+            cancellation_check()
         try:
             response = bound_model.invoke(messages)
         except Exception as exc:
             result.fallback_used = True
             result.errors.append(f"supervisor model invoke failed: {type(exc).__name__}")
             break
+        if cancellation_check:
+            cancellation_check()
         messages.append(response)
         tool_calls = list(getattr(response, "tool_calls", []) or [])
         if not tool_calls:
@@ -518,8 +523,23 @@ def run_travel_supervisor(
                 result.decision, result.answer, result.decision_reason = parsed_decision
             else:
                 result.final_model_note = _compact(getattr(response, "content", ""), 500)
+                if result.used_tools:
+                    # Some OpenAI-compatible Qwen deployments return a normal
+                    # assistant note after successful tool calls instead of
+                    # the requested JSON action. Keep the verified provider
+                    # data and choose the safest action from the normalized
+                    # intent rather than re-running every adapter on fallback.
+                    result.decision = (
+                        "plan"
+                        if query.intent in {"trip_plan", "trip_replan"}
+                        else "answer"
+                    )
+                    result.answer = result.final_model_note
+                    result.decision_reason = "工具结果已返回，采用旅行意图对应的安全默认动作。"
             break
         for call in tool_calls:
+            if cancellation_check:
+                cancellation_check()
             if tool_call_count >= MAX_SUPERVISOR_TOOL_CALLS:
                 result.fallback_used = True
                 result.errors.append("supervisor tool-call budget exceeded")
@@ -561,6 +581,8 @@ def run_travel_supervisor(
                     result.adapter_status[status_key] = "failed"
                 messages.append(ToolMessage(content=_json_result({"error": _safe_tool_error(exc)}), tool_call_id=str(call.get("id") or name)))
             else:
+                if cancellation_check:
+                    cancellation_check()
                 messages.append(ToolMessage(content=_compact(tool_output, 4500), tool_call_id=str(call.get("id") or name)))
         if result.fallback_used:
             break

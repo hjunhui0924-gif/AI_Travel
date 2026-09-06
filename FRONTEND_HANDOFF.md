@@ -173,6 +173,7 @@ HomeView / ChatComposer
 | `message` | string | 否 | 用户自然语言问题；只上传附件时可为空 |
 | `thread_id` | string | 是 | 账户线程或 guest 线程 |
 | `search_enabled` | boolean string | 否 | `true` 才允许网页搜索，默认 `false` |
+| `request_id` | string | 否 | 本轮请求的随机 ID，用于生成过程中停止 |
 | `files` | file[] | 否 | 后端支持的附件类型 |
 
 响应 `Content-Type` 为 `text/event-stream`。每条 SSE 由 `event:` 和 `data:` 组成，`data` 是 JSON。
@@ -204,6 +205,8 @@ data: {
   "scope_refusal": false,
   "decision": "answer|clarify|plan|refuse",
   "decision_reason": "简要动作原因",
+  "retryable": false,
+  "retry_reason": "",
   "transport_options": [],
   "transport_page": null,
   "trip_plan": null,
@@ -222,6 +225,9 @@ data: {
 - `done.final_text` 是可直接展示的文本，不包含内部 metadata 标记。前端不要从它解析日历。
 - `done.answer_segments` 是句子级引用的权威结构；只有其中存在有效网页引用时才按它渲染引用组件，否则直接渲染 `done.final_text` 的完整 Markdown。不要把两条路径同时完整渲染造成重复文本。
 - 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。鉴权/输入错误可以返回具体提示；服务内部异常只返回稳定的通用提示，详细异常只写服务端日志。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
+- `done.retryable=true` 表示 provider 暂时失败或超时，前端可显示有限次数的“重试”操作；不要从 `final_text` 或诊断文案猜测是否可重试。当前前端最多允许 2 次手动重试，每次复用原始用户输入和附件。
+
+生成中的停止：前端为每次 `/chat` 请求生成随机 `request_id` 并作为表单字段提交；用户点击停止时调用 `POST /chat/cancel`，请求体为 `{ "thread_id": "...", "request_id": "..." }`，同时立即 abort 当前 `fetch` 流。取消接口使用与 `/chat` 相同的账号/guest capability 鉴权，只会通知服务端在下一个安全编排边界停止。已经进入 provider 的单次网络请求可能先完成，不能承诺硬终止；前端应保留已收到的文本并标记为已停止。`activity` 只展示可验证的工作摘要，不展示模型内部思维链。
 
 附件限制：图片支持 `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`；文档支持 `.pdf`、`.txt`、`.md`、`.csv`、`.docx`、`.doc`、`.xlsx`、`.xls`。单个文件最大 10MB。`.doc` 只返回兼容性提示，不保证可靠解析。图片附件的 `image_url` 可能是内联 `data:` URL 或有时效的 OSS URL，不应假设它永久有效；历史消息中的图片通过用户消息的 `attachments`/`image_urls` 返回，而 `done.attachments` 当前只列出文本附件。
 

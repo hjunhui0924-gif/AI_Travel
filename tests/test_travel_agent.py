@@ -628,6 +628,8 @@ def test_adapter_failure_is_structured_in_plan(monkeypatch):
     assert response.adapter_status["flight"] == "failed"
     assert response.diagnostics == ["flight adapter failed: TimeoutError"]
     assert any("航班数据接口暂时失败" in item for item in response.alerts)
+    assert response.retryable is True
+    assert "航班" in response.retry_reason
 
 
 def test_partial_transport_result_is_exposed_in_plan(monkeypatch):

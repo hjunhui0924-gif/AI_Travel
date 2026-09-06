@@ -83,6 +83,12 @@ from services.answer_citations import (
     strip_citation_markers_for_stream,
     validate_answer_segments,
 )
+from services.generation_control import (
+    GenerationCancelled,
+    cancel_generation,
+    register_generation,
+    unregister_generation,
+)
 
 load_dotenv()
 
@@ -388,6 +394,11 @@ class PlanShareCreateRequest(BaseModel):
     expires_days: int = 30
 
 
+class ChatCancelRequest(BaseModel):
+    request_id: str
+    thread_id: str
+
+
 def _serialize_plan_for_api(plan, *, include_days: bool = True) -> dict:
     payload = asdict(plan)
     if not include_days:
@@ -583,6 +594,25 @@ def clear_history(thread_id: str, request: Request):
         return JSONResponse({"status": "error", "message": "无权访问该会话。"}, status_code=404)
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
+
+
+@app.post("/chat/cancel")
+def cancel_chat(payload: ChatCancelRequest, request: Request):
+    """Request cooperative cancellation for an in-flight chat generation."""
+
+    try:
+        user = _authorized_thread_user(request, payload.thread_id)
+        cancelled = cancel_generation(
+            payload.request_id,
+            payload.thread_id,
+            int(user["id"]) if user is not None else None,
+        )
+        return {"status": "success", "cancelled": cancelled}
+    except HTTPException as exc:
+        return JSONResponse({"status": "error", "message": exc.detail}, status_code=exc.status_code)
+    except Exception:
+        logger.exception("chat cancellation request failed")
+        return JSONResponse({"status": "error", "message": "无法停止本轮生成。"}, status_code=500)
 
 
 @app.get("/travel/plans/{thread_id}")
@@ -1158,6 +1188,7 @@ async def chat(
     message: str = Form(""),
     thread_id: str = Form("default"),
     search_enabled: bool = Form(False),
+    request_id: str = Form(""),
     files: list[UploadFile] | None = File(default=None),
 ):
     try:
@@ -1205,6 +1236,12 @@ async def chat(
 
         return StreamingResponse(forbidden_thread_response(), media_type="text/event-stream; charset=utf-8")
 
+    generation_control = register_generation(
+        request_id,
+        thread_id,
+        int(user["id"]) if user is not None else None,
+    )
+
     def stream_generator():
         try:
             has_output = False
@@ -1217,6 +1254,8 @@ async def chat(
             assistant_scope_refusal = False
             assistant_decision = ""
             assistant_decision_reason = ""
+            assistant_retryable = False
+            assistant_retry_reason = ""
             assistant_transport_options = []
             assistant_transport_page = None
             travel_plan = None
@@ -1237,6 +1276,7 @@ async def chat(
                 search_enabled=search_enabled,
                 attachments=attachments,
                 user_id=int(user["id"]) if user is not None else None,
+                cancellation_check=generation_control.check if generation_control else None,
             ):
                 if isinstance(metadata, dict) and metadata.get("trip_plan"):
                     travel_plan = metadata["trip_plan"]
@@ -1253,6 +1293,10 @@ async def chat(
                     assistant_decision = metadata["decision"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("decision_reason"), str):
                     assistant_decision_reason = metadata["decision_reason"]
+                if isinstance(metadata, dict) and metadata.get("retryable") is True:
+                    assistant_retryable = True
+                if isinstance(metadata, dict) and isinstance(metadata.get("retry_reason"), str):
+                    assistant_retry_reason = metadata["retry_reason"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("transport_options"), list):
                     assistant_transport_options = metadata["transport_options"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("transport_page"), dict):
@@ -1350,6 +1394,8 @@ async def chat(
                 search_enabled=search_enabled,
                 clarification=assistant_clarification,
                 scope_refusal=assistant_scope_refusal,
+                retryable=assistant_retryable,
+                retry_reason=assistant_retry_reason,
             )
 
             if not is_travel_response:
@@ -1429,6 +1475,8 @@ async def chat(
                     "scope_refusal": assistant_scope_refusal,
                     "decision": assistant_decision,
                     "decision_reason": assistant_decision_reason,
+                    "retryable": assistant_retryable,
+                    "retry_reason": assistant_retry_reason,
                     "trip_plan": travel_plan,
                     "transport_options": assistant_transport_options,
                     "transport_page": assistant_transport_page,
@@ -1442,6 +1490,8 @@ async def chat(
                     ],
                 },
             )
+        except GenerationCancelled:
+            logger.info("chat generation cancelled by user for thread %s", thread_id)
         except Exception:
             # Do not expose provider URLs, credentials, filesystem paths, or
             # traceback text through the streaming protocol.  The server log
@@ -1449,6 +1499,8 @@ async def chat(
             # non-sensitive message.
             logger.exception("chat stream failed")
             yield _sse_event("error", {"message": INTERNAL_SSE_ERROR_MESSAGE})
+        finally:
+            unregister_generation(request_id, generation_control)
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream; charset=utf-8")
 

@@ -297,6 +297,11 @@ class TravelPlanResponse:
     decision: str = "plan"
     decision_reason: str = ""
     scope_refusal: bool = False
+    # A transient provider failure can be retried safely with the same user
+    # request. This is kept separate from alerts/diagnostics so the frontend
+    # can offer a bounded retry action without parsing rendered text.
+    retryable: bool = False
+    retry_reason: str = ""
 
 
 @dataclass(slots=True)

@@ -165,3 +165,25 @@ frontend/
 - 移动端计划通知浮层上移到搜索框上方，避免全宽通知卡覆盖输入控件。
 - `App.vue` 的转场初始化改为定位 `.workspace-chat-scroll-region`；消息列禁止 flex 收缩，长回答可以正常滚动且不会改变工作台尺寸。
 - 最终验证：开发入口真实杭州规划流程通过；1440×900 和移动端检查确认消息容器收窄、搜索框独立、页面无横向/纵向溢出，内部滚动有效，顶部栏保持固定，浏览器无严重错误。
+
+## 26. 工作摘要与生成停止（2026-09-06）
+
+- 执行步骤改为“工作摘要”：展示可验证的阶段、已选数据源、结果数量和状态，不展示模型内部思维链；摘要详情在工作流完成后仍可从消息中展开查看。
+- 发送按钮在 SSE 请求进行时切换为可访问的停止按钮；点击后立即 abort 浏览器流、保留已收到的文本，并在消息中标记“已停止生成”。
+- 新增 `POST /chat/cancel` 协作取消接口；服务端按线程和当前账号/guest capability 校验 request id，并在模型/Provider 编排边界停止，无法承诺硬终止已经发出的单次外部请求。
+- 验证：前端 `npm run typecheck`、`npm run build`，后端取消回归和完整测试通过；Playwright 桌面流程确认停止按钮、部分文本、工作摘要和控制台状态均正常。
+
+## 27. Qwen 与交通查询重试（2026-09-06）
+
+- 发送失败或 provider 超时会在消息中显示结构化“重试本轮”按钮，最多 2 次手动重试；重试复用原始问题和当前请求附件，不自动无限循环。
+- `/chat` 的 `done.retryable/retry_reason` 与历史消息契约已同步；前端请求增加 45 秒客户端总等待保护，超时会保留已有文本并提供重试。
+- Qwen3.7 Flash 已作为 DashScope 默认模型；明确交通查询跳过多轮 Supervisor，等待期间仍显示“查询旅行数据”工作摘要。
+
+## 28. 性能与液态玻璃优化（2026-09-06）
+
+- 流式合帧（`frontend/src/stores/chat.ts`）：SSE `text.delta` 不再每个增量立即触发整条消息重渲染；增量先缓冲，用 `requestAnimationFrame` 按动画帧合并提交一次（done/error/断流/finally 路径同步 flush，保证尾部内容不丢）。目标：把长回答“逐 token 全量重解析 + 整块 innerHTML 替换 + 强制滚动”的高频布局开销收敛为一帧一次。
+- 液态玻璃收敛（`frontend/src/styles/interaction-pass.css` 末尾新增覆盖段）：工作台消息玻璃容器 blur 26px→16px（saturate/contrast 同步下调），顶部栏 12→8、紧凑胶囊 20→11、输入框 15→9、底部行程浮层 18→10；主容器补 30% 强度的液态玻璃细节（上缘径向高光带、border 提亮、inset 顶部发丝高光），底色/叠色微加深补偿可读性。观感由“深磨砂”收敛为“清透玻璃”，背景轮廓更清晰、文字对比度保持不变。
+- 动画期间暂停毛玻璃重采样：状态切换（`.is-transitioning`）与全屏照片交叉淡化（`.app-background` enter/leave）期间，上述玻璃层临时切半透明实色兜底（`backdrop-filter: none`），动画结束立即恢复——消除“照片逐帧变化 × 多层 blur 逐帧重采样”的掉帧源。
+- 涉及文件仅上述两个；未改动 main.css、未涉及 FRONTEND_HANDOFF 契约参数；不在本地引入演示开关/组件。
+- 验证：`npm run typecheck` 通过；`npm run build`（临时 outDir，未写 `static/`）通过——CSS 107.38 kB（gzip 18.97 kB）、JS 242.97 kB（gzip 86.75 kB）。视觉对照此前已在沙盒副本 `frontend-glass-demo` 用「现状/推荐版」两态开关回归通过；该副本随后已清理。
+- 回退：仅需移除 interaction-pass.css 末尾的“性能与液态玻璃 pass”段，并把 chat.ts `send()` 中“流式合帧”注释块还原为逐 delta 直接 `current.content += delta`（勿用 `git checkout` 整文件回退，避免覆盖本会话之前本地已有的未提交改动）。

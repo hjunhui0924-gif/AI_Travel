@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import type { ChatMessage } from "../stores/chat";
-import { useChatStore } from "../stores/chat";
+import { MAX_RETRY_ATTEMPTS, useChatStore } from "../stores/chat";
 import { useAuthStore } from "../stores/auth";
 import { usePlanStore } from "../stores/plan";
 import { renderMarkdown, safeImageUrl } from "../utils/markdown";
@@ -19,11 +19,18 @@ watch(
   () => props.message.streaming,
   (streaming, wasStreaming) => {
     if (streaming) showActivities.value = true;
-    else if (wasStreaming) showActivities.value = false;
+    else if (wasStreaming) showActivities.value = Boolean(props.message.interrupted);
   },
 );
 
 const isUser = computed(() => props.message.role === "user");
+
+function activityStateLabel(state?: string, streaming = false, interrupted = false) {
+  if (state === "running") return interrupted ? "已停止" : streaming ? "进行中" : "已完成";
+  if (state === "failed") return "未完成";
+  if (state === "cancelled") return "已停止";
+  return "已完成";
+}
 
 const renderedContent = computed(() => renderMarkdown(props.message.content));
 
@@ -82,6 +89,10 @@ function openPlan() {
 function toggleActivities() {
   showActivities.value = !showActivities.value;
 }
+
+function retry() {
+  chat.retryMessage(props.message);
+}
 </script>
 
 <template>
@@ -105,22 +116,34 @@ function toggleActivities() {
                 <circle cx="12" cy="12" r="4" />
               </svg>
             </span>
-            <span>{{ showActivities ? "收起执行步骤" : `查看 ${message.activities.length} 个执行步骤` }}</span>
+            <span>{{ showActivities ? "收起工作摘要" : `查看 ${message.activities.length} 条工作摘要` }}</span>
             <svg class="activity-toggle-chevron" viewBox="0 0 24 24" aria-hidden="true">
               <path d="m7 10 5 5 5-5" />
             </svg>
           </button>
           <Transition name="activity-reveal">
             <div v-if="showActivities" class="activity-feed">
+              <p class="activity-disclaimer">
+                仅展示可验证的工作阶段与数据结果，不展示模型内部思维链。
+              </p>
               <div
                 v-for="(act, i) in message.activities"
                 :key="i"
                 class="activity-item"
-                :class="{ running: message.streaming && i === message.activities.length - 1 }"
+                :class="{
+                  running: message.streaming && act.state === 'running',
+                  stopped: message.interrupted && act.state === 'running',
+                  failed: act.state === 'failed',
+                }"
               >
-                <span class="activity-state">[{{ act.state || "..." }}]</span>
-                <span class="activity-title">{{ act.title || act.stage }}</span>
+                <span class="activity-marker" aria-hidden="true"></span>
+                <span class="activity-copy">
+                  <span class="activity-title">{{ act.title || act.stage }}</span>
+                  <small v-if="act.detail" class="activity-detail">{{ act.detail }}</small>
+                </span>
+                <span class="activity-state">{{ activityStateLabel(act.state, message.streaming, message.interrupted) }}</span>
               </div>
+              <p v-if="message.interrupted" class="activity-interrupted">已停止生成，以上内容为已完成的工作摘要。</p>
             </div>
           </Transition>
         </div>
@@ -153,6 +176,22 @@ function toggleActivities() {
 
       <div v-if="message.failed" class="message-failed">
         本轮回答未成功完成，以上内容可能不完整；请调整后重试。
+      </div>
+      <div v-if="message.interrupted" class="message-interrupted">
+        已停止生成，已保留当前收到的内容。
+      </div>
+      <div v-if="message.retryable && !message.streaming" class="message-retry-row">
+        <span class="message-retry-hint">{{ message.retry_reason || "本轮暂时未完成。" }}</span>
+        <button
+          v-if="(message.retry_attempts ?? 0) < MAX_RETRY_ATTEMPTS"
+          class="message-retry-btn"
+          type="button"
+          :disabled="chat.loading"
+          @click="retry"
+        >
+          重试（{{ (message.retry_attempts ?? 0) + 1 }}/{{ MAX_RETRY_ATTEMPTS }}）
+        </button>
+        <span v-else class="message-retry-limit">已达到重试次数</span>
       </div>
 
       <div v-if="!isUser && message.clarification" class="clarification-card">
