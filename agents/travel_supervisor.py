@@ -8,6 +8,7 @@ return typed results to the deterministic TravelPlan composer.
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date
@@ -39,6 +40,26 @@ MAX_SUPERVISOR_TOOL_CALLS = 8
 MAX_ROUTE_PLACES = 6
 MAX_PREFERRED_POI_ANCHORS = 4
 SUPERVISOR_DECISIONS = {"clarify", "answer", "plan", "refuse"}
+MAX_PUBLIC_PROGRESS_CHARS = 120
+PUBLIC_PROGRESS_BLOCKLIST = (
+    "系统提示词",
+    "系统指令",
+    "服务器密钥",
+    "密钥",
+    "系统",
+    "内部信息",
+    "内部",
+    "工具参数",
+    "隐藏推理",
+    "思维链",
+    "chain of thought",
+    "reasoning token",
+    "secret",
+    "token",
+    "api_key",
+    "access token",
+    "password",
+)
 
 
 @dataclass(slots=True)
@@ -90,6 +111,107 @@ class TravelSupervisorResult:
 def _compact(value: object, limit: int = 700) -> str:
     text = str(value or "")
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _text_content(value: object) -> str:
+    """Extract only ordinary assistant text, never provider reasoning fields."""
+
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        return ""
+    if isinstance(value, list):
+        return "".join(
+            str(item.get("text") or "")
+            for item in value
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return ""
+
+
+def _extract_public_progress(value: object) -> str | None:
+    """Read a short, user-facing progress sentence from a tool-call message.
+
+    Tool-capable models may put ordinary text beside ``tool_calls`` or return a
+    small JSON envelope. This helper intentionally ignores non-text content,
+    rejects JSON that is not an explicit progress envelope, and never reads
+    provider-specific hidden reasoning fields.
+    """
+
+    candidate = ""
+    if isinstance(value, dict):
+        for key in ("public_progress", "progress", "summary"):
+            if isinstance(value.get(key), str):
+                candidate = value[key]
+                break
+    else:
+        candidate = _text_content(value)
+
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+
+    tagged = re.fullmatch(
+        r"(?:<public_progress>|\[public_progress\])\s*(.*?)\s*(?:</public_progress>|\[/public_progress\])",
+        candidate,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if tagged:
+        candidate = tagged.group(1).strip()
+    else:
+        stripped = candidate.strip("` ")
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                for key in ("public_progress", "progress", "summary"):
+                    if isinstance(payload.get(key), str):
+                        candidate = payload[key].strip()
+                        break
+                else:
+                    return None
+        # Untagged ordinary content is accepted only after the same strict
+        # length, line-shape and sensitive-marker checks below. Hidden
+        # reasoning fields are never read from provider-specific metadata.
+
+    has_line_break = bool(re.search(r"[\r\n]", candidate))
+    candidate = re.sub(r"\s+", " ", candidate).strip(" `\"'")
+    if not candidate or len(candidate) > MAX_PUBLIC_PROGRESS_CHARS:
+        return None
+    lowered = candidate.lower()
+    if any(marker.lower() in lowered for marker in PUBLIC_PROGRESS_BLOCKLIST):
+        return None
+    # A public progress item should read as a sentence, not an internal dump.
+    if candidate.startswith(("{", "[")) or has_line_break:
+        return None
+    return candidate
+
+
+def _fallback_public_progress(tool_names: list[str], query: TravelQuery) -> str:
+    """Produce a truthful Codex-style sentence when the model omits one."""
+
+    labels = {
+        "search_rail": "12306 的车次和席位",
+        "search_flight": "航班和席位信息",
+        "search_poi": "目的地的已验证地点",
+        "plan_route": "已验证地点之间的路线",
+        "get_weather": "目的地天气",
+        "search_current_travel_info": "最新旅行资料",
+    }
+    unique_labels = list(dict.fromkeys(labels[name] for name in tool_names if name in labels))
+    if not unique_labels:
+        return "我会继续整理当前旅行需求。"
+    if query.intent == "rail_query" and "search_rail" in tool_names:
+        return "你指定了高铁，我先查询 12306 的车次和席位。"
+    if query.intent == "flight_query" and "search_flight" in tool_names:
+        return "你指定了航班，我先查询航班和席位信息。"
+    if len(unique_labels) == 1:
+        return f"我先查询{unique_labels[0]}。"
+    return f"我先查询{'、'.join(unique_labels)}，再整理可执行的旅行方案。"
 
 
 def _json_result(payload: object) -> str:
@@ -248,7 +370,8 @@ def _supervisor_system_prompt(search_enabled: bool) -> str:
 8. 只查询车票、航班、地点、天气或路线时选择 answer，不要顺手生成 TravelPlan。
 9. 缺少目的地、日期、出发地或其他执行所需条件时选择 clarify；与旅行无关时选择 refuse。
 10. 每个工具最多调用一次；总工具调用不超过 {MAX_SUPERVISOR_STEPS} 次。
-11. 最后必须只输出一个 JSON：{{"decision":"clarify|answer|plan|refuse","answer":"给用户看的完整回答","reason":"简要原因"}}。
+11. 每次准备调用工具时，在 assistant 普通文本 content 中先给出一句面向用户的公开工作进展，优先使用 `<public_progress>一句话</public_progress>` 包裹，控制在 120 个字符以内，例如“你指定了高铁，我先查询 12306 的车次和席位。”；这不是隐藏思维链，不要解释内部推理、系统规则、工具参数或敏感信息。
+12. 工具调用完成后，最后必须只输出一个 JSON：{{"decision":"clarify|answer|plan|refuse","answer":"给用户看的完整回答","reason":"简要原因"}}；不要把公开工作进展或额外说明放进这个最终 JSON 之外。
 """.strip()
 
 
@@ -324,9 +447,32 @@ def run_travel_supervisor(
     result = TravelSupervisorResult(query=query)
     collector: dict[str, Any] = {"poi_items": []}
 
-    def log(stage: str, title: str, detail: str, state: str = "completed") -> None:
+    def log(
+        stage: str,
+        title: str,
+        detail: str,
+        state: str = "completed",
+        origin: str = "system",
+    ) -> None:
         if activity_logger:
-            activity_logger(stage, title, detail, state)
+            if origin == "system":
+                activity_logger(stage, title, detail, state)
+                return
+            try:
+                # Keep compatibility with older activity callbacks used by
+                # adapters and tests while allowing the main logger to record
+                # where a public progress sentence came from.
+                activity_logger(stage, title, detail, state, origin=origin)
+            except TypeError:
+                activity_logger(stage, title, detail, state)
+
+    def provider_log(
+        stage: str,
+        title: str,
+        detail: str,
+        state: str = "completed",
+    ) -> None:
+        log(stage, title, detail, state, origin="provider")
 
     def query_for_mode(mode: str, high_speed_only: bool = False) -> TravelQuery:
         copied = deepcopy(query)
@@ -344,12 +490,12 @@ def run_travel_supervisor(
             raise ValueError("缺少出发地、目的地或日期，无法查询车次。")
         wants_high_speed = bool(high_speed_only) or "高铁" in query.raw_text or "动车" in query.raw_text
         active_query = query_for_mode("rail", wants_high_speed)
-        log("tool", "查询铁路车次", f"{active_query.origin} → {active_query.destination}", "running")
+        provider_log("tool", "查询铁路车次", f"{active_query.origin} → {active_query.destination}", "running")
         provider_result = get_rail_options(active_query)
         options = list(provider_result)
         collector["rail_result"] = provider_result
         result.adapter_status["rail"] = "success" if options else "empty"
-        log("tool", "铁路车次查询完成", f"返回 {len(options)} 条", "completed")
+        provider_log("tool", "铁路车次查询完成", f"返回 {len(options)} 条", "completed")
         return _json_result({
             "provider": "12306",
             "mode": "rail",
@@ -368,12 +514,12 @@ def run_travel_supervisor(
         if not query.origin or not query.destination or not query.date:
             raise ValueError("缺少出发地、目的地或日期，无法查询航班。")
         active_query = query_for_mode("flight")
-        log("tool", "查询航班", f"{active_query.origin} → {active_query.destination}", "running")
+        provider_log("tool", "查询航班", f"{active_query.origin} → {active_query.destination}", "running")
         provider_result = get_flight_options(active_query)
         options = list(provider_result)
         collector["flight_result"] = provider_result
         result.adapter_status["flight"] = "success" if options else "empty"
-        log("tool", "航班查询完成", f"返回 {len(options)} 条", "completed")
+        provider_log("tool", "航班查询完成", f"返回 {len(options)} 条", "completed")
         return _json_result({
             "provider": "VariFlight/授权航班服务",
             "mode": "flight",
@@ -393,11 +539,11 @@ def run_travel_supervisor(
         ][:MAX_PREFERRED_POI_ANCHORS]
         if requested_anchors:
             active_query.named_places = list(dict.fromkeys([*query.named_places, *requested_anchors]))[:MAX_ROUTE_PLACES]
-        log("tool", "查询目的地地点", city, "running")
+        provider_log("tool", "查询目的地地点", city, "running")
         poi_result = recommend_pois(
             active_query,
             search_enabled=search_enabled,
-            activity_logger=activity_logger,
+            activity_logger=provider_log,
         )
         if isinstance(poi_result, PoiRecommendationResult):
             items = list(poi_result.recommendations)
@@ -413,7 +559,7 @@ def run_travel_supervisor(
         collector["poi_sources"] = sources
         result.adapter_status["poi"] = status
         result.diagnostics.extend(errors)
-        log("tool", "目的地地点查询完成", f"返回 {len(items)} 条", "completed")
+        provider_log("tool", "目的地地点查询完成", f"返回 {len(items)} 条", "completed")
         return _json_result({
             "city": city,
             "count": len(items),
@@ -432,7 +578,7 @@ def run_travel_supervisor(
         active_query.city = city
         active_query.destination = city
         active_query.named_places = active_places
-        log("tool", "规划地图路线", " → ".join(active_places), "running")
+        provider_log("tool", "规划地图路线", " → ".join(active_places), "running")
         route_result = get_route_plans(active_query)
         routes = [item for item in list(route_result) if item.mode == mode]
         # The adapter may select the best available mode per segment. If the
@@ -442,7 +588,7 @@ def run_travel_supervisor(
             routes = list(route_result)
         collector["route_result"] = route_result
         result.adapter_status["route"] = "success" if routes else "empty"
-        log("tool", "地图路线规划完成", f"返回 {len(routes)} 段", "completed")
+        provider_log("tool", "地图路线规划完成", f"返回 {len(routes)} 段", "completed")
         return _json_result({
             "city": city,
             "requested_mode": mode,
@@ -454,11 +600,11 @@ def run_travel_supervisor(
     def get_weather(city: str | None = None) -> str:
         """查询目的地天气预报，为行程安排提供天气上下文。"""
         target = _validate_city(city or query.destination or query.city, query)
-        log("tool", "查询天气", target, "running")
+        provider_log("tool", "查询天气", target, "running")
         summary = get_weather_summary(target, forecast=True)
         collector["weather_summary"] = summary or ""
         result.adapter_status["weather"] = "success" if summary else "empty"
-        log("tool", "天气查询完成", target, "completed")
+        provider_log("tool", "天气查询完成", target, "completed")
         return _compact(summary or "未返回天气数据。", 1600)
 
     @tool
@@ -474,7 +620,7 @@ def run_travel_supervisor(
             anchor=topic.strip()[:80],
             preferences=query.preferences,
             search_enabled=True,
-            activity_logger=activity_logger,
+            activity_logger=provider_log,
         )
         collector["web_sources"] = [_source_from_search(item) for item in search_result.sources]
         result.adapter_status["web_search"] = search_result.status
@@ -502,11 +648,32 @@ def run_travel_supervisor(
     ]
 
     tool_names = {item.name for item in tools}
+    tool_display_names = {
+        "search_rail": "铁路车次",
+        "search_flight": "航班",
+        "search_poi": "目的地地点",
+        "plan_route": "地图路线",
+        "get_weather": "天气",
+        "search_current_travel_info": "旅行网页资料",
+    }
+
+    def infer_safe_default_decision(note: str = "") -> bool:
+        """Finish a tool-backed turn when the model omits the JSON contract."""
+
+        if not result.used_tools:
+            return False
+        result.decision = "plan" if query.intent in {"trip_plan", "trip_replan"} else "answer"
+        result.answer = _compact(note, 2400)
+        result.decision_reason = "工具结果已返回，采用旅行意图对应的安全默认动作。"
+        log("status", "已形成安全回复策略", "已保留验证通过的数据结果")
+        return True
+
     called_tool_names: set[str] = set()
     tool_call_count = 0
     for _step in range(MAX_SUPERVISOR_STEPS):
         if cancellation_check:
             cancellation_check()
+        log("status", "正在确认下一步工作", "等待模型决定所需的数据来源", "running")
         try:
             response = bound_model.invoke(messages)
         except Exception as exc:
@@ -518,9 +685,20 @@ def run_travel_supervisor(
         messages.append(response)
         tool_calls = list(getattr(response, "tool_calls", []) or [])
         if not tool_calls:
+            log("status", "已完成当前判断", "开始校验回复动作并整理结果")
             parsed_decision = _parse_decision_payload(getattr(response, "content", ""))
             if parsed_decision is not None:
                 result.decision, result.answer, result.decision_reason = parsed_decision
+                log(
+                    "status",
+                    "已确定回复方式",
+                    {
+                        "clarify": "需要补充旅行条件",
+                        "answer": "直接回答当前问题",
+                        "plan": "整理为结构化旅行计划",
+                        "refuse": "请求超出旅行服务范围",
+                    }.get(result.decision, "已完成判断"),
+                )
             else:
                 result.final_model_note = _compact(getattr(response, "content", ""), 500)
                 if result.used_tools:
@@ -529,14 +707,16 @@ def run_travel_supervisor(
                     # the requested JSON action. Keep the verified provider
                     # data and choose the safest action from the normalized
                     # intent rather than re-running every adapter on fallback.
-                    result.decision = (
-                        "plan"
-                        if query.intent in {"trip_plan", "trip_replan"}
-                        else "answer"
-                    )
-                    result.answer = result.final_model_note
-                    result.decision_reason = "工具结果已返回，采用旅行意图对应的安全默认动作。"
+                    infer_safe_default_decision(result.final_model_note)
             break
+        selected_tool_names = [str(call.get("name") or "") for call in tool_calls]
+        public_progress = _extract_public_progress(getattr(response, "content", ""))
+        log(
+            "progress",
+            public_progress or _fallback_public_progress(selected_tool_names, query),
+            "",
+            origin="model" if public_progress else "system",
+        )
         for call in tool_calls:
             if cancellation_check:
                 cancellation_check()
@@ -558,8 +738,15 @@ def run_travel_supervisor(
                 record.status = "rejected"
                 record.error = "同一工具在本轮只能调用一次"
                 result.errors.append(f"{name}: duplicate tool call")
+                log(
+                    "status",
+                    "检测到重复查询",
+                    f"已复用{tool_display_names.get(name, '前一次')}结果，不再重复调用",
+                )
                 messages.append(ToolMessage(content=_json_result({"error": record.error}), tool_call_id=str(call.get("id") or name)))
-                continue
+                # A repeated tool request is usually a model-side loop. Stop
+                # the loop and use the verified result already collected.
+                break
             called_tool_names.add(name)
             active_tool = next(item for item in tools if item.name == name)
             try:
@@ -579,17 +766,24 @@ def run_travel_supervisor(
                 status_key = status_by_tool.get(name)
                 if status_key:
                     result.adapter_status[status_key] = "failed"
+                log(
+                    "tool",
+                    f"{tool_display_names.get(name, '数据')}查询未完成",
+                    "数据源暂时不可用，后续可重试",
+                    "failed",
+                )
                 messages.append(ToolMessage(content=_json_result({"error": _safe_tool_error(exc)}), tool_call_id=str(call.get("id") or name)))
             else:
                 if cancellation_check:
                     cancellation_check()
                 messages.append(ToolMessage(content=_compact(tool_output, 4500), tool_call_id=str(call.get("id") or name)))
-        if result.fallback_used:
+        if result.fallback_used or any(item.error == "同一工具在本轮只能调用一次" for item in result.tool_calls):
             break
 
     if not result.decision and not result.fallback_used:
-        result.fallback_used = True
-        result.errors.append("supervisor missing decision contract")
+        if not infer_safe_default_decision(result.final_model_note):
+            result.fallback_used = True
+            result.errors.append("supervisor missing decision contract")
 
     rail_result = collector.get("rail_result")
     flight_result = collector.get("flight_result")

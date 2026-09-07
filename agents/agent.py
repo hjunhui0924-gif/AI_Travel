@@ -7,6 +7,8 @@ from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
+from threading import Thread
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -63,6 +65,7 @@ TRAVEL_STREAM_CHUNK_SIZE = 72
 TRAVEL_STREAM_DELAY_SECONDS = 0.028
 
 _activity_log_var: ContextVar[list[dict] | None] = ContextVar("activity_log", default=None)
+_activity_archive_var: ContextVar[list[dict] | None] = ContextVar("activity_archive", default=None)
 _source_cards_var: ContextVar[list[dict] | None] = ContextVar("source_cards", default=None)
 _travel_plan_var: ContextVar[dict | None] = ContextVar("travel_plan", default=None)
 
@@ -83,6 +86,14 @@ def _activity_log() -> list[dict]:
     return log
 
 
+def _activity_archive() -> list[dict]:
+    archive = _activity_archive_var.get()
+    if archive is None:
+        archive = []
+        _activity_archive_var.set(archive)
+    return archive
+
+
 def _source_cards() -> list[dict]:
     cards = _source_cards_var.get()
     if cards is None:
@@ -93,22 +104,43 @@ def _source_cards() -> list[dict]:
 
 def _reset_runtime_buffers() -> None:
     _activity_log_var.set([])
+    _activity_archive_var.set([])
     _source_cards_var.set([])
     _travel_plan_var.set(None)
 
 
-def _log_activity(stage: str, title: str, detail: str = "", state: str = "completed") -> None:
+def _log_activity(
+    stage: str,
+    title: str,
+    detail: str = "",
+    state: str = "completed",
+    origin: str = "system",
+) -> None:
     if stage == "attachment" and "未附加文件" in title:
         return
-    _activity_log().append(
-        {
-            "stage": stage,
-            "title": title,
-            "detail": detail,
-            "state": state,
-            "timestamp": _now_cn_label(),
-        }
-    )
+    if origin not in {"model", "system", "provider"}:
+        origin = "system"
+    event = {
+        "stage": stage,
+        "title": title,
+        "detail": detail,
+        "state": state,
+        "origin": origin,
+        "timestamp": _now_cn_label(),
+    }
+    _activity_log().append(event)
+    _activity_archive().append(event)
+
+
+def _log_provider_activity(
+    stage: str,
+    title: str,
+    detail: str = "",
+    state: str = "completed",
+) -> None:
+    """Mark adapter/search callbacks separately from orchestration status."""
+
+    _log_activity(stage, title, detail, state, origin="provider")
 
 
 def _log_source_card(
@@ -157,6 +189,77 @@ def consume_travel_plan() -> dict | None:
     plan = _travel_plan_var.get()
     _travel_plan_var.set(None)
     return plan
+
+
+def _stream_sync_with_activities(operation, cancellation_check=None):
+    """Run sync orchestration while forwarding each activity to the SSE loop.
+
+    Provider and model SDK calls are synchronous. Running one operation in a
+    small daemon worker lets the outer generator yield immediately after the
+    operation records an activity, instead of waiting for the whole model or
+    provider chain to return. Activity records are written back in the outer
+    thread so ContextVar buffers and history persistence remain request-local.
+    """
+
+    activity_queue: Queue[object] = Queue()
+    sentinel = object()
+    result_box: list[object] = []
+    error_box: list[Exception] = []
+    worker_source_cards: list[dict] = []
+    worker_travel_plan: list[dict | None] = []
+
+    def enqueue_activity(
+        stage: str,
+        title: str,
+        detail: str = "",
+        state: str = "completed",
+        origin: str = "system",
+    ) -> None:
+        activity_queue.put((stage, title, detail, state, origin))
+
+    def run_operation() -> None:
+        try:
+            # Keep request-local buffers inside the worker. ContextVars are
+            # thread-local by design, so collect these two non-activity
+            # outputs and merge them back in the caller after the operation
+            # has finished.
+            _activity_log_var.set([])
+            _activity_archive_var.set([])
+            _source_cards_var.set([])
+            _travel_plan_var.set(None)
+            result_box.append(operation(enqueue_activity))
+        except Exception as exc:
+            error_box.append(exc)
+        finally:
+            worker_source_cards.extend(_source_cards_var.get() or [])
+            worker_travel_plan.append(_travel_plan_var.get())
+            activity_queue.put(sentinel)
+
+    worker = Thread(target=run_operation, name="ai-agent-sync-stream", daemon=True)
+    worker.start()
+    while True:
+        try:
+            item = activity_queue.get(timeout=0.05)
+        except Empty:
+            if cancellation_check:
+                cancellation_check()
+            continue
+        if item is sentinel:
+            break
+        stage, title, detail, state, origin = item
+        _log_activity(stage, title, detail, state, origin=origin)
+        yield AIMessageChunk(content=[]), {"travel": True}
+        if cancellation_check:
+            cancellation_check()
+
+    worker.join()
+    for card in worker_source_cards:
+        _source_cards().append(card)
+    if worker_travel_plan and worker_travel_plan[0] is not None:
+        _travel_plan_var.set(worker_travel_plan[0])
+    if error_box:
+        raise error_box[0]
+    return result_box[0] if result_box else None
 
 
 def _env_value(name: str) -> str:
@@ -785,9 +888,9 @@ def _stream_travel_response(
             cancellation_check()
 
     _log_activity("think", "识别旅行需求", "已进入旅行规划工作流")
+    yield AIMessageChunk(content=[]), {"travel": True}
+    check_cancelled()
     _log_activity("think", "整理旅行上下文", "提取出发地、目的地、日期、偏好和附件", state="running")
-    # Flush the initial activity events before the synchronous adapter/model
-    # work starts. The actual answer is streamed below once the plan is ready.
     yield AIMessageChunk(content=[]), {"travel": True}
     check_cancelled()
     current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
@@ -817,25 +920,46 @@ def _stream_travel_response(
                 # three extra Qwen calls before the user can see a ticket
                 # result, while plan_travel still owns provider validation and
                 # the final answer/plan gate.
-                labels = {
-                    "rail_query": "铁路",
-                    "flight_query": "航班",
-                    "transport_compare": "铁路与航班",
+                progress = {
+                    "rail_query": "你指定了高铁，我先查询 12306 的车次和席位。",
+                    "flight_query": "你指定了航班，我先查询航班和席位信息。",
+                    "transport_compare": "你希望比较出行方式，我先核对铁路和航班数据。",
+                }
+                _log_activity("progress", progress[supervisor_query.intent])
+                yield AIMessageChunk(content=[]), {"travel": True}
+                check_cancelled()
+            else:
+                planning_progress = {
+                    "nearby_explore": "我先确认目的地周边有哪些值得去的已验证地点。",
+                    "trip_replan": "我先核对当前行程和这次需要调整的部分。",
+                    "trip_plan": "我先确认交通、天气和路线等必要资料。",
                 }
                 _log_activity(
-                    "decision",
-                    "按明确交通需求查询",
-                    f"直接查询{labels[supervisor_query.intent]}数据源",
+                    "progress",
+                    planning_progress.get(
+                        supervisor_query.intent,
+                        "我先确认这次旅行需要哪些资料。",
+                    ),
                 )
-            else:
-                _log_activity("decision", "制定数据查询方案", "根据旅行目标选择必要的数据来源", state="running")
-                supervisor_result = run_travel_supervisor(
-                    model,
-                    planning_message,
-                    attachments,
-                    supervisor_query,
-                    search_enabled=search_enabled,
-                    activity_logger=_log_activity,
+                # Let the UI show the work-progress stage before the synchronous
+                # model/tool loop starts. The following events contain only
+                # safe, high-level decisions—not hidden chain-of-thought text.
+                yield AIMessageChunk(content=[]), {"travel": True}
+                check_cancelled()
+
+                def run_supervisor(activity_logger):
+                    return run_travel_supervisor(
+                        model,
+                        planning_message,
+                        attachments,
+                        supervisor_query,
+                        search_enabled=search_enabled,
+                        activity_logger=activity_logger,
+                        cancellation_check=cancellation_check,
+                    )
+
+                supervisor_result = yield from _stream_sync_with_activities(
+                    run_supervisor,
                     cancellation_check=cancellation_check,
                 )
                 check_cancelled()
@@ -865,6 +989,8 @@ def _stream_travel_response(
                         if tool_labels
                         else "本轮无需调用外部数据源",
                     )
+                yield AIMessageChunk(content=[]), {"travel": True}
+                check_cancelled()
         except GenerationCancelled:
             raise
         except Exception as exc:
@@ -875,7 +1001,7 @@ def _stream_travel_response(
         "thread_id": thread_id,
         "search_enabled": search_enabled,
         "current_plan": current_plan,
-        "activity_logger": _log_activity,
+        "activity_logger": _log_provider_activity,
     }
     if extraction_hint is not None:
         plan_kwargs["extraction_hint"] = extraction_hint
@@ -887,19 +1013,36 @@ def _stream_travel_response(
     # Flush the progress event before synchronous provider calls begin so a
     # slow rail/map endpoint never looks like a frozen agent in the UI.
     yield AIMessageChunk(content=[]), {"travel": True}
-    response = plan_travel(planning_message, attachments, **plan_kwargs)
+
+    def run_plan(activity_logger):
+        operation_kwargs = dict(plan_kwargs)
+        operation_kwargs["activity_logger"] = activity_logger
+        return plan_travel(planning_message, attachments, **operation_kwargs)
+
+    response = yield from _stream_sync_with_activities(
+        run_plan,
+        cancellation_check=cancellation_check,
+    )
     check_cancelled()
     _log_activity("tool", "旅行数据查询完成", "已收到 provider 返回并开始汇总")
+    yield AIMessageChunk(content=[]), {"travel": True}
+    check_cancelled()
     _log_activity("think", "旅行上下文已整理", "已准备好后续结果汇总")
+    yield AIMessageChunk(content=[]), {"travel": True}
+    check_cancelled()
 
     if response.transport_options:
         _log_activity("result", "汇总交通候选", f"已获得 {len(response.transport_options)} 条 provider 结果")
+        yield AIMessageChunk(content=[]), {"travel": True}
     if response.timeline:
         _log_activity("result", "整理行程安排", f"已生成 {len(response.timeline)} 个日程项")
+        yield AIMessageChunk(content=[]), {"travel": True}
     if response.poi_recommendations:
         _log_activity("result", "整理目的地推荐", f"已获得 {len(response.poi_recommendations)} 个已验证地点")
+        yield AIMessageChunk(content=[]), {"travel": True}
     if response.weather_summary:
         _log_activity("result", "补充天气信息", "天气上下文已加入结果")
+        yield AIMessageChunk(content=[]), {"travel": True}
 
     saved_plan = response.trip_plan
     if saved_plan is not None and thread_id:
@@ -916,6 +1059,8 @@ def _stream_travel_response(
             )
         except Exception as exc:
             _log_activity("storage", "旅行计划未保存", "结果已生成，但持久化失败")
+            yield AIMessageChunk(content=[]), {"travel": True}
+            check_cancelled()
             response.alerts.append("本次计划尚未成功持久化，请刷新当前计划后再继续修改。")
             saved_plan = None
             response.trip_plan = None
@@ -938,6 +1083,13 @@ def _stream_travel_response(
                         retrieved_at=evidence.retrieved_at,
                         supports=evidence.supports,
                     )
+            _log_activity(
+                "storage",
+                "旅行计划已保存",
+                f"已保存第 {saved_plan.version} 版旅行计划",
+            )
+            yield AIMessageChunk(content=[]), {"travel": True}
+            check_cancelled()
     if thread_id:
         check_cancelled()
         try:
@@ -959,6 +1111,8 @@ def _stream_travel_response(
             )
         except Exception as exc:
             _log_activity("storage", "请求记录未保存", "本轮结果不影响当前展示")
+            yield AIMessageChunk(content=[]), {"travel": True}
+            check_cancelled()
     rendered_with_markers = render_travel_response(response)
     check_cancelled()
     source_dicts = deduplicate_sources([asdict(source) for source in response.sources])
@@ -978,7 +1132,7 @@ def _stream_travel_response(
                 role="assistant",
                 content=rendered
                 + encode_assistant_metadata(
-                    _activity_log(),
+                    _activity_archive(),
                     source_dicts,
                     answer_segments,
                     search_enabled=search_enabled,
@@ -995,6 +1149,8 @@ def _stream_travel_response(
             )
         except Exception as exc:
             _log_activity("storage", "回复记录未保存", "本轮结果不影响当前展示")
+            yield AIMessageChunk(content=[]), {"travel": True}
+            check_cancelled()
 
     yield from _stream_answer_chunks(
         rendered,
@@ -1025,23 +1181,31 @@ def stream_chat(
     if cancellation_check:
         cancellation_check()
 
-    _log_activity("think", "分析用户问题", message.strip() or "结合上传内容回答", state="running")
+    _log_activity("progress", "我先整理你的旅行需求。", state="running")
+    yield AIMessageChunk(content=[]), {"travel": True}
+    if cancellation_check:
+        cancellation_check()
     if attachments:
         image_count = sum(1 for attachment in attachments if attachment.get("modality") == "image")
         text_count = len(attachments) - image_count
         if text_count:
             _log_activity("attachment", "读取上传文件", f"{text_count} 个文档已进入上下文")
+            yield AIMessageChunk(content=[]), {"travel": True}
         if image_count:
             _log_activity("attachment", "附加图片内容", f"{image_count} 张图片将交给多模态模型")
+            yield AIMessageChunk(content=[]), {"travel": True}
     else:
         _log_activity("attachment", "未附加文件", "本轮仅处理文本问题")
+        yield AIMessageChunk(content=[]), {"travel": True}
 
     if search_enabled:
         _log_activity("search", "联网搜索已开启", "如需要最新信息，将自动执行时效校验。")
     else:
         _log_activity("search", "联网搜索未开启", "本轮回答不会访问外部网页。")
+    yield AIMessageChunk(content=[]), {"travel": True}
 
-    _log_activity("think", "整理回答策略", "准备汇总上下文并生成最终回复")
+    _log_activity("status", "整理回答策略", "准备汇总上下文并生成最终回复")
+    yield AIMessageChunk(content=[]), {"travel": True}
 
     current_plan = get_current_plan(thread_id, user_id=user_id) if thread_id else None
     pending_query = _get_pending_travel_query(thread_id, user_id=user_id)
@@ -1051,7 +1215,7 @@ def stream_chat(
         more_request = _parse_transport_more_request(message, current_plan)
         if more_request is not None:
             mode, limit = more_request
-            return _stream_transport_more_response(
+            yield from _stream_transport_more_response(
                 message,
                 thread_id,
                 current_plan,
@@ -1060,6 +1224,7 @@ def stream_chat(
                 user_id=user_id,
                 cancellation_check=cancellation_check,
             )
+            return
     route_kind = _travel_route_kind(message, attachments, current_plan)
     if route_kind in {"keyword", "context"}:
         _log_activity(
@@ -1067,7 +1232,8 @@ def stream_chat(
             "旅行请求已识别",
             "关键词命中" if route_kind == "keyword" else "沿用当前旅行上下文",
         )
-        return _stream_travel_response(
+        yield AIMessageChunk(content=[]), {"travel": True}
+        yield from _stream_travel_response(
             message,
             thread_id,
             search_enabled,
@@ -1076,11 +1242,13 @@ def stream_chat(
             pending_query=pending_query,
             cancellation_check=cancellation_check,
         )
+        return
 
     if route_kind == "model_fallback":
         if cancellation_check:
             cancellation_check()
         _log_activity("think", "进入旅行范围兜底识别", "关键词未命中，交由大模型判断是否为旅行问题")
+        yield AIMessageChunk(content=[]), {"travel": True}
         extraction_hint = _extract_travel_intent_with_model(
             message,
             attachments,
@@ -1098,7 +1266,7 @@ def stream_chat(
         if cancellation_check:
             cancellation_check()
         if extraction_hint and extraction_hint.get("is_travel_request") is True:
-            return _stream_travel_response(
+            yield from _stream_travel_response(
                 message,
                 thread_id,
                 search_enabled,
@@ -1108,10 +1276,11 @@ def stream_chat(
                 pending_query=pending_query,
                 cancellation_check=cancellation_check,
             )
+            return
 
     # Travel-only product boundary: an unmatched turn that the classifier did
     # not confirm as travel must never fall through to a general chat model.
-    return _stream_scope_refusal(message, cancellation_check=cancellation_check)
+    yield from _stream_scope_refusal(message, cancellation_check=cancellation_check)
 
 
 def _strip_internal_sections(text: str) -> str:

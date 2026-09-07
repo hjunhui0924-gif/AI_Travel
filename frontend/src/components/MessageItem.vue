@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import type { ChatMessage } from "../stores/chat";
 import { MAX_RETRY_ATTEMPTS, useChatStore } from "../stores/chat";
 import { useAuthStore } from "../stores/auth";
@@ -13,23 +13,65 @@ const auth = useAuthStore();
 const chat = useChatStore();
 const plan = usePlanStore();
 
-const showActivities = ref(Boolean(props.message.streaming));
+const showActivities = ref(Boolean(props.message.streaming || props.message.activities?.length));
+const activityFeedEl = ref<HTMLElement | null>(null);
+const followActivity = ref(true);
+
+// Activities are appended by the SSE stream. A row appears only when the
+// backend has emitted that activity event; there is no playback timer here.
+const visibleActivities = computed(() => props.message.activities ?? []);
 
 watch(
   () => props.message.streaming,
   (streaming, wasStreaming) => {
-    if (streaming) showActivities.value = true;
-    else if (wasStreaming) showActivities.value = Boolean(props.message.interrupted);
+    if (streaming) {
+      showActivities.value = true;
+      return;
+    }
+    if (wasStreaming && props.message.interrupted) showActivities.value = true;
   },
 );
 
+watch(
+  () => props.message.activities?.length ?? 0,
+  async () => {
+    if (!props.message.streaming || !followActivity.value) return;
+    await nextTick();
+    const feed = activityFeedEl.value;
+    if (feed) feed.scrollTop = feed.scrollHeight;
+  },
+);
+
+function onActivityFeedScroll(event: Event) {
+  const feed = event.currentTarget as HTMLElement;
+  followActivity.value = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48;
+}
+
 const isUser = computed(() => props.message.role === "user");
 
-function activityStateLabel(state?: string, streaming = false, interrupted = false) {
-  if (state === "running") return interrupted ? "已停止" : streaming ? "进行中" : "已完成";
+function activityStateLabel(
+  state?: string,
+  streaming = false,
+  interrupted = false,
+  failed = false,
+) {
+  if (state === "running") {
+    if (interrupted) return "已停止";
+    if (failed) return "未完成";
+    return streaming ? "进行中" : "已完成";
+  }
   if (state === "failed") return "未完成";
   if (state === "cancelled") return "已停止";
   return "已完成";
+}
+
+function activityStageLabel(stage?: string, origin?: string) {
+  if (origin === "model" || stage === "progress") return "工作进展";
+  if (stage === "reasoning" || stage === "decision" || stage === "think" || stage === "status") return "状态";
+  if (stage === "search") return "搜索";
+  if (stage === "result") return "结果";
+  if (stage === "storage") return "保存";
+  return "工具";
 }
 
 const renderedContent = computed(() => renderMarkdown(props.message.content));
@@ -116,34 +158,48 @@ function retry() {
                 <circle cx="12" cy="12" r="4" />
               </svg>
             </span>
-            <span>{{ showActivities ? "收起工作摘要" : `查看 ${message.activities.length} 条工作摘要` }}</span>
+            <span>{{ showActivities ? "收起工作进展" : `查看 ${message.activities.length} 条工作进展` }}</span>
             <svg class="activity-toggle-chevron" viewBox="0 0 24 24" aria-hidden="true">
               <path d="m7 10 5 5 5-5" />
             </svg>
           </button>
           <Transition name="activity-reveal">
-            <div v-if="showActivities" class="activity-feed">
-              <p class="activity-disclaimer">
-                仅展示可验证的工作阶段与数据结果，不展示模型内部思维链。
-              </p>
+            <div v-if="showActivities" class="activity-reveal-outer">
               <div
-                v-for="(act, i) in message.activities"
-                :key="i"
-                class="activity-item"
-                :class="{
-                  running: message.streaming && act.state === 'running',
-                  stopped: message.interrupted && act.state === 'running',
-                  failed: act.state === 'failed',
-                }"
+                ref="activityFeedEl"
+                class="activity-feed"
+                aria-label="Agent 工作进展"
+                aria-live="polite"
+                @scroll="onActivityFeedScroll"
               >
-                <span class="activity-marker" aria-hidden="true"></span>
-                <span class="activity-copy">
-                  <span class="activity-title">{{ act.title || act.stage }}</span>
-                  <small v-if="act.detail" class="activity-detail">{{ act.detail }}</small>
-                </span>
-                <span class="activity-state">{{ activityStateLabel(act.state, message.streaming, message.interrupted) }}</span>
+                <p class="activity-disclaimer">
+                  这里展示 Agent 的公开工作进展和已完成的操作，不展示隐藏思维链。
+                </p>
+                <div
+                  v-for="(act, i) in visibleActivities"
+                  :key="`${act.timestamp ?? i}-${i}`"
+                  class="activity-item"
+                  :class="{
+                    'model-progress': act.origin === 'model' || act.stage === 'progress',
+                    'reveal-current': message.streaming && i === visibleActivities.length - 1,
+                    running: message.streaming && act.state === 'running',
+                    stopped: message.interrupted && act.state === 'running',
+                    failed: act.state === 'failed' || (message.failed && act.state === 'running'),
+                  }"
+                >
+                  <span class="activity-marker" aria-hidden="true"></span>
+                  <span
+                    v-if="act.origin !== 'model' && act.stage !== 'progress'"
+                    class="activity-stage"
+                  >{{ activityStageLabel(act.stage, act.origin) }}</span>
+                  <span class="activity-copy">
+                    <span class="activity-title">{{ act.title || act.stage }}</span>
+                    <small v-if="act.detail" class="activity-detail">{{ act.detail }}</small>
+                  </span>
+                  <span class="activity-state">{{ activityStateLabel(act.state, message.streaming, message.interrupted, message.failed) }}</span>
+                </div>
+                <p v-if="message.interrupted" class="activity-interrupted">已停止生成，以上内容为已完成的工作摘要。</p>
               </div>
-              <p v-if="message.interrupted" class="activity-interrupted">已停止生成，以上内容为已完成的工作摘要。</p>
             </div>
           </Transition>
         </div>

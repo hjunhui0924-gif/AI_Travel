@@ -37,6 +37,8 @@ export interface ActivityEvent {
   title?: string;
   detail?: string;
   state?: string;
+  /** model = public summary; system/provider = verified execution status. */
+  origin?: "model" | "system" | "provider";
   timestamp?: string;
 }
 

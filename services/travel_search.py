@@ -195,7 +195,11 @@ def discover_travel_places(
                 }
             )
         if activity_logger:
-            activity_logger("search", "旅行网页搜索完成", f"候选 {len(result.candidates)} 条")
+            activity_logger(
+                "result",
+                "搜索资料已返回",
+                f"本次返回 {len(items)} 条，保留 {len(result.sources)} 条可追溯来源",
+            )
 
     if result.candidates:
         result.status = "partial" if result.errors else "success"

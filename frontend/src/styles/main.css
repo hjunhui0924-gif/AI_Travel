@@ -591,21 +591,29 @@ a:hover {
   text-decoration: none;
 }
 
-/* 执行过程 */
+/* Agent work progress */
 .activity-feed {
   margin-top: 8px;
-  border-left: 2px dashed var(--border-strong);
-  padding-left: 12px;
+  border-left: 1px solid var(--border);
+  padding: 2px 0 2px 15px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 10px;
 }
 .activity-item {
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--text-muted);
   display: flex;
-  gap: 6px;
+  gap: 7px;
   align-items: baseline;
+  min-width: 0;
+}
+.activity-item.model-progress {
+  display: block;
+  margin-left: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.7;
 }
 .activity-copy {
   display: flex;
@@ -614,9 +622,33 @@ a:hover {
   flex-direction: column;
   gap: 2px;
 }
+.activity-stage {
+  min-width: 31px;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.35;
+  text-align: center;
+  opacity: 0.72;
+}
+.activity-item.model-progress .activity-marker {
+  display: none;
+}
+.activity-item.model-progress .activity-copy {
+  display: block;
+}
+.activity-item.model-progress .activity-title {
+  font-weight: 450;
+}
+.activity-item.model-progress .activity-state {
+  display: none;
+}
 .activity-detail {
   color: var(--text-muted);
-  font-size: 11.5px;
+  font-size: 12.5px;
   line-height: 1.45;
   overflow-wrap: anywhere;
 }
@@ -631,7 +663,7 @@ a:hover {
 }
 .activity-item .activity-state {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   white-space: nowrap;
   opacity: 0.7;
 }
@@ -4803,7 +4835,7 @@ a:hover {
   line-height: 1.65;
 }
 
-/* Execution details are a disclosure attached to the answer, not a footer. */
+/* Codex-style work progress is a disclosure attached to the answer, not a footer. */
 .activity-section {
   margin: 0 0 8px;
 }
@@ -4862,17 +4894,52 @@ a:hover {
 
 .main-column.is-workspace .activity-feed {
   max-width: 540px;
+  max-height: 250px;
   margin-top: 6px;
-  padding: 7px 0 4px 13px;
-  border-left-color: rgba(243, 181, 104, 0.4);
+  padding: 5px 0 5px 17px;
+  border-left-color: rgba(255, 250, 240, 0.18);
+  gap: 15px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .main-column.is-workspace .activity-disclaimer {
   margin: 0 0 8px;
   color: rgba(255, 250, 240, 0.48);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.5;
 }
+.main-column.is-workspace .activity-item {
+  color: rgba(255, 250, 240, 0.76);
+  font-size: 13px;
+}
 .main-column.is-workspace .activity-detail {
+  color: rgba(255, 250, 240, 0.54);
+}
+.main-column.is-workspace .activity-item.model-progress {
+  color: rgba(255, 250, 240, 0.9);
+  font-size: 15px;
+  line-height: 1.72;
+}
+.main-column.is-workspace .activity-item.reveal-current .activity-title {
+  color: rgba(255, 250, 240, 0.98);
+}
+
+@keyframes activity-item-enter {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.activity-item.reveal-current {
+  animation: activity-item-enter 260ms ease both;
+}
+.main-column.is-workspace .activity-stage {
   color: rgba(255, 250, 240, 0.54);
 }
 .main-column.is-workspace .activity-state {
@@ -4927,24 +4994,52 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* 工作进展展开/收起按真实内容高度平滑动画（grid-template-rows 0fr⇄1fr）。
+   替代原 max-height 0↔1200px：后者内容 ~46ms 内猛弹、其余时间停顿，
+   收起时最后骤缩，导致下方正文让位/复位生硬（2026-09-06）。 */
+.activity-reveal-outer {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+
 .activity-reveal-enter-active,
 .activity-reveal-leave-active {
+  display: grid;
   overflow: hidden;
-  transition: opacity 180ms ease, max-height 220ms ease, transform 220ms ease;
+  transition:
+    grid-template-rows 280ms cubic-bezier(0.33, 1, 0.68, 1),
+    opacity 200ms ease;
 }
 
 .activity-reveal-enter-from,
 .activity-reveal-leave-to {
-  max-height: 0;
+  grid-template-rows: 0fr;
   opacity: 0;
-  transform: translateY(-4px);
 }
 
 .activity-reveal-enter-to,
 .activity-reveal-leave-from {
-  max-height: 360px;
+  grid-template-rows: 1fr;
   opacity: 1;
-  transform: translateY(0);
+}
+
+/* 行内滚动区允许收缩到 0fr，并保留自身滚动 */
+.activity-reveal-outer > .activity-feed {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+@media (max-width: 600px) {
+  .main-column.is-workspace .activity-feed {
+    max-height: 200px;
+    padding-left: 13px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-item.reveal-current {
+    animation: none;
+  }
 }
 
 /* On wide screens, let the hero read as a centered editorial invitation. */

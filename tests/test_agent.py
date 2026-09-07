@@ -1,6 +1,10 @@
+from threading import Event
+from uuid import uuid4
+
 from agents import agent
 from langchain.messages import AIMessage, AIMessageChunk
 from agents.schemas import TransportOption, TransportPage, TransportQueryPage, TravelPlan, TravelPlanResponse
+from services.travel_store import delete_travel_thread, ensure_guest_access
 
 
 def test_model_settings_prefer_qwen_when_dashscope_is_configured(monkeypatch):
@@ -202,6 +206,74 @@ def test_travel_response_yields_incremental_text_chunks(monkeypatch):
 
     assert len(text_parts) > 1
     assert "".join(text_parts) == rendered
+
+
+def test_sync_activity_stream_forwards_each_event_before_operation_finishes():
+    agent._reset_runtime_buffers()
+    release = Event()
+
+    def operation(activity_logger):
+        activity_logger("progress", "第一步已完成", "", origin="model")
+        assert release.wait(1)
+        activity_logger("progress", "第二步已完成", "", origin="provider")
+        return "operation-result"
+
+    stream = agent._stream_sync_with_activities(operation)
+    next(stream)
+    first = agent.consume_activity_log()
+    assert [item["title"] for item in first] == ["第一步已完成"]
+
+    release.set()
+    list(stream)
+    second = agent.consume_activity_log()
+    assert [item["title"] for item in second] == ["第二步已完成"]
+    assert second[0]["origin"] == "provider"
+
+
+def test_travel_work_progress_is_persisted_after_live_events(monkeypatch):
+    thread_id = f"guest_{uuid4().hex}"
+    ensure_guest_access(thread_id)
+    query = agent.prepare_travel_query("杭州有哪些适合散步的地方", [])
+    supervised = agent.TravelSupervisorResult(
+        query=query,
+        decision="answer",
+        answer="已找到适合散步的地点。",
+        decision_reason="用户只要求查询地点。",
+    )
+
+    monkeypatch.setattr(agent, "get_current_plan", lambda thread_id, user_id=None: None)
+    def fake_supervisor(*args, **kwargs):
+        kwargs["activity_logger"](
+            "progress",
+            "我先查询目的地的已验证地点。",
+            "",
+            "completed",
+            origin="model",
+        )
+        return supervised
+
+    monkeypatch.setattr(agent, "run_travel_supervisor", fake_supervisor)
+    monkeypatch.setattr(
+        agent,
+        "plan_travel",
+        lambda *args, **kwargs: TravelPlanResponse(
+            intent="nearby_explore",
+            summary="已找到适合散步的地点。",
+            decision="answer",
+        ),
+    )
+    monkeypatch.setattr(agent, "render_travel_response", lambda response: response.summary)
+
+    try:
+        list(agent._stream_travel_response("杭州有哪些适合散步的地方", thread_id, False, []))
+        history = agent.get_messages(thread_id)
+        assistant = next(item for item in history if item["role"] == "assistant")
+        stages = [item.get("stage") for item in assistant.get("activities", [])]
+        titles = [item.get("title") for item in assistant.get("activities", [])]
+        assert "progress" in stages
+        assert "我先查询目的地的已验证地点。" in titles
+    finally:
+        delete_travel_thread(thread_id)
 
 
 def test_more_transport_request_returns_next_structured_page(monkeypatch):

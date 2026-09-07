@@ -179,6 +179,28 @@ frontend/
 - `/chat` 的 `done.retryable/retry_reason` 与历史消息契约已同步；前端请求增加 45 秒客户端总等待保护，超时会保留已有文本并提供重试。
 - Qwen3.7 Flash 已作为 DashScope 默认模型；明确交通查询跳过多轮 Supervisor，等待期间仍显示“查询旅行数据”工作摘要。
 
+## 28. 可解释推理轨迹（2026-09-06）
+
+- 工作台的“工作摘要”改为“推理过程”，展示思考、搜索、工具、结果和保存阶段；步骤详情包含模型选择的下一项工作及搜索返回/保留的资料数量。
+- 推理面板明确标注为可解释摘要与执行轨迹，不渲染未经筛选的模型隐藏思维链；完成后仍可展开查看完整过程。
+- 验证：桌面 Playwright 回归确认推理步骤展开、阶段标签和搜索统计可见，移动/桌面布局无横向溢出且无控制台错误。
+
+## 29. 推理轨迹归档与失败状态（2026-09-07）
+
+- 实时推理步骤与历史记录使用独立数据队列，完成后刷新会话仍能展开查看完整轨迹。
+- 失败/超时的未完成步骤显示“未完成”；用户主动停止的步骤显示“已停止”。
+
+## 30. Codex 风格公开工作进展（2026-09-07）
+
+- 活动面板改为 Codex 风格：`origin=model` 的安全公开摘要显示为自然语言段落，代码和 provider 事件显示为简洁操作行；折叠入口从“推理步骤”调整为“工作进展”。
+- 后端新增 `progress` 活动事件。Supervisor 优先从工具调用前的普通 assistant content 中提取 `<public_progress>`，也兼容通过同一 content 返回的单行短摘要；统一限制为 120 字并过滤敏感/结构化内部内容，未提取到时使用真实工具名生成代码兜底文案。
+- `ActivityEvent.origin` 已加入前端类型与交接契约。历史旧事件没有该字段时仍按原有阶段兼容展示；SSE、历史归档、停止和重试行为不变。
+- 生成中的工作进展改为 SSE 事件驱动逐条显示：后端发出一条真实 activity 后前端立即显示一条，顺序跟随模型/工具执行，不再用固定计时器播放；工作进展区设置独立滚动和高度上限（桌面 250px、移动端 200px），展开时不会整体挤出聊天正文。
+- 公开摘要字号、状态行字号和对比度已提高，并为新条目增加轻微进入动画；系统开启 reduced-motion 时关闭该动画。
+- 已移除固定时间揭示逻辑；前端直接消费 SSE activity 队列，只有后端真实发出的事件才会显示，新增事件到达时自动滚动到进展末尾，用户手动上滑后停止跟随。
+- 安全边界：工作进展是公开摘要和执行状态，不是逐字思维链；不会向前端发送隐藏推理 token、系统提示词、工具参数或密钥。
+- 最终验证：`npm run typecheck`、`npm run build` 通过；Chrome 实际请求确认 activity 按 SSE 到达顺序追加，“查看工作进展”、自然语言进展句和查询结果状态行均可见；桌面/移动端展开区高度上限和内部滚动生效，390px 页面无横向溢出，控制台 0 errors（仅 AMap Canvas2D 性能 warning）。
+
 ## 28. 性能与液态玻璃优化（2026-09-06）
 
 - 流式合帧（`frontend/src/stores/chat.ts`）：SSE `text.delta` 不再每个增量立即触发整条消息重渲染；增量先缓冲，用 `requestAnimationFrame` 按动画帧合并提交一次（done/error/断流/finally 路径同步 flush，保证尾部内容不丢）。目标：把长回答“逐 token 全量重解析 + 整块 innerHTML 替换 + 强制滚动”的高频布局开销收敛为一帧一次。
@@ -187,3 +209,11 @@ frontend/
 - 涉及文件仅上述两个；未改动 main.css、未涉及 FRONTEND_HANDOFF 契约参数；不在本地引入演示开关/组件。
 - 验证：`npm run typecheck` 通过；`npm run build`（临时 outDir，未写 `static/`）通过——CSS 107.38 kB（gzip 18.97 kB）、JS 242.97 kB（gzip 86.75 kB）。视觉对照此前已在沙盒副本 `frontend-glass-demo` 用「现状/推荐版」两态开关回归通过；该副本随后已清理。
 - 回退：仅需移除 interaction-pass.css 末尾的“性能与液态玻璃 pass”段，并把 chat.ts `send()` 中“流式合帧”注释块还原为逐 delta 直接 `current.content += delta`（勿用 `git checkout` 整文件回退，避免覆盖本会话之前本地已有的未提交改动）。
+
+## 31. 液态玻璃 12px 定档 + 工作进展展开/收起平滑（2026-09-07）
+
+- 液态玻璃定档 12px：主消息容器 blur 26→16→12px（另：顶部栏 7、紧凑胶囊 9、输入框 7、行程浮层 8），保留上缘高光带 / 亮描边 / 发丝内辉光，底色 alpha 微调维持正文可读性。范围明确为“只改玻璃自身参数，不改全屏照片叠层亮度”——不做全屏高亮（沙盒曾尝试全屏提亮方案，已否决）。
+- 工作进展展开/收起动画重写：原 `max-height: 0 ⇄ 1200px` 为梯形时序（列表实际高约 250px，展开前 ~46ms 猛弹、其余停顿，收起时最后骤缩），导致下方正文让位/复位生硬。现于 `MessageItem.vue` 为活动列表增加 `.activity-reveal-outer` 包裹层，`main.css` 改用 `grid-template-rows: 0fr ⇄ 1fr` 做高度动画（精确跟随真实内容、全程匀速），配 opacity 过渡；行内 `.activity-feed` 保留 `min-height: 0` 与独立滚动/自动跟随（与 §30 行为兼容）。
+- 涉及文件：`frontend/src/styles/interaction-pass.css`（玻璃段更新至 12px 档）、`frontend/src/styles/main.css`（activity-reveal 过渡重写）、`frontend/src/components/MessageItem.vue`（外层包裹）。
+- 验证：沙盒 5 档 A/B（16/12/10/8/6px）目测后定档 12px，随后清理沙盒副本（本地零残留）；当前 `npm run typecheck` 通过，`npm run build`（写入 `static/`）通过——CSS 108.90 kB（gzip 19.26 kB）、JS 244.09 kB（gzip 87.16 kB）；当前 `static/index.html` 实际引用 `index-uYCWfioC.css` / `index-kJ31gYrl.js`，并包含 `blur(12px)`、`grid-template-rows: 0fr`、`activity-reveal-outer`。
+- 备注：更透档位（10/8/6px，含底色 alpha 递减）已在沙盒验证全谱可用；助手正文直接压在玻璃上，透度越高可读性越低，12px 为当前平衡点。

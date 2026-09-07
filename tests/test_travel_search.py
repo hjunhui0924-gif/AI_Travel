@@ -37,6 +37,24 @@ def test_enabled_search_preserves_source_and_marks_discovery_only():
     assert result.sources[0]["snippet"] == ""
 
 
+def test_enabled_search_reports_result_count_in_activity_trace():
+    activities = []
+    result = discover_travel_places(
+        "杭州",
+        search_enabled=True,
+        searcher=FakeSearcher(),
+        activity_logger=lambda stage, title, detail, state="completed": activities.append(
+            {"stage": stage, "title": title, "detail": detail, "state": state}
+        ),
+    )
+
+    assert result.status == "success"
+    returned = [item for item in activities if item["title"] == "搜索资料已返回"]
+    assert returned
+    assert "返回 1 条" in returned[0]["detail"]
+    assert "保留 1 条可追溯来源" in returned[0]["detail"]
+
+
 def test_search_failure_is_returned_without_fake_candidates():
     result = discover_travel_places("杭州", search_enabled=True, searcher=FakeSearcher(error=TimeoutError("timeout")))
 

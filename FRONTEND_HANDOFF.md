@@ -184,7 +184,7 @@ HomeView / ChatComposer
 
 ```text
 event: activity
-data: {"stage":"tool","title":"...","detail":"...","state":"completed","timestamp":"..."}
+data: {"stage":"progress","title":"你指定了高铁，我先查询 12306 的车次和席位。","detail":"","state":"completed","origin":"model","timestamp":"..."}
 
 event: source
 data: {"title":"西湖","url":"https://...","summary":"...","source_date":"...","evidence_id":"..."}
@@ -214,7 +214,8 @@ data: {
 }
 ```
 
-- `activity` 可用于显示“正在分析、查询地点、整理行程”等过程；不要把 `detail` 当作事实字段。
+- `activity` 用于显示 Codex 风格的公开工作进展和真实执行轨迹。`origin=model` 表示模型返回了经安全过滤的短摘要；`origin=system/provider` 表示代码记录的流程或数据源状态。不要把 `detail` 当作事实字段，也不要将任何 activity 当作模型逐字思维链。
+- 生成中的消息按 SSE activity 到达顺序逐条显示：每收到一条真实阶段事件就立即追加，不使用固定计时器伪造进度。工作进展面板在工作台内有独立滚动和高度上限，前端不要依赖其完整高度推动正文布局。
 - `source` 和 `done.sources` 只用于来源卡；优先用 `evidence_id` 去重。来源可能是来源卡字段，也可能是完整 `Evidence` 字段，未知字段应忽略。
 - `text.delta` 只做聊天文本增量拼接；旅行规划正文、澄清回复和范围拒答都会拆成多个增量事件，前端不应等待完整正文后再渲染。
 - `done.transport_options` 和 `done.transport_page` 仅用于“加载更多”类后续交通查询；如果本轮生成了完整计划，交通候选的权威列表仍在 `done.trip_plan.transport_options`。
@@ -227,7 +228,7 @@ data: {
 - 发生异常时收到 `event: error`，数据为 `{ "message": "..." }`；这类错误可能仍然以 HTTP 200 的 SSE 响应返回，也可能没有 `done`，不能只依赖 HTTP 状态码判断成功。鉴权/输入错误可以返回具体提示；服务内部异常只返回稳定的通用提示，详细异常只写服务端日志。前端应结束 loading、保留已收到内容，并避免自动重复提交同一请求。
 - `done.retryable=true` 表示 provider 暂时失败或超时，前端可显示有限次数的“重试”操作；不要从 `final_text` 或诊断文案猜测是否可重试。当前前端最多允许 2 次手动重试，每次复用原始用户输入和附件。
 
-生成中的停止：前端为每次 `/chat` 请求生成随机 `request_id` 并作为表单字段提交；用户点击停止时调用 `POST /chat/cancel`，请求体为 `{ "thread_id": "...", "request_id": "..." }`，同时立即 abort 当前 `fetch` 流。取消接口使用与 `/chat` 相同的账号/guest capability 鉴权，只会通知服务端在下一个安全编排边界停止。已经进入 provider 的单次网络请求可能先完成，不能承诺硬终止；前端应保留已收到的文本并标记为已停止。`activity` 只展示可验证的工作摘要，不展示模型内部思维链。
+生成中的停止：前端为每次 `/chat` 请求生成随机 `request_id` 并作为表单字段提交；用户点击停止时调用 `POST /chat/cancel`，请求体为 `{ "thread_id": "...", "request_id": "..." }`，同时立即 abort 当前 `fetch` 流。取消接口使用与 `/chat` 相同的账号/guest capability 鉴权，只会通知服务端在下一个安全编排边界停止。已经进入 provider 的单次网络请求可能先完成，不能承诺硬终止；前端应保留已收到的文本并标记为已停止。`activity` 展示经过过滤的公开工作进展和真实执行状态，不展示模型内部思维链。
 
 附件限制：图片支持 `.png`、`.jpg`、`.jpeg`、`.webp`、`.gif`；文档支持 `.pdf`、`.txt`、`.md`、`.csv`、`.docx`、`.doc`、`.xlsx`、`.xls`。单个文件最大 10MB。`.doc` 只返回兼容性提示，不保证可靠解析。图片附件的 `image_url` 可能是内联 `data:` URL 或有时效的 OSS URL，不应假设它永久有效；历史消息中的图片通过用户消息的 `attachments`/`image_urls` 返回，而 `done.attachments` 当前只列出文本附件。
 
