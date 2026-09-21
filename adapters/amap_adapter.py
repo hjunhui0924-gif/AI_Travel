@@ -36,16 +36,62 @@ def search_pois(location: str, keywords: str, page_size: int = 5) -> list[dict]:
         business = item.get("business", {}) if isinstance(item.get("business"), dict) else {}
         results.append(
             {
+                "provider_id": item.get("id", ""),
                 "name": item.get("name", ""),
                 "category": item.get("type", ""),
                 "address": item.get("address", ""),
-                "area": city,
+                "area": item.get("cityname") or item.get("adname") or city,
+                "province": item.get("pname", ""),
+                "city": item.get("cityname") or city,
+                "district": item.get("adname", ""),
+                "location": item.get("location", ""),
                 "distance": item.get("distance", ""),
                 "rating": business.get("rating", ""),
                 "cost": business.get("cost", ""),
             }
         )
     return results
+
+
+def search_place_candidates(city: str, place: str, page_size: int = 3) -> list[dict]:
+    """Return map-backed candidates for an explicit user place.
+
+    Unlike ``resolve_place_in_city`` this intentionally keeps multiple
+    candidates so same-name landmarks can be confirmed instead of selecting
+    the provider's first result silently.
+    """
+
+    if not city or not place or not has_amap_key():
+        return []
+    payload = _amap_get(
+        "/v5/place/text",
+        {
+            "keywords": place,
+            "region": city,
+            "page_size": max(1, min(3, int(page_size))),
+            "show_fields": "business,navi",
+        },
+    )
+    candidates = []
+    for item in (payload.get("pois") or [])[: max(1, min(3, int(page_size)))]:
+        if not isinstance(item, dict):
+            continue
+        business = item.get("business", {}) if isinstance(item.get("business"), dict) else {}
+        candidates.append(
+            {
+                "provider_id": str(item.get("id") or ""),
+                "name": str(item.get("name") or place),
+                "category": str(item.get("type") or ""),
+                "province": str(item.get("pname") or ""),
+                "city": str(item.get("cityname") or city),
+                "district": str(item.get("adname") or ""),
+                "address": str(item.get("address") or ""),
+                "location": str(item.get("location") or ""),
+                "distance": str(item.get("distance") or ""),
+                "rating": str(business.get("rating") or ""),
+            }
+        )
+    return candidates
 
 
 def resolve_place_in_city(city: str, place: str) -> dict | None:
@@ -68,9 +114,13 @@ def resolve_place_in_city(city: str, place: str) -> dict | None:
 
     item = pois[0]
     return {
+        "provider_id": item.get("id", ""),
         "name": item.get("name", place),
+        "category": item.get("type", ""),
+        "province": item.get("pname", ""),
         "address": item.get("address", ""),
         "city": city,
+        "district": item.get("adname", ""),
         "location": item.get("location", ""),
         "formatted_address": f"{city}{item.get('address', '')}".strip(),
     }

@@ -5,8 +5,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from adapters.amap_adapter import resolve_place_in_city, search_pois, search_pois_around_location
-from agents.schemas import Evidence, PoiGroup, PoiRecommendation, TravelQuery
+from adapters.amap_adapter import (
+    resolve_place_in_city,
+    search_place_candidates,
+    search_pois,
+    search_pois_around_location,
+)
+from agents.schemas import (
+    BookingRequirement,
+    Evidence,
+    OpeningWindow,
+    PlaceCandidate,
+    PoiGroup,
+    PoiRecommendation,
+    TravelQuery,
+)
 from services.travel_search import discover_travel_places
 from utils.weather_utils import has_amap_key
 
@@ -23,6 +36,8 @@ class PoiGroupDiscoveryResult:
     errors: list[str]
     web_search_status: str = "not_requested"
     poi_status: str = "empty"
+    place_candidates: list[PlaceCandidate] | None = None
+    unresolved_places: list[str] | None = None
 
     def __iter__(self):
         # Keep the original three-value unpacking seam for callers that do not
@@ -40,6 +55,8 @@ class PoiRecommendationResult:
     errors: list[str]
     web_search_status: str = "not_requested"
     poi_status: str = "empty"
+    place_candidates: list[PlaceCandidate] | None = None
+    unresolved_places: list[str] | None = None
 
     def __iter__(self):
         # Existing tests and integrations can continue to unpack four values.
@@ -47,6 +64,28 @@ class PoiRecommendationResult:
         yield self.groups
         yield self.evidence
         yield self.errors
+
+
+def _place_candidate(item: dict, query_text: str, index: int) -> PlaceCandidate:
+    provider_id = str(item.get("provider_id") or "").strip()
+    name = str(item.get("name") or query_text).strip()
+    candidate_id = provider_id or _source_id({**item, "name": name}, provider="place")
+    return PlaceCandidate(
+        candidate_id=candidate_id or f"place_{index}",
+        provider_id=provider_id,
+        name=name,
+        category=str(item.get("category") or ""),
+        province=str(item.get("province") or ""),
+        city=str(item.get("city") or ""),
+        district=str(item.get("district") or ""),
+        address=str(item.get("address") or item.get("formatted_address") or ""),
+        location=str(item.get("location") or ""),
+        distance_from_city_center=str(item.get("distance") or ""),
+        opening_status=str(item.get("opening_status") or "unknown"),
+        confidence="high" if provider_id and name else "unknown",
+        source_ids=list(item.get("source_ids") or []),
+        query_text=query_text,
+    )
 
 
 def _now_label() -> str:
@@ -115,6 +154,45 @@ def _to_poi(
     source_ids.extend(item.get("source_ids") or [])
     source_ids.extend(extra_source_ids or [])
 
+    raw_windows = item.get("opening_windows") if isinstance(item.get("opening_windows"), list) else []
+    opening_windows = [
+        OpeningWindow(
+            date=str(window.get("date") or ""),
+            target_id=str(window.get("target_id") or item.get("provider_id") or item.get("name") or ""),
+            open_time=str(window.get("open_time") or ""),
+            close_time=str(window.get("close_time") or ""),
+            last_entry_time=window.get("last_entry_time"),
+            closed_reason=window.get("closed_reason"),
+            source_ids=list(window.get("source_ids") or []),
+        )
+        for window in raw_windows
+        if isinstance(window, dict)
+    ]
+    raw_booking = item.get("booking_requirement")
+    booking = (
+        BookingRequirement(
+            target_id=str(raw_booking.get("target_id") or item.get("provider_id") or item.get("name") or ""),
+            required=bool(raw_booking.get("required")),
+            booking_url=raw_booking.get("booking_url"),
+            booking_note=str(raw_booking.get("booking_note") or ""),
+            booking_status=str(raw_booking.get("booking_status") or "unknown"),
+            verification=str(raw_booking.get("verification") or "unknown"),
+            source_ids=list(raw_booking.get("source_ids") or []),
+        )
+        if isinstance(raw_booking, dict)
+        else BookingRequirement()
+    )
+    if (
+        not isinstance(raw_booking, dict)
+        and any(token in f"{category} {item.get('name', '')}" for token in ("博物馆", "展馆", "演出", "景区"))
+    ):
+        booking = BookingRequirement(
+            target_id=str(item.get("provider_id") or item.get("name") or ""),
+            booking_note="当前未获得可靠预约状态，请出发前通过官方渠道确认。",
+            booking_status="unknown",
+            verification="unknown",
+        )
+
     return (
         PoiRecommendation(
             name=item.get("name", ""),
@@ -132,6 +210,13 @@ def _to_poi(
             source_ids=source_ids,
             website_url=website_url,
             freshness="current_query",
+            provider_id=str(item.get("provider_id") or ""),
+            province=str(item.get("province") or ""),
+            city=str(item.get("city") or area),
+            district=str(item.get("district") or ""),
+            location=str(item.get("location") or ""),
+            opening_windows=opening_windows,
+            booking_requirement=booking,
         ),
         source,
     )
@@ -180,7 +265,11 @@ def build_poi_groups(
     search_enabled: bool = False,
     activity_logger=None,
 ) -> PoiGroupDiscoveryResult:
-    city = query.destination or query.city
+    city = (
+        query.destination_cities[0]
+        if query.destination_scope == "province" and query.destination_cities
+        else query.destination or query.city
+    )
     if not city:
         return PoiGroupDiscoveryResult(
             groups=[],
@@ -196,15 +285,67 @@ def build_poi_groups(
     web_search_statuses: list[str] = []
     has_map_items = False
     map_failed = False
+    place_candidates: list[PlaceCandidate] = []
+    unresolved_places: list[str] = []
     anchors = query.named_places[:4] or [""]
     for place in anchors:
-        try:
-            resolved = resolve_place_in_city(city, place) if place else None
-        except Exception as exc:
-            resolved = None
-            map_failed = True
-            errors.append(f"地图地点解析失败：{type(exc).__name__}")
+        confirmed = next(
+            (
+                item
+                for item in query.resolved_place_candidates
+                if item.name == place
+                or item.query_text == place
+                or place in item.name
+                or item.name in place
+            ),
+            None,
+        )
+        if confirmed is not None:
+            place_candidates.append(confirmed)
+            resolved = {
+                "provider_id": confirmed.provider_id,
+                "name": confirmed.name,
+                "category": confirmed.category,
+                "province": confirmed.province,
+                "city": confirmed.city or city,
+                "district": confirmed.district,
+                "address": confirmed.address,
+                "location": confirmed.location,
+                "formatted_address": confirmed.address or confirmed.name,
+            }
+        else:
+            try:
+                resolved = resolve_place_in_city(city, place) if place else None
+            except Exception as exc:
+                resolved = None
+                map_failed = True
+                errors.append(f"地图地点解析失败：{type(exc).__name__}")
         anchor_name = resolved.get("name", place) if resolved else (place or city)
+
+        # The legacy resolver deliberately returns one result.  Only a
+        # provider-backed result with an id enters the multi-candidate path;
+        # this keeps adapter/test doubles without ids backward compatible.
+        if place and resolved and resolved.get("provider_id") and confirmed is None:
+            try:
+                candidate_rows = search_place_candidates(city, place, page_size=3)
+            except Exception as exc:
+                candidate_rows = [resolved]
+                errors.append(f"地点候选查询失败：{type(exc).__name__}")
+            if not candidate_rows:
+                candidate_rows = [resolved]
+            candidates_for_place = [
+                _place_candidate(item, place, len(place_candidates) + index + 1)
+                for index, item in enumerate(candidate_rows)
+                if isinstance(item, dict)
+            ]
+            exact_candidates = [
+                item
+                for item in candidates_for_place
+                if item.name == place or place in item.name or item.name in place
+            ]
+            place_candidates.extend(candidates_for_place)
+            if len(exact_candidates) > 1:
+                unresolved_places.append(place)
 
         food_items: list[dict] = []
         leisure_items: list[dict] = []
@@ -314,6 +455,8 @@ def build_poi_groups(
         errors=_dedupe_errors(errors),
         web_search_status=web_search_status,
         poi_status=poi_status,
+        place_candidates=place_candidates,
+        unresolved_places=list(dict.fromkeys(unresolved_places)),
     )
 
 
@@ -361,7 +504,11 @@ def recommend_pois(
     search_enabled: bool = False,
     activity_logger=None,
 ) -> PoiRecommendationResult:
-    city = query.destination or query.city
+    city = (
+        query.destination_cities[0]
+        if query.destination_scope == "province" and query.destination_cities
+        else query.destination or query.city
+    )
     if not city:
         return PoiRecommendationResult(
             recommendations=[],
@@ -383,10 +530,14 @@ def recommend_pois(
         errors = group_result.errors
         web_search_status = group_result.web_search_status
         poi_status = group_result.poi_status
+        place_candidates = list(group_result.place_candidates or [])
+        unresolved_places = list(group_result.unresolved_places or [])
     else:
         poi_groups, evidence, errors = group_result
         web_search_status = "disabled" if not search_enabled else ("failed" if errors else "empty")
         poi_status = "success" if poi_groups else ("failed" if errors else "empty")
+        place_candidates = []
+        unresolved_places = []
 
     recommendations: list[PoiRecommendation] = []
     for group in poi_groups:
@@ -434,4 +585,6 @@ def recommend_pois(
         errors=_dedupe_errors(errors),
         web_search_status=web_search_status,
         poi_status=poi_status,
+        place_candidates=place_candidates,
+        unresolved_places=list(dict.fromkeys(unresolved_places)),
     )

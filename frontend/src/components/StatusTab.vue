@@ -35,6 +35,8 @@ const adapters = computed(() => {
     label: STATE_LABELS[state] ?? state,
   }));
 });
+
+const providerMeta = computed(() => Object.values(p.value?.provider_meta ?? {}));
 </script>
 
 <template>
@@ -50,6 +52,35 @@ const adapters = computed(() => {
         <span class="adapter-state" :class="a.state">{{ a.label }}</span>
       </div>
     </div>
+    <div v-if="providerMeta.length" class="provider-meta-list">
+      <div v-for="meta in providerMeta" :key="meta.provider" class="notice-block diagnostic">
+        {{ meta.provider }}：第 {{ meta.attempts }} 次，耗时 {{ meta.latency_ms }}ms
+        <span v-if="meta.retryable"> · 可重试</span>
+      </div>
+    </div>
+
+    <template v-if="p.unresolved_places?.length">
+      <div class="section-title">地点待确认</div>
+      <div v-for="place in p.unresolved_places" :key="place" class="notice-block risk">
+        “{{ place }}”存在多个候选，确认后才会进入正式路线计算。
+      </div>
+    </template>
+
+    <template v-if="p.care_reminders?.length">
+      <div class="section-title">天气行动建议</div>
+      <div v-for="(reminder, i) in p.care_reminders" :key="`${reminder.date}-${i}`" class="notice-block alert">
+        {{ reminder.date }}：{{ reminder.message }}
+      </div>
+    </template>
+
+    <template v-if="p.daily_weather?.length">
+      <div class="section-title">按日天气</div>
+      <div v-for="weather in p.daily_weather" :key="weather.date" class="notice-block diagnostic">
+        {{ weather.date }}：{{ weather.day_weather || "天气待确认" }}
+        <span v-if="weather.day_temp_c !== null"> · {{ weather.day_temp_c }}°C</span>
+        <span v-if="weather.rain_probability !== null"> · 降雨概率 {{ Math.round(weather.rain_probability * 100) }}%</span>
+      </div>
+    </template>
 
     <template v-if="p.conflicts?.length">
       <div class="section-title">冲突</div>

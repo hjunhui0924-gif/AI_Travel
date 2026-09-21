@@ -1251,6 +1251,7 @@ async def chat(
             assistant_sources = []
             assistant_answer_segments = []
             assistant_clarification = None
+            assistant_pending_query = None
             assistant_scope_refusal = False
             assistant_decision = ""
             assistant_decision_reason = ""
@@ -1287,6 +1288,8 @@ async def chat(
                         assistant_answer_segments = metadata["answer_segments"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("clarification"), dict):
                     assistant_clarification = metadata["clarification"]
+                if isinstance(metadata, dict) and isinstance(metadata.get("pending_query"), dict):
+                    assistant_pending_query = metadata["pending_query"]
                 if isinstance(metadata, dict) and metadata.get("scope_refusal") is True:
                     assistant_scope_refusal = True
                 if isinstance(metadata, dict) and isinstance(metadata.get("decision"), str):
@@ -1393,6 +1396,7 @@ async def chat(
                 answer_segments,
                 search_enabled=search_enabled,
                 clarification=assistant_clarification,
+                pending_query=assistant_pending_query,
                 scope_refusal=assistant_scope_refusal,
                 retryable=assistant_retryable,
                 retry_reason=assistant_retry_reason,
@@ -1472,6 +1476,7 @@ async def chat(
                     "final_text": final_text,
                     "answer_segments": answer_segments,
                     "clarification": assistant_clarification,
+                    "pending_query": assistant_pending_query,
                     "scope_refusal": assistant_scope_refusal,
                     "decision": assistant_decision,
                     "decision_reason": assistant_decision_reason,

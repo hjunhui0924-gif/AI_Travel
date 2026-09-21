@@ -65,7 +65,11 @@ def _resolve_places(city: str, places: list[str]) -> list[dict]:
 
 
 def _build_segments(query: TravelQuery) -> list[tuple[dict, dict]]:
-    city = query.destination or query.city
+    city = (
+        query.destination_cities[0]
+        if query.destination_scope == "province" and query.destination_cities
+        else query.destination or query.city
+    )
     named_places = _dedupe_places(query.named_places)
     if not city or not named_places:
         return []

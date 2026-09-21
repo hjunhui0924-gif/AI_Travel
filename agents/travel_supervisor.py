@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date
@@ -19,6 +20,7 @@ from langchain_core.tools import StructuredTool, tool
 
 from agents.schemas import (
     Evidence,
+    PlaceCandidate,
     PoiGroup,
     PoiRecommendation,
     RoutePlan,
@@ -86,6 +88,8 @@ class TravelSupervisorResult:
     adapter_status: dict[str, str] = field(default_factory=dict)
     diagnostics: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    place_candidates: list[PlaceCandidate] = field(default_factory=list)
+    unresolved_places: list[str] = field(default_factory=list)
     final_model_note: str = ""
     # The model owns the conversational action after it has seen the request
     # and any provider results. Code validates this value before acting on it.
@@ -551,6 +555,8 @@ def run_travel_supervisor(
             sources = list(poi_result.evidence)
             errors = list(poi_result.errors)
             status = poi_result.poi_status
+            result.place_candidates = list(poi_result.place_candidates or [])
+            result.unresolved_places = list(poi_result.unresolved_places or [])
         else:
             items, groups, sources, errors = poi_result
             status = "success" if items else "failed" if errors else "empty"
@@ -571,6 +577,8 @@ def run_travel_supervisor(
     def plan_route(places: list[str], mode: str = "driving") -> str:
         """规划已验证地点之间的高德路线；places 必须来自用户输入或 search_poi 结果。"""
         city = _validate_city(query.destination or query.city, query)
+        if result.unresolved_places:
+            raise ValueError("存在同名地点候选，必须先完成地点确认。")
         if mode not in {"driving", "walking", "transit"}:
             raise ValueError("路线方式只能是 driving、walking 或 transit。")
         active_places = _validate_route_places(places, query, collector.get("poi_items", []))
@@ -717,6 +725,8 @@ def run_travel_supervisor(
             "",
             origin="model" if public_progress else "system",
         )
+        pending_tool_calls = []
+        stop_after_duplicate = False
         for call in tool_calls:
             if cancellation_check:
                 cancellation_check()
@@ -746,37 +756,84 @@ def run_travel_supervisor(
                 messages.append(ToolMessage(content=_json_result({"error": record.error}), tool_call_id=str(call.get("id") or name)))
                 # A repeated tool request is usually a model-side loop. Stop
                 # the loop and use the verified result already collected.
+                stop_after_duplicate = True
                 break
             called_tool_names.add(name)
             active_tool = next(item for item in tools if item.name == name)
-            try:
-                tool_output = active_tool.invoke(arguments)
-            except Exception as exc:
-                record.status = "failed"
-                record.error = _safe_tool_error(exc)
-                result.errors.append(f"{name}: {type(exc).__name__}")
-                status_by_tool = {
-                    "search_rail": "rail",
-                    "search_flight": "flight",
-                    "search_poi": "poi",
-                    "plan_route": "route",
-                    "get_weather": "weather",
-                    "search_current_travel_info": "web_search",
+            pending_tool_calls.append((call, record, active_tool, arguments))
+
+        # A model can return several independent tool calls in one response.
+        # Execute those calls concurrently, while keeping route calls in the
+        # same response serially isolated by the adapter's own validation. The
+        # ToolMessages are restored to model call order after all futures have
+        # completed, so the conversation protocol remains deterministic.
+        if pending_tool_calls:
+            max_workers = max(1, min(4, len(pending_tool_calls)))
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="travel-supervisor") as pool:
+                futures = {
+                    pool.submit(active_tool.invoke, arguments): index
+                    for index, (_call, _record, active_tool, arguments) in enumerate(pending_tool_calls)
+                    if _record.name != "plan_route"
                 }
-                status_key = status_by_tool.get(name)
-                if status_key:
-                    result.adapter_status[status_key] = "failed"
-                log(
-                    "tool",
-                    f"{tool_display_names.get(name, '数据')}查询未完成",
-                    "数据源暂时不可用，后续可重试",
-                    "failed",
-                )
-                messages.append(ToolMessage(content=_json_result({"error": _safe_tool_error(exc)}), tool_call_id=str(call.get("id") or name)))
-            else:
-                if cancellation_check:
-                    cancellation_check()
-                messages.append(ToolMessage(content=_compact(tool_output, 4500), tool_call_id=str(call.get("id") or name)))
+                completed: dict[int, tuple[object, Exception | None]] = {}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    try:
+                        completed[index] = (future.result(), None)
+                    except Exception as exc:
+                        completed[index] = (None, exc)
+                # Route planning may depend on POI results returned by the
+                # same model response, so execute it only after the
+                # independent discovery calls have finished.
+                for index, (_call, record, active_tool, arguments) in enumerate(pending_tool_calls):
+                    if record.name != "plan_route":
+                        continue
+                    try:
+                        completed[index] = (active_tool.invoke(arguments), None)
+                    except Exception as exc:
+                        completed[index] = (None, exc)
+
+            status_by_tool = {
+                "search_rail": "rail",
+                "search_flight": "flight",
+                "search_poi": "poi",
+                "plan_route": "route",
+                "get_weather": "weather",
+                "search_current_travel_info": "web_search",
+            }
+            for index, (call, record, _active_tool, _arguments) in enumerate(pending_tool_calls):
+                tool_output, error = completed.get(index, (None, RuntimeError("tool result missing")))
+                name = record.name
+                if error is not None:
+                    record.status = "failed"
+                    record.error = _safe_tool_error(error)
+                    result.errors.append(f"{name}: {type(error).__name__}")
+                    status_key = status_by_tool.get(name)
+                    if status_key:
+                        result.adapter_status[status_key] = "failed"
+                    log(
+                        "tool",
+                        f"{tool_display_names.get(name, '数据')}查询未完成",
+                        "数据源暂时不可用，后续可重试",
+                        "failed",
+                    )
+                    messages.append(
+                        ToolMessage(
+                            content=_json_result({"error": record.error}),
+                            tool_call_id=str(call.get("id") or name),
+                        )
+                    )
+                else:
+                    if cancellation_check:
+                        cancellation_check()
+                    messages.append(
+                        ToolMessage(
+                            content=_compact(tool_output, 4500),
+                            tool_call_id=str(call.get("id") or name),
+                        )
+                    )
+        if stop_after_duplicate:
+            break
         if result.fallback_used or any(item.error == "同一工具在本轮只能调用一次" for item in result.tool_calls):
             break
 

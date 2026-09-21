@@ -76,6 +76,7 @@ export interface ClarificationRequest {
   code: string;
   prompt: string;
   options: ClarificationOption[];
+  pending_query?: Record<string, unknown>;
 }
 
 export interface HistoryMessage {
@@ -87,6 +88,7 @@ export interface HistoryMessage {
   sources?: SourceInfo[];
   answer_segments?: AnswerSegment[];
   clarification?: ClarificationRequest | null;
+  pending_query?: Record<string, unknown> | null;
   scope_refusal?: boolean;
   retryable?: boolean;
   retry_reason?: string;
@@ -136,6 +138,107 @@ export interface RoutePlan {
   polyline: [number, number][];
 }
 
+export interface ProviderMeta {
+  provider: string;
+  status: string;
+  retryable: boolean;
+  error_code: string;
+  attempts: number;
+  latency_ms: number;
+  retrieved_at: string;
+  valid_until: string;
+}
+
+export interface PlaceCandidate {
+  candidate_id: string;
+  provider_id: string;
+  name: string;
+  category: string;
+  province: string;
+  city: string;
+  district: string;
+  address: string;
+  location: string;
+  distance_from_city_center: string;
+  opening_status: string;
+  confidence: string;
+  source_ids: string[];
+  query_text: string;
+}
+
+export interface OpeningWindow {
+  date: string;
+  target_id: string;
+  open_time: string;
+  close_time: string;
+  last_entry_time: string | null;
+  closed_reason: string | null;
+  source_ids: string[];
+}
+
+export interface BookingRequirement {
+  target_id: string;
+  required: boolean;
+  booking_url: string | null;
+  booking_note: string;
+  booking_status: string;
+  verification: string;
+  source_ids: string[];
+}
+
+export interface DailyWeather {
+  date: string;
+  day_weather: string;
+  night_weather: string;
+  day_temp_c: number | null;
+  night_temp_c: number | null;
+  rain_probability: number | null;
+  wind_level: string;
+  humidity: string;
+  source_id: string;
+  retrieved_at: string;
+}
+
+export interface CareReminder {
+  date: string;
+  message: string;
+  rule: string;
+  source_ids: string[];
+}
+
+export interface RouteSegment {
+  segment_id: string;
+  date: string;
+  origin_place_id: string;
+  destination_place_id: string;
+  mode: string;
+  distance_meters: number | null;
+  duration_minutes: number | null;
+  estimated_cost: string | null;
+  buffer_minutes: number;
+  walking_minutes: number | null;
+  source_ids: string[];
+}
+
+export interface TransportEdge {
+  origin_city: string;
+  destination_city: string;
+  mode: string;
+  depart_at: string;
+  arrive_at: string;
+  duration_minutes: number | null;
+  price: string | null;
+  transfer_count: number;
+  source_ids: string[];
+}
+
+export interface OptimizationDiagnostic {
+  code: string;
+  message: string;
+  severity: string;
+  details: Record<string, string>;
+}
+
 export interface PlanItem {
   item_id: string;
   item_type: string;
@@ -155,6 +258,12 @@ export interface PlanItem {
   end_date: string;
   is_demo: boolean;
   seat_count: number | null;
+  place_id: string;
+  opening_window_id: string;
+  booking_requirement_id: string;
+  buffer_minutes: number;
+  walking_minutes: number | null;
+  transit_minutes: number | null;
 }
 
 export interface PlanDay {
@@ -237,6 +346,19 @@ export interface TravelPlan {
   transport_options: TransportOption[];
   transport_pages?: TransportPage[];
   route_plans?: RoutePlan[];
+  route_segments?: RouteSegment[];
+  optimization_objective?: string;
+  optimization_score?: number | null;
+  place_candidates?: PlaceCandidate[];
+  opening_windows?: OpeningWindow[];
+  booking_requirements?: BookingRequirement[];
+  daily_weather?: DailyWeather[];
+  care_reminders?: CareReminder[];
+  unresolved_places?: string[];
+  optimization_diagnostics?: OptimizationDiagnostic[];
+  provider_meta?: Record<string, ProviderMeta>;
+  schedule_constraints?: unknown[];
+  transport_edges?: TransportEdge[];
 }
 
 export interface PlanVersionSummary {
@@ -280,6 +402,7 @@ export interface DonePayload {
   final_text: string;
   answer_segments: AnswerSegment[];
   clarification?: ClarificationRequest | null;
+  pending_query?: Record<string, unknown> | null;
   scope_refusal?: boolean;
   decision?: "answer" | "clarify" | "plan" | "refuse" | string;
   decision_reason?: string;
@@ -288,6 +411,11 @@ export interface DonePayload {
   activities: ActivityEvent[];
   sources: SourceInfo[];
   trip_plan: TravelPlan | null;
+  place_candidates?: PlaceCandidate[];
+  unresolved_places?: string[];
+  daily_weather?: DailyWeather[];
+  care_reminders?: CareReminder[];
+  provider_meta?: Record<string, ProviderMeta>;
   transport_options?: TransportOption[];
   transport_page?: TransportPage | null;
   attachments: { name: string; modality: string }[];

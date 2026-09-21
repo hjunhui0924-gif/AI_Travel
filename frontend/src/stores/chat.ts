@@ -26,6 +26,7 @@ export interface ChatMessage {
   sources?: SourceInfo[];
   answer_segments?: AnswerSegment[];
   clarification?: ClarificationRequest | null;
+  pending_query?: Record<string, unknown> | null;
   scope_refusal?: boolean;
   search_enabled?: boolean;
   plan_id?: string | null;
@@ -95,6 +96,7 @@ export const useChatStore = defineStore("chat", {
           sources: m.sources ?? [],
           answer_segments: m.answer_segments ?? [],
           clarification: m.clarification ?? null,
+          pending_query: (m as HistoryMessage).pending_query ?? null,
           scope_refusal: m.scope_refusal ?? false,
           retryable: m.retryable ?? false,
           retry_reason: m.retry_reason ?? "",
@@ -317,6 +319,7 @@ export const useChatStore = defineStore("chat", {
             current.content = payload.final_text || current.content;
             current.answer_segments = payload.answer_segments ?? [];
             current.clarification = payload.clarification ?? null;
+            current.pending_query = payload.pending_query ?? null;
             current.scope_refusal = payload.scope_refusal ?? false;
             current.transport_page = payload.transport_page ?? null;
             current.activities = payload.activities ?? current.activities;

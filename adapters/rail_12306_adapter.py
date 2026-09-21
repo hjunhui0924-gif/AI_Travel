@@ -188,7 +188,7 @@ def _load_ticket_payload(date: str, origin_code: str, destination_code: str) -> 
     # retrying all three after a slow network response adds 20–40 seconds to a
     # request without improving the usual success path.
     try:
-        max_retries = max(0, min(2, int(os.getenv("RAIL_MAX_RETRIES", "0"))))
+        max_retries = max(0, min(1, int(os.getenv("RAIL_MAX_RETRIES", "1"))))
     except ValueError:
         max_retries = 0
     query_paths = list(LEFT_TICKET_QUERY_PATHS[: 1 + max_retries])

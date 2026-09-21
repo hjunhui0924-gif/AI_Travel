@@ -34,6 +34,7 @@ from services.travel_store import (
     save_travel_turn,
 )
 from services.transport_service import get_transport_page
+from services.travel_finalizer import finalize_travel_response
 from services.answer_citations import (
     deduplicate_sources,
     parse_answer_citations,
@@ -504,6 +505,7 @@ def _travel_route_kind(
     message: str,
     attachments: list[dict],
     current_plan: TravelPlan | None = None,
+    pending_query: dict | None = None,
 ) -> str:
     """Choose the cheap first-pass route before any model scope fallback.
 
@@ -517,6 +519,12 @@ def _travel_route_kind(
     if _is_travel_query(message, attachments):
         return "keyword"
     if current_plan and (_message_mentions_travel_context(message) or _message_mentions_replan(message)):
+        return "context"
+    # A clarification follow-up is already inside a travel workflow.  Route
+    # option clicks such as “选择 A” contain no travel keyword themselves, so
+    # they must reuse the saved pending requirement instead of falling through
+    # to the out-of-scope classifier.
+    if pending_query and re.search(r"(?:选择|选)\s*[A-D](?:\b|$)", str(message or ""), re.IGNORECASE):
         return "context"
     if _looks_like_unclassified_travel_query(message, attachments):
         return "model_fallback"
@@ -700,6 +708,42 @@ def _get_pending_travel_query(thread_id: str, user_id: int | None = None) -> dic
         # Only the latest assistant turn can leave an active clarification.
         return None
     return None
+
+
+def _confirmed_place_hint(message: str, pending_query: dict | None) -> dict | None:
+    """Convert a clarification option click into a structured place hint."""
+
+    candidates = (pending_query or {}).get("place_candidates")
+    if not isinstance(candidates, list):
+        return None
+    unresolved_places = [
+        str(item).strip()
+        for item in ((pending_query or {}).get("unresolved_places") or [])
+        if str(item).strip()
+    ]
+    option_candidates = [
+        item
+        for item in candidates
+        if isinstance(item, dict)
+        and (
+            not unresolved_places
+            or str(item.get("query_text") or "") in unresolved_places
+        )
+    ]
+    if option_candidates:
+        candidates = option_candidates
+    match = re.search(r"(?:选择|选)\s*([A-Z])", str(message or ""), re.IGNORECASE)
+    selected = None
+    if match:
+        index = ord(match.group(1).upper()) - ord("A")
+        if 0 <= index < len(candidates):
+            selected = candidates[index]
+    if selected is None:
+        for candidate in candidates:
+            if isinstance(candidate, dict) and str(candidate.get("candidate_id") or "") in str(message or ""):
+                selected = candidate
+                break
+    return selected if isinstance(selected, dict) else None
 
 
 TRAVEL_SCOPE_REFUSAL = (
@@ -898,6 +942,13 @@ def _stream_travel_response(
     previous_message = str((pending_query or {}).get("raw_text") or "").strip()
     if previous_message and previous_message != message.strip():
         planning_message = f"{previous_message}\n用户补充：{message.strip()}"
+    confirmed_place = _confirmed_place_hint(message, pending_query)
+    confirmation_hint = None
+    if confirmed_place:
+        confirmation_hint = {
+            "confirmed_place": confirmed_place,
+            "unresolved_places": list((pending_query or {}).get("unresolved_places") or []),
+        }
     supervisor_result: TravelSupervisorResult | None = None
     should_run_supervisor = bool(thread_id)
     if should_run_supervisor:
@@ -906,7 +957,7 @@ def _stream_travel_response(
                 planning_message,
                 attachments,
                 current_plan=current_plan,
-                extraction_hint=extraction_hint,
+                extraction_hint={**(extraction_hint or {}), **(confirmation_hint or {})} or None,
             )
             check_cancelled()
             blocking_clarification = _build_clarification(supervisor_query)
@@ -1005,6 +1056,8 @@ def _stream_travel_response(
     }
     if extraction_hint is not None:
         plan_kwargs["extraction_hint"] = extraction_hint
+    if confirmation_hint is not None:
+        plan_kwargs["extraction_hint"] = {**(plan_kwargs.get("extraction_hint") or {}), **confirmation_hint}
     if supervisor_result is not None:
         plan_kwargs["supervisor_result"] = supervisor_result
     if cancellation_check:
@@ -1113,7 +1166,12 @@ def _stream_travel_response(
             _log_activity("storage", "请求记录未保存", "本轮结果不影响当前展示")
             yield AIMessageChunk(content=[]), {"travel": True}
             check_cancelled()
-    rendered_with_markers = render_travel_response(response)
+    rendered_with_markers = finalize_travel_response(
+        model,
+        planning_message,
+        response,
+        render_travel_response,
+    )
     check_cancelled()
     source_dicts = deduplicate_sources([asdict(source) for source in response.sources])
     parsed_answer = parse_answer_citations(
@@ -1159,6 +1217,7 @@ def _stream_travel_response(
             "trip_plan": asdict(saved_plan) if saved_plan is not None and thread_id else None,
             "answer_segments": answer_segments,
             "clarification": asdict(response.clarification) if response.clarification else None,
+            "pending_query": response.pending_query,
             "scope_refusal": response.scope_refusal,
             "decision": response.decision,
             "decision_reason": response.decision_reason,
@@ -1225,7 +1284,7 @@ def stream_chat(
                 cancellation_check=cancellation_check,
             )
             return
-    route_kind = _travel_route_kind(message, attachments, current_plan)
+    route_kind = _travel_route_kind(message, attachments, current_plan, pending_query)
     if route_kind in {"keyword", "context"}:
         _log_activity(
             "think",
@@ -1435,6 +1494,7 @@ def _stored_turn_messages(turns: list[dict]) -> list[dict]:
                         citations_enabled=citations_enabled,
                     ),
                     "clarification": metadata.get("clarification"),
+                    "pending_query": metadata.get("pending_query"),
                     "scope_refusal": metadata.get("scope_refusal") is True,
                     "retryable": metadata.get("retryable") is True,
                     "retry_reason": str(metadata.get("retry_reason") or ""),
@@ -1482,6 +1542,7 @@ def _checkpoint_message_item(msg) -> dict | None:
                 citations_enabled=_metadata_bool(metadata, "search_enabled"),
             ),
             "clarification": metadata.get("clarification"),
+            "pending_query": metadata.get("pending_query"),
             "scope_refusal": metadata.get("scope_refusal") is True,
             "retryable": metadata.get("retryable") is True,
             "retry_reason": str(metadata.get("retry_reason") or ""),
@@ -1696,6 +1757,7 @@ def get_messages(thread_id: str, user_id: int | None = None) -> list[dict]:
                     citations_enabled=citations_enabled,
                 ),
                 "clarification": metadata.get("clarification"),
+                "pending_query": metadata.get("pending_query"),
                 "scope_refusal": metadata.get("scope_refusal") is True,
             }
             if result and result[-1].get("role") == "assistant":

@@ -12,7 +12,17 @@ const plan = usePlanStore();
 const p = computed(() => plan.displayPlan);
 const day = computed(() => plan.selectedDay);
 const routePlans = computed(() => p.value?.route_plans ?? []);
+const routeSegments = computed(() => p.value?.route_segments ?? []);
 const transportPages = computed(() => p.value?.transport_pages ?? []);
+const placeLabels = computed(() => {
+  const labels = new Map<string, string>();
+  for (const day of p.value?.days ?? []) {
+    for (const item of day.items) {
+      if (item.place_id) labels.set(item.place_id, item.title);
+    }
+  }
+  return labels;
+});
 
 const outOfRangeOpen = ref(true);
 
@@ -139,6 +149,23 @@ const dateRangeText = computed(() => {
     </div>
 
     <RouteMap v-if="routePlans.some((route) => route.polyline?.length >= 2)" :routes="routePlans" />
+
+    <section v-if="routeSegments.length" class="route-segment-list">
+      <div class="section-title">路线段 · {{ p.optimization_objective || "综合平衡" }}</div>
+      <div v-for="segment in routeSegments" :key="segment.segment_id" class="route-segment-row">
+        <span class="route-segment-time">{{ segment.date }}</span>
+        <span>
+          {{ placeLabels.get(segment.origin_place_id) || segment.origin_place_id }}
+          → {{ placeLabels.get(segment.destination_place_id) || segment.destination_place_id }}
+        </span>
+        <small>
+          {{ segment.mode }} · {{ segment.duration_minutes ?? "待确认" }} 分钟 · 预留 {{ segment.buffer_minutes }} 分钟缓冲
+        </small>
+      </div>
+      <p v-if="p.optimization_score !== null && p.optimization_score !== undefined" class="route-segment-note">
+        这是按当前目标函数计算的候选方案，不代表所有现实条件下的绝对最优。
+      </p>
+    </section>
 
     <div class="plan-actions" aria-label="计划操作">
       <button

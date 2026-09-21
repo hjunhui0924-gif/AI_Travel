@@ -9,17 +9,21 @@ from zoneinfo import ZoneInfo
 
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled
 from agents.schemas import (
+    CareReminder,
+    DailyWeather,
     ClarificationOption,
     ClarificationRequest,
     Evidence,
     PlanDay,
     PlanItem,
+    PlaceCandidate,
     PoiGroup,
     PoiRecommendation,
     RoutePlan,
     TimelineItem,
     TransportPage,
     TransportOption,
+    TransportEdge,
     TravelConstraint,
     TravelFact,
     TravelPlan,
@@ -34,7 +38,9 @@ from services.route_service import get_route_plans
 from services.trip_extractor import extract_attachment_notes, extract_named_places
 from services.trip_planner import build_timeline
 from services.transport_dates import is_valid_clock_time
-from services.weather_service import get_weather_summary
+from services.weather_service import build_care_reminders, get_daily_weather, get_weather_summary
+from services.provider_orchestrator import run_provider_orchestrator
+from services.itinerary_optimizer import optimize_itinerary
 from services.answer_citations import citation_marker
 
 
@@ -356,6 +362,49 @@ def _extract_constraints(message: str, preferences: list[str]) -> list[str]:
     return constraints
 
 
+def _extract_objective(message: str, hint: dict | None = None) -> str:
+    hinted = _hint_string(hint, "objective")
+    if hinted in {"fastest", "cheapest", "least_walking", "balanced"}:
+        return hinted
+    if _contains_any(message, ["最快", "最省时间", "赶时间", "用时最短"]):
+        return "fastest"
+    if _contains_any(message, ["最便宜", "省钱", "最低费用", "花费最低"]):
+        return "cheapest"
+    if _contains_any(message, ["少走路", "步行少", "尽量不走路", "最少步行", "步行最少"]):
+        return "least_walking"
+    return "balanced"
+
+
+def _extract_pace(message: str, hint: dict | None = None) -> str:
+    hinted = _hint_string(hint, "pace")
+    if hinted in {"relaxed", "normal", "packed"}:
+        return hinted
+    if _contains_any(message, ["慢游", "轻松", "不赶", "悠闲"]):
+        return "relaxed"
+    if _contains_any(message, ["紧凑", "特种兵", "多去几个", "行程满"]):
+        return "packed"
+    return "normal"
+
+
+def _extract_minutes_limit(message: str, patterns: tuple[str, ...]) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            try:
+                return max(1, min(24 * 60, int(match.group(1))))
+            except ValueError:
+                continue
+    return None
+
+
+def _extract_requirement_lists(message: str, named_places: list[str], hint: dict | None = None) -> tuple[list[str], list[str]]:
+    hinted_must = _hint_list(hint, "must_visit_places")
+    hinted_optional = _hint_list(hint, "optional_places")
+    must = hinted_must or [place for place in named_places if any(marker in message for marker in ("必须", "一定要", "必去")) and place in message]
+    optional = hinted_optional or [place for place in named_places if place not in must and any(marker in message for marker in ("顺便", "可选", "有时间") ) and place in message]
+    return list(dict.fromkeys(must)), list(dict.fromkeys(optional))
+
+
 def _extract_date(message: str) -> str:
     return _extract_date_range(message)[0]
 
@@ -394,6 +443,37 @@ def build_travel_query(
             intent = hinted_intent
     attachment_notes = extract_attachment_notes(attachments)
     named_places = extract_named_places(attachments, message=message)
+    confirmed_place = (extraction_hint or {}).get("confirmed_place")
+    if isinstance(confirmed_place, dict) and str(confirmed_place.get("name") or "").strip():
+        unresolved = set(_hint_list(extraction_hint, "unresolved_places"))
+        named_places = [
+            str(confirmed_place["name"]).strip(),
+            *[
+                place
+                for place in named_places
+                if place not in unresolved
+                and not any(marker in place for marker in (*unresolved, "用户补充", "选择"))
+            ],
+        ]
+        confirmed_candidate = PlaceCandidate(
+            candidate_id=str(confirmed_place.get("candidate_id") or confirmed_place.get("provider_id") or ""),
+            provider_id=str(confirmed_place.get("provider_id") or ""),
+            name=str(confirmed_place.get("name") or ""),
+            category=str(confirmed_place.get("category") or ""),
+            province=str(confirmed_place.get("province") or ""),
+            city=str(confirmed_place.get("city") or ""),
+            district=str(confirmed_place.get("district") or ""),
+            address=str(confirmed_place.get("address") or ""),
+            location=str(confirmed_place.get("location") or ""),
+            distance_from_city_center=str(confirmed_place.get("distance_from_city_center") or ""),
+            opening_status=str(confirmed_place.get("opening_status") or "unknown"),
+            confidence="confirmed",
+            source_ids=list(confirmed_place.get("source_ids") or []),
+            query_text=str(confirmed_place.get("query_text") or ""),
+        )
+    else:
+        confirmed_candidate = None
+    named_places = list(dict.fromkeys([*named_places, *_hint_list(extraction_hint, "named_places")]))[:6]
     destination_scope = "province" if destination in PROVINCE_DESTINATION_PROFILES else "city" if destination else "unknown"
     destination_cities = _extract_destination_cities(message, destination)
     destination_cities = list(dict.fromkeys([*destination_cities, *_hint_list(extraction_hint, "destination_cities")]))
@@ -421,6 +501,7 @@ def build_travel_query(
         end_date = (date.fromisoformat(start_date) + timedelta(days=days - 1)).isoformat()
     preferences = _extract_preferences(message)
     preferences = list(dict.fromkeys([*preferences, *_hint_list(extraction_hint, "preferences")]))
+    must_visit_places, optional_places = _extract_requirement_lists(message, named_places, extraction_hint)
 
     travel_mode = ""
     if _contains_any(message, FLIGHT_KEYWORDS):
@@ -434,6 +515,25 @@ def build_travel_query(
     hinted_travelers = (extraction_hint or {}).get("travelers")
     if travelers == 1 and isinstance(hinted_travelers, int) and 1 < hinted_travelers <= 30 and "人" not in message:
         travelers = hinted_travelers
+
+    objective = _extract_objective(message, extraction_hint)
+    pace = _extract_pace(message, extraction_hint)
+    max_daily_walking_minutes = _extract_minutes_limit(
+        message,
+        (
+            r"(?:每天|每日|单日).{0,8}(?:最多|不超过|限制).{0,8}(\d+)\s*分钟.{0,4}(?:步行|走路)",
+            r"(?:每天|每日|单日).{0,8}(?:步行|走路).{0,8}(?:最多|不超过|限制).{0,8}(\d+)\s*分钟",
+        ),
+    )
+    max_daily_transit_minutes = _extract_minutes_limit(
+        message,
+        (
+            r"(?:每天|每日|单日).{0,8}(?:最多|不超过|限制).{0,8}(\d+)\s*分钟.{0,4}(?:通勤|交通|坐车)",
+            r"(?:每天|每日|单日).{0,8}(?:通勤|交通|坐车).{0,8}(?:最多|不超过|限制).{0,8}(\d+)\s*分钟",
+        ),
+    )
+    arrival_match = re.search(r"(?:最晚)?到达(?:时间)?[^0-9]{0,4}([01]?\d|2[0-3]):([0-5]\d)", message)
+    departure_match = re.search(r"(?:最晚)?出发(?:时间)?[^0-9]{0,4}([01]?\d|2[0-3]):([0-5]\d)", message)
 
     query = TravelQuery(
         raw_text=message,
@@ -459,6 +559,17 @@ def build_travel_query(
         named_places=named_places,
         destination_scope=destination_scope,
         destination_cities=destination_cities,
+        objective=objective,
+        pace=pace,
+        max_daily_walking_minutes=max_daily_walking_minutes,
+        max_daily_transit_minutes=max_daily_transit_minutes,
+        must_visit_places=must_visit_places,
+        optional_places=optional_places,
+        date_flexibility=_contains_any(message, ["日期可调整", "日期灵活", "前后都可以"]),
+        meal_preferences=[item for item in preferences if item in {"美食", "咖啡"}],
+        arrival_deadline=(f"{int(arrival_match.group(1)):02d}:{arrival_match.group(2)}" if arrival_match else ""),
+        departure_deadline=(f"{int(departure_match.group(1)):02d}:{departure_match.group(2)}" if departure_match else ""),
+        resolved_place_candidates=[confirmed_candidate] if confirmed_candidate else [],
     )
     query.date_is_assumed = date_is_assumed
     return query
@@ -489,6 +600,10 @@ def _inherit_previous_requirement(query: TravelQuery, current_plan: TravelPlan |
         query.date_is_assumed = False
     if not query.preferences:
         query.preferences = list(current_plan.preferences)
+    if query.objective == "balanced" and getattr(current_plan, "optimization_objective", "balanced") != "balanced":
+        query.objective = current_plan.optimization_objective
+    if query.pace == "normal" and any("慢" in item for item in current_plan.preferences):
+        query.pace = "relaxed"
     if query.travelers == 1 and current_plan.travelers > 1 and "人" not in query.raw_text:
         query.travelers = current_plan.travelers
     inherited_constraints = [constraint.label for constraint in current_plan.constraints]
@@ -782,6 +897,12 @@ def _new_plan_item(
     end_date: str = "",
     is_demo: bool = False,
     seat_count: int | None = None,
+    place_id: str = "",
+    opening_window_id: str = "",
+    booking_requirement_id: str = "",
+    buffer_minutes: int = 0,
+    walking_minutes: int | None = None,
+    transit_minutes: int | None = None,
 ) -> PlanItem:
     return PlanItem(
         item_id=_stable_item_id(item_type, title, day),
@@ -799,6 +920,12 @@ def _new_plan_item(
         end_date=end_date,
         is_demo=is_demo,
         seat_count=seat_count,
+        place_id=place_id,
+        opening_window_id=opening_window_id,
+        booking_requirement_id=booking_requirement_id,
+        buffer_minutes=buffer_minutes,
+        walking_minutes=walking_minutes,
+        transit_minutes=transit_minutes,
     )
 
 
@@ -847,11 +974,37 @@ def _build_structured_plan(
     alerts: list[str],
     diagnostics: list[str],
     adapter_status: dict[str, str],
+    provider_meta: dict,
+    place_candidates: list,
+    unresolved_places: list[str],
+    daily_weather: list,
     current_plan: TravelPlan | None,
 ) -> TravelPlan:
     day_dates = _date_sequence(query.start_date, query.end_date)
     days = [PlanDay(date=value, day_number=index + 1) for index, value in enumerate(day_dates)]
     out_of_range_items: list[PlanItem] = []
+    optimization = None
+    planned_pois = list(poi_items)
+    if query.named_places and poi_items:
+        locked_titles = []
+        if current_plan:
+            locked_titles = [
+                item.title
+                for plan_day in current_plan.days
+                for item in plan_day.items
+                if item.locked or item.status in {"confirmed", "booked"}
+            ]
+        optimization = optimize_itinerary(
+            query,
+            poi_items,
+            route_plans,
+            locked_titles=locked_titles,
+        )
+        conflicts.extend(optimization.conflicts)
+        if optimization.ordered_places and not any(
+            item.code == "no_feasible_order" for item in optimization.diagnostics
+        ):
+            planned_pois = optimization.ordered_places
 
     if transport_options and days:
         option = transport_options[0]
@@ -912,8 +1065,10 @@ def _build_structured_plan(
             )
         )
 
-    for index, poi in enumerate(poi_items[: min(16, max(4, len(days) * 4))]):
-        day = days[index % len(days)]
+    for index, poi in enumerate(planned_pois[: min(16, max(4, len(days) * 4))]):
+        schedule = optimization.schedule.get(poi.provider_id or poi.name) if optimization else None
+        scheduled_day = schedule[0] if schedule else ""
+        day = next((item for item in days if item.date == scheduled_day), days[index % len(days)])
         item_type = "food" if any(token in poi.category for token in ["餐", "美食", "咖啡"]) else "attraction"
         detail_parts = [poi.summary]
         if poi.popularity_signal:
@@ -929,6 +1084,21 @@ def _build_structured_plan(
                 source_ids=poi.source_ids,
                 estimated_cost=poi.estimated_cost,
                 confidence="source_backed" if poi.source_ids else "unverified",
+                start_time=schedule[1] if schedule else "",
+                end_time=schedule[2] if schedule else "",
+                place_id=poi.provider_id,
+                opening_window_id=(
+                    f"{poi.provider_id or poi.name}:{schedule[0] if schedule else day.date}"
+                    if poi.opening_windows
+                    else ""
+                ),
+                buffer_minutes=20 if schedule else 0,
+                booking_requirement_id=(
+                    poi.provider_id or poi.name
+                    if poi.booking_requirement.required or poi.booking_requirement.booking_status != "unknown"
+                    or poi.booking_requirement.booking_note
+                    else ""
+                ),
             )
         )
 
@@ -1004,6 +1174,43 @@ def _build_structured_plan(
     if len(day_dates) >= 31 and query.end_date > day_dates[-1]:
         risks.append("行程超过 31 天，日历暂只展开前 31 天。")
 
+    opening_windows = [
+        window
+        for poi in planned_pois
+        for window in poi.opening_windows
+    ]
+    booking_requirements = [
+        poi.booking_requirement
+        for poi in planned_pois
+        if poi.booking_requirement.required
+        or poi.booking_requirement.booking_status != "unknown"
+        or poi.booking_requirement.booking_note
+    ]
+    optimization_diagnostics = list(optimization.diagnostics) if optimization else []
+    route_segments = list(optimization.route_segments) if optimization else []
+    transport_edges = [
+        TransportEdge(
+            origin_city=query.origin,
+            destination_city=query.destination or query.city,
+            mode=option.mode,
+            depart_at=f"{option.depart_date or query.start_date}T{option.depart_time}".rstrip("T"),
+            arrive_at=f"{option.arrive_date or option.depart_date or query.start_date}T{option.arrive_time}".rstrip("T"),
+            price=option.price or None,
+            source_ids=list(option.source_ids),
+        )
+        for option in transport_options
+        if query.origin and (query.destination or query.city)
+    ]
+    if optimization:
+        diagnostics.extend(item.message for item in optimization.diagnostics if item.severity == "warning")
+    for requirement in booking_requirements:
+        if requirement.booking_status == "unknown" and requirement.booking_note:
+            risks.append(requirement.booking_note)
+    care_reminders = build_care_reminders(
+        list(daily_weather),
+        [item for day in days for item in day.items],
+    )
+    alerts.extend(item.message for item in care_reminders)
     return TravelPlan(
         plan_id="",
         thread_id=thread_id,
@@ -1036,6 +1243,18 @@ def _build_structured_plan(
         alerts=list(dict.fromkeys(alerts)),
         diagnostics=list(dict.fromkeys(diagnostics)),
         adapter_status=dict(adapter_status),
+        provider_meta=dict(provider_meta),
+        place_candidates=list(place_candidates),
+        unresolved_places=list(unresolved_places),
+        route_segments=route_segments,
+        optimization_objective=query.objective,
+        optimization_score=optimization.score if optimization else None,
+        opening_windows=opening_windows,
+        booking_requirements=booking_requirements,
+        daily_weather=list(daily_weather),
+        care_reminders=care_reminders,
+        optimization_diagnostics=optimization_diagnostics,
+        transport_edges=transport_edges,
         sources=list(dict((item.evidence_id, item) for item in sources).values()),
         search_enabled=search_enabled,
         status="needs_attention" if conflicts or risks or alerts or diagnostics else "draft",
@@ -1116,11 +1335,138 @@ def plan_travel(
     rail_options: list[TransportOption] = []
     flight_options: list[TransportOption] = []
     transport_pages: list[TransportPage] = []
+    route_plans: list[RoutePlan] = []
+    poi_items: list[PoiRecommendation] = []
+    poi_groups: list[PoiGroup] = []
+    poi_sources: list[Evidence] = []
+    poi_errors: list[str] = []
+    weather_summary = ""
+    web_search_status = "not_requested"
     alerts: list[str] = []
     risks: list[str] = []
     conflicts: list[str] = []
     diagnostics: list[str] = []
     adapter_status: dict[str, str] = {}
+    provider_meta = {}
+    place_candidates = list(query.resolved_place_candidates)
+    unresolved_places: list[str] = []
+    daily_weather = []
+    include_explore = _should_include_explore(query) or (
+        model_decision == "plan" and plan_requested
+    )
+    weather_requested = _should_include_weather(query)
+    provider_batch_used = False
+    poi_prefetched = False
+
+    # Independent transport/weather lookups share one bounded executor.  The
+    # callable references are passed explicitly so existing adapter seams and
+    # tests can continue to replace them without bypassing orchestration.
+    if supervisor_result is None and any(
+        [
+            rail_requested and bool(query.origin and query.destination and query.date),
+            flight_requested and bool(query.origin and query.destination and query.date),
+            weather_requested and bool(query.destination or query.city),
+        ]
+    ):
+        operations = {}
+        if rail_requested and query.origin and query.destination and query.date:
+            operations["rail"] = lambda: get_rail_options(query)
+        if flight_requested and query.origin and query.destination and query.date:
+            operations["flight"] = lambda: get_flight_options(query)
+        if weather_requested and (query.destination or query.city):
+            operations["weather"] = lambda: (
+                get_weather_summary(query.destination or query.city, forecast=True),
+                get_daily_weather(query.destination or query.city),
+            )
+        if include_explore:
+            operations["poi"] = lambda: recommend_pois(
+                query,
+                search_enabled=search_enabled,
+                activity_logger=activity_logger,
+            )
+        batch = run_provider_orchestrator(
+            operations,
+            activity_logger=activity_logger,
+            cancellation_check=check_cancelled,
+        )
+        provider_batch_used = True
+        provider_meta.update(batch.provider_meta)
+        for provider_name, task in batch.results.items():
+            if task.meta.status == "failed":
+                diagnostics.extend(
+                    f"{provider_name} adapter failed: {error}"
+                    for error in task.errors
+                    if error
+                )
+                if provider_name == "rail":
+                    alerts.append("高铁数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+                elif provider_name == "flight":
+                    alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
+                elif provider_name == "weather":
+                    alerts.append("天气接口暂时失败，行程中的天气判断需要重新查询。")
+            elif task.meta.status == "partial":
+                diagnostics.extend(
+                    f"{provider_name} row failed: {error}"
+                    for error in task.errors
+                    if error
+                )
+                if provider_name == "rail" and task.value:
+                    alerts.append("部分火车结果格式异常，已保留仍可用的车次候选。")
+                elif provider_name == "flight" and task.value:
+                    alerts.append("部分航班结果格式异常，已保留仍可用的航班候选。")
+            else:
+                diagnostics.extend(
+                    f"{provider_name} provider: {error}"
+                    for error in task.errors
+                    if error
+                )
+        rail_task = batch.results.get("rail")
+        if rail_task is not None:
+            rail_result = rail_task.value
+            rail_options = list(rail_result or []) if isinstance(rail_result, (list, tuple)) else []
+            if rail_result is not None:
+                transport_pages.append(_transport_page_from_result("rail", rail_result, query))
+            adapter_status["rail"] = (
+                "partial" if rail_options and rail_task.errors else rail_task.meta.status
+            )
+        flight_task = batch.results.get("flight")
+        if flight_task is not None:
+            flight_result = flight_task.value
+            flight_options = list(flight_result or []) if isinstance(flight_result, (list, tuple)) else []
+            if flight_result is not None:
+                transport_pages.append(_transport_page_from_result("flight", flight_result, query))
+            flight_status = flight_task.meta.status
+            if not is_flight_mcp_enabled() and not flight_options and not flight_task.errors:
+                flight_status = "not_configured"
+            adapter_status["flight"] = "partial" if flight_options and flight_task.errors else flight_status
+        weather_task = batch.results.get("weather")
+        if weather_task is not None:
+            if isinstance(weather_task.value, tuple):
+                weather_summary = str(weather_task.value[0] or "")
+                daily_weather = list(weather_task.value[1] or [])
+            else:
+                weather_summary = str(weather_task.value or "")
+            adapter_status["weather"] = weather_task.meta.status
+        poi_task = batch.results.get("poi")
+        poi_batch_used = poi_task is not None
+        if poi_task is not None and poi_task.value is not None:
+            poi_result = poi_task.value
+            if isinstance(poi_result, PoiRecommendationResult):
+                poi_items = list(poi_result.recommendations)
+                poi_groups = list(poi_result.groups)
+                poi_sources = list(poi_result.evidence)
+                poi_errors = list(poi_result.errors)
+                place_candidates = list(poi_result.place_candidates or [])
+                unresolved_places = list(poi_result.unresolved_places or [])
+                web_search_status = poi_result.web_search_status
+                adapter_status["poi"] = poi_result.poi_status
+            else:
+                poi_items, poi_groups, poi_sources, poi_errors = poi_result
+                web_search_status = "disabled" if not search_enabled else ("failed" if poi_errors else "empty")
+                adapter_status["poi"] = "success" if poi_items else ("failed" if poi_errors else "empty")
+        elif poi_task is not None:
+            adapter_status["poi"] = poi_task.meta.status
+            poi_batch_used = True
 
     if supervisor_result is not None and not supervisor_result.fallback_used:
         rail_options = [item for item in supervisor_result.transport_options if item.mode == "rail"]
@@ -1131,6 +1477,8 @@ def plan_travel(
         poi_groups = list(supervisor_result.poi_groups)
         poi_sources = list(supervisor_result.sources)
         poi_errors = []
+        place_candidates = list(supervisor_result.place_candidates)
+        unresolved_places = list(supervisor_result.unresolved_places)
         weather_summary = supervisor_result.weather_summary
         adapter_status.update(supervisor_result.adapter_status)
         diagnostics.extend(
@@ -1138,7 +1486,7 @@ def plan_travel(
         )
         if supervisor_result.fallback_used:
             diagnostics.append("Supervisor 未完成工具决策，已回退确定性旅行规划。")
-    elif rail_requested and query.origin and query.destination and query.date:
+    elif not provider_batch_used and rail_requested and query.origin and query.destination and query.date:
         try:
             rail_result = get_rail_options(query)
             rail_options = list(rail_result)
@@ -1157,11 +1505,11 @@ def plan_travel(
             alerts.append("高铁数据接口暂时失败，本次没有把交通时间当作已确认事实。")
         check_cancelled()
     else:
-        adapter_status["rail"] = "not_requested"
+        adapter_status.setdefault("rail", "not_requested")
 
     if supervisor_result is not None and not supervisor_result.fallback_used:
         pass
-    elif flight_requested and query.origin and query.destination and query.date:
+    elif not provider_batch_used and flight_requested and query.origin and query.destination and query.date:
         try:
             flight_result = get_flight_options(query)
             flight_options = list(flight_result)
@@ -1185,7 +1533,7 @@ def plan_travel(
             diagnostics.append(_flight_failure_detail(exc))
             alerts.append("航班数据接口暂时失败，本次没有把交通时间当作已确认事实。")
         check_cancelled()
-    elif supervisor_result is None or supervisor_result.fallback_used:
+    elif not provider_batch_used and (supervisor_result is None or supervisor_result.fallback_used):
         adapter_status["flight"] = "not_requested"
     rail_options = [item for item in rail_options if _is_well_formed_transport_option(item)]
     flight_options = [item for item in flight_options if _is_well_formed_transport_option(item)]
@@ -1193,12 +1541,46 @@ def plan_travel(
         # The supervisor has already made the provider calls. Keep only the
         # selected mode results and do not call adapters a second time.
         transport_options = rail_options + flight_options
+
+    # Explicit landmarks must be resolved before route lookup.  This is the
+    # safety gate that prevents the map provider from routing to its first
+    # same-name result.  Generic city trips keep the historical route-then-POI
+    # fallback because they have no user landmark to disambiguate.
+    if (
+        supervisor_result is None
+        and include_explore
+        and query.named_places
+        and not provider_batch_used
+    ):
+        try:
+            poi_result = recommend_pois(
+                query,
+                search_enabled=search_enabled,
+                activity_logger=activity_logger,
+            )
+            if isinstance(poi_result, PoiRecommendationResult):
+                poi_items = poi_result.recommendations
+                poi_groups = poi_result.groups
+                poi_sources = poi_result.evidence
+                poi_errors = poi_result.errors
+                place_candidates = list(poi_result.place_candidates or [])
+                unresolved_places = list(poi_result.unresolved_places or [])
+                web_search_status = poi_result.web_search_status
+                adapter_status["poi"] = poi_result.poi_status
+            else:
+                poi_items, poi_groups, poi_sources, poi_errors = poi_result
+                web_search_status = "disabled" if not search_enabled else ("failed" if poi_errors else "empty")
+                adapter_status["poi"] = "success" if poi_items else ("failed" if poi_errors else "empty")
+        except Exception as exc:
+            poi_items, poi_groups, poi_sources = [], [], []
+            poi_errors = ["地图 POI 接口失败，未生成未经验证的地点。"]
+            adapter_status["poi"] = "failed"
+            diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
+            web_search_status = "disabled" if not search_enabled else "failed"
+        poi_prefetched = True
     else:
         transport_options = rail_options + flight_options
 
-    include_explore = _should_include_explore(query) or (
-        model_decision == "plan" and plan_requested
-    )
     if supervisor_result is not None and not supervisor_result.fallback_used:
         if include_explore:
             has_route_geometry = any(len(route.polyline) >= 2 for route in route_plans)
@@ -1217,50 +1599,62 @@ def plan_travel(
             web_search_status = "not_requested"
     elif include_explore:
         check_cancelled()
-        try:
-            route_result = get_route_plans(query)
-            route_plans = list(route_result)
-            route_errors = list(getattr(route_result, "errors", []) or [])
-            if route_errors:
-                adapter_status["route"] = "partial" if route_plans else "failed"
-                diagnostics.extend(f"route mode failed: {error}" for error in route_errors)
-                alerts.append(
-                    "部分地图路线模式查询失败，已保留仍可用的路线结果。"
-                    if route_plans
-                    else "地图路线模式查询失败，本次没有可用路线结果。"
-                )
-            else:
-                adapter_status["route"] = "success" if route_plans else "empty"
-        except Exception as exc:
+        if unresolved_places:
             route_plans = []
-            adapter_status["route"] = "failed"
-            diagnostics.append(f"route adapter failed: {type(exc).__name__}")
-            alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
-        check_cancelled()
-        try:
-            poi_result = recommend_pois(
-                query, search_enabled=search_enabled, activity_logger=activity_logger
-            )
-            if isinstance(poi_result, PoiRecommendationResult):
-                poi_items = poi_result.recommendations
-                poi_groups = poi_result.groups
-                poi_sources = poi_result.evidence
-                poi_errors = poi_result.errors
-                poi_status = poi_result.poi_status
-                web_search_status = poi_result.web_search_status
-            else:
-                poi_items, poi_groups, poi_sources, poi_errors = poi_result
-                poi_status = "success" if poi_items else ("failed" if poi_errors else "empty")
-                web_search_status = "disabled" if not search_enabled else ("failed" if poi_errors else "empty")
-        except Exception as exc:
-            poi_items, poi_groups, poi_sources = [], [], []
-            poi_errors = ["地图 POI 接口失败，未生成未经验证的地点。"]
-            poi_status = "failed"
-            web_search_status = "disabled" if not search_enabled else "failed"
-            adapter_status["poi"] = "failed"
-            diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
+            adapter_status["route"] = "blocked"
+            diagnostics.append("route blocked until ambiguous places are confirmed")
         else:
-            adapter_status["poi"] = poi_status
+            try:
+                route_result = get_route_plans(query)
+                route_plans = list(route_result)
+                route_errors = list(getattr(route_result, "errors", []) or [])
+                if route_errors:
+                    adapter_status["route"] = "partial" if route_plans else "failed"
+                    diagnostics.extend(f"route mode failed: {error}" for error in route_errors)
+                    alerts.append(
+                        "部分地图路线模式查询失败，已保留仍可用的路线结果。"
+                        if route_plans
+                        else "地图路线模式查询失败，本次没有可用路线结果。"
+                    )
+                else:
+                    adapter_status["route"] = "success" if route_plans else "empty"
+            except Exception as exc:
+                route_plans = []
+                adapter_status["route"] = "failed"
+                diagnostics.append(f"route adapter failed: {type(exc).__name__}")
+                alerts.append("地图路线接口暂时失败，市内移动时间需要到现场再确认。")
+        check_cancelled()
+        if not provider_batch_used and not poi_prefetched:
+            try:
+                poi_result = recommend_pois(
+                    query, search_enabled=search_enabled, activity_logger=activity_logger
+                )
+                if isinstance(poi_result, PoiRecommendationResult):
+                    poi_items = poi_result.recommendations
+                    poi_groups = poi_result.groups
+                    poi_sources = poi_result.evidence
+                    poi_errors = poi_result.errors
+                    poi_status = poi_result.poi_status
+                    web_search_status = poi_result.web_search_status
+                    place_candidates = list(poi_result.place_candidates or [])
+                    unresolved_places = list(poi_result.unresolved_places or [])
+                else:
+                    poi_items, poi_groups, poi_sources, poi_errors = poi_result
+                    poi_status = "success" if poi_items else ("failed" if poi_errors else "empty")
+                    web_search_status = "disabled" if not search_enabled else ("failed" if poi_errors else "empty")
+                    place_candidates = []
+                    unresolved_places = []
+            except Exception as exc:
+                poi_items, poi_groups, poi_sources = [], [], []
+                poi_errors = ["地图 POI 接口失败，未生成未经验证的地点。"]
+                place_candidates = []
+                unresolved_places = []
+                poi_status = "failed"
+                web_search_status = "disabled" if not search_enabled else "failed"
+                adapter_status["poi"] = "failed"
+                diagnostics.append(f"poi adapter failed: {type(exc).__name__}")
+            else:
+                adapter_status["poi"] = poi_status
         check_cancelled()
 
         # A generic city request such as "广州五日游" has no explicit
@@ -1306,9 +1700,10 @@ def plan_travel(
     weather_requested = _should_include_weather(query)
     if supervisor_result is not None and not supervisor_result.fallback_used:
         adapter_status.setdefault("weather", "success" if weather_summary else "not_requested")
-    elif weather_requested:
+    elif not provider_batch_used and weather_requested:
         try:
             weather_summary = get_weather_summary(query.destination or query.city, forecast=True)
+            daily_weather = get_daily_weather(query.destination or query.city)
             adapter_status["weather"] = "success" if weather_summary else "empty"
         except Exception as exc:
             weather_summary = ""
@@ -1316,6 +1711,8 @@ def plan_travel(
             diagnostics.append(f"weather adapter failed: {type(exc).__name__}")
             alerts.append("天气接口暂时失败，行程中的天气判断需要重新查询。")
         check_cancelled()
+    elif provider_batch_used and weather_requested:
+        adapter_status.setdefault("weather", "empty")
     else:
         weather_summary = ""
         adapter_status["weather"] = "not_requested"
@@ -1360,6 +1757,63 @@ def plan_travel(
             )
         )
 
+    if unresolved_places and model_decision != "refuse":
+        unresolved = unresolved_places[0]
+        options = []
+        seen_candidates: set[str] = set()
+        for index, candidate in enumerate(
+            [item for item in place_candidates if item.query_text == unresolved or not item.query_text][:3],
+            start=1,
+        ):
+            if candidate.candidate_id in seen_candidates:
+                continue
+            seen_candidates.add(candidate.candidate_id)
+            label = "｜".join(
+                part
+                for part in (candidate.name, candidate.district, candidate.address)
+                if part
+            )
+            options.append(
+                ClarificationOption(
+                    key=chr(64 + index),
+                    label=label or candidate.name,
+                    description=candidate.category or "地图地点候选",
+                    value=candidate.candidate_id,
+                )
+            )
+        if options:
+            risks.append("同名地点尚未确认，当前未计算其正式路线。")
+            return TravelPlanResponse(
+                intent=query.intent,
+                summary="请先确认具体地点，再继续计算路线和营业时间。",
+                transport_options=transport_options,
+                route_plans=[],
+                transport_pages=transport_pages,
+                poi_recommendations=[],
+                poi_groups=[],
+                weather_summary=weather_summary,
+                alerts=alerts,
+                risks=risks,
+                diagnostics=diagnostics,
+                adapter_status=adapter_status,
+                provider_meta=provider_meta,
+                sources=sources,
+                place_candidates=place_candidates,
+                unresolved_places=unresolved_places,
+                clarification=ClarificationRequest(
+                    code="place_ambiguous",
+                    prompt=f"“{unresolved}”有多个候选，请确认你要去哪个地点：",
+                    options=options,
+                ),
+                pending_query={
+                    **asdict(query),
+                    "place_candidates": [asdict(item) for item in place_candidates],
+                    "unresolved_places": list(unresolved_places),
+                },
+                decision="clarify",
+                decision_reason="地点存在多个地图候选，必须由用户确认。",
+            )
+
     if model_decision == "refuse":
         check_cancelled()
         return TravelPlanResponse(
@@ -1373,6 +1827,7 @@ def plan_travel(
             alerts=alerts,
             diagnostics=diagnostics,
             adapter_status=adapter_status,
+            provider_meta=provider_meta,
             sources=sources,
             decision="refuse",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "模型未授权生成旅行计划。"),
@@ -1402,6 +1857,7 @@ def plan_travel(
             alerts=alerts,
             diagnostics=diagnostics,
             adapter_status=adapter_status,
+            provider_meta=provider_meta,
             sources=sources,
             clarification=model_clarification,
             pending_query=asdict(query),
@@ -1438,6 +1894,7 @@ def plan_travel(
             extracted_context=query.attachment_notes,
             diagnostics=diagnostics,
             adapter_status=adapter_status,
+            provider_meta=provider_meta,
             sources=sources,
             decision="answer",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "本轮未明确要求生成行程。"),
@@ -1469,6 +1926,7 @@ def plan_travel(
             extracted_context=query.attachment_notes,
             diagnostics=diagnostics,
             adapter_status=adapter_status,
+            provider_meta=provider_meta,
             sources=sources,
             decision="answer",
             decision_reason="没有有效 provider 数据。",
@@ -1492,6 +1950,10 @@ def plan_travel(
         alerts=alerts,
         diagnostics=diagnostics,
         adapter_status=adapter_status,
+        provider_meta=provider_meta,
+        place_candidates=place_candidates,
+        unresolved_places=unresolved_places,
+        daily_weather=daily_weather,
         current_plan=current_plan,
     )
 
@@ -1517,6 +1979,10 @@ def plan_travel(
         decision_reason=(supervisor_result.decision_reason if supervisor_result else "已明确提出行程规划需求，且取得有效数据。"),
         retryable=retryable,
         retry_reason=retry_reason,
+        provider_meta=provider_meta,
+        place_candidates=place_candidates,
+        unresolved_places=unresolved_places,
+        daily_weather=daily_weather,
     )
 
 

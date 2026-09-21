@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { PlanItem } from "../types/api";
+import type { BookingRequirement, OpeningWindow, PlanItem } from "../types/api";
 import { usePlanStore } from "../stores/plan";
 
 const props = withDefaults(
@@ -9,6 +9,17 @@ const props = withDefaults(
 );
 
 const plan = usePlanStore();
+
+const openingWindow = computed<OpeningWindow | null>(() => {
+  const itemId = props.item.opening_window_id;
+  return plan.displayPlan?.opening_windows?.find((window) =>
+    Boolean(itemId && window.target_id === props.item.place_id && window.date === props.item.date),
+  ) ?? null;
+});
+const bookingRequirement = computed<BookingRequirement | null>(() => {
+  const itemId = props.item.booking_requirement_id;
+  return plan.displayPlan?.booking_requirements?.find((booking) => Boolean(itemId && booking.target_id === itemId)) ?? null;
+});
 
 const TYPE_ICONS: Record<string, string> = {
   transport: "✈",
@@ -110,6 +121,24 @@ function restore() {
       </div>
       <div v-if="item.estimated_cost" class="item-detail">
         预估费用：{{ item.estimated_cost }}
+      </div>
+      <div v-if="openingWindow && (openingWindow.open_time || openingWindow.close_time)" class="item-detail">
+        开放时间：{{ openingWindow.open_time || "待确认" }}–{{ openingWindow.close_time || "待确认" }}
+        <span v-if="openingWindow.last_entry_time"> · 最后入场 {{ openingWindow.last_entry_time }}</span>
+      </div>
+      <div v-if="bookingRequirement" class="item-detail booking-note">
+        {{ bookingRequirement.required || bookingRequirement.booking_status === "required" ? "需要预约/购票" : "预约状态" }}：
+        {{ bookingRequirement.booking_status === "unknown" ? "尚未确认" : bookingRequirement.booking_status }}
+        <span v-if="bookingRequirement.booking_note"> · {{ bookingRequirement.booking_note }}</span>
+        <a
+          v-if="bookingRequirement.booking_url"
+          :href="bookingRequirement.booking_url"
+          target="_blank"
+          rel="noopener noreferrer"
+        >官方入口</a>
+      </div>
+      <div v-if="item.buffer_minutes" class="item-detail">
+        交通缓冲：{{ item.buffer_minutes }} 分钟<span v-if="item.walking_minutes !== null && item.walking_minutes !== undefined"> · 步行约 {{ item.walking_minutes }} 分钟</span>
       </div>
       <div v-if="item.seat_count !== null && item.seat_count !== undefined" class="item-detail">
         查询时余票/库存：{{ item.seat_count }}（仅供参考，不代表锁座或出票）

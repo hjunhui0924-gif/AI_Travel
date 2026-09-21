@@ -23,10 +23,20 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from agents.schemas import (
+    BookingRequirement,
+    CareReminder,
+    DailyWeather,
     Evidence,
+    OpeningWindow,
+    OptimizationDiagnostic,
     PlanDay,
     PlanItem,
+    PlaceCandidate,
+    ProviderMeta,
     RoutePlan,
+    RouteSegment,
+    ScheduleConstraint,
+    TransportEdge,
     TransportPage,
     TransportOption,
     TravelConstraint,
@@ -120,6 +130,24 @@ def _list_value(value: object) -> list:
     return []
 
 
+def _rebuild_dataclass_list(cls: type, raw: object, defaults: dict[str, Any] | None = None) -> list:
+    """Rehydrate append-only nested plan fields with legacy-safe defaults."""
+
+    result = []
+    for item in _list_value(raw):
+        if isinstance(item, cls):
+            result.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        values = _field_values(cls, item, defaults)
+        for key, value in list(values.items()):
+            if key.endswith("_ids"):
+                values[key] = _list_value(value)
+        result.append(cls(**values))
+    return result
+
+
 def _legacy_item_id(raw_item: dict[str, Any], day: str) -> str:
     encoded = _json({"day": day, "item": raw_item})
     return f"legacy_{hashlib.sha1(encoded.encode('utf-8', errors='ignore')).hexdigest()[:12]}"
@@ -150,6 +178,12 @@ def _rebuild_plan_item(raw_item: object, day: str) -> PlanItem | None:
             "end_date": "",
             "is_demo": False,
             "seat_count": None,
+            "place_id": "",
+            "opening_window_id": "",
+            "booking_requirement_id": "",
+            "buffer_minutes": 0,
+            "walking_minutes": None,
+            "transit_minutes": None,
         },
     )
     item_values["source_ids"] = _list_value(item_values.get("source_ids"))
@@ -322,6 +356,26 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
                 )
             )
 
+    first_day = days[0].date if days else ""
+    last_day = days[-1].date if days else first_day
+    route_segments = _rebuild_dataclass_list(
+        RouteSegment,
+        payload.get("route_segments"),
+        {
+            "segment_id": "",
+            "date": first_day,
+            "origin_place_id": "",
+            "destination_place_id": "",
+            "mode": "unknown",
+            "distance_meters": None,
+            "duration_minutes": None,
+            "estimated_cost": None,
+            "buffer_minutes": 20,
+            "walking_minutes": None,
+            "source_ids": [],
+        },
+    )
+
     sources = []
     for raw_source in payload.get("sources") or []:
         if isinstance(raw_source, dict):
@@ -349,8 +403,6 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             )
             sources[-1].supports = _list_value(sources[-1].supports)
 
-    first_day = days[0].date if days else ""
-    last_day = days[-1].date if days else first_day
     values = _field_values(
         TravelPlan,
         payload,
@@ -394,6 +446,19 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
             "created_at": "",
             "updated_at": "",
             "previous_version": None,
+            "route_segments": [],
+            "optimization_objective": "balanced",
+            "optimization_score": None,
+            "place_candidates": [],
+            "opening_windows": [],
+            "booking_requirements": [],
+            "daily_weather": [],
+            "care_reminders": [],
+            "unresolved_places": [],
+            "optimization_diagnostics": [],
+            "provider_meta": {},
+            "schedule_constraints": [],
+            "transport_edges": [],
         },
     )
     for key in ("preferences", "conflicts", "risks", "alerts", "diagnostics"):
@@ -410,6 +475,96 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
     values["transport_pages"] = transport_pages
     values["route_plans"] = route_plans
     values["destination_cities"] = _list_value(values.get("destination_cities"))
+    values["route_segments"] = route_segments
+    values["transport_edges"] = _rebuild_dataclass_list(
+        TransportEdge,
+        values.get("transport_edges"),
+        {
+            "origin_city": "",
+            "destination_city": "",
+            "mode": "",
+            "depart_at": "",
+            "arrive_at": "",
+            "duration_minutes": None,
+            "price": None,
+            "transfer_count": 0,
+            "source_ids": [],
+        },
+    )
+    values["place_candidates"] = _rebuild_dataclass_list(
+        PlaceCandidate,
+        values.get("place_candidates"),
+        {
+            "candidate_id": "",
+            "provider_id": "",
+            "name": "",
+            "category": "",
+            "province": "",
+            "city": "",
+            "district": "",
+            "address": "",
+            "location": "",
+            "distance_from_city_center": "",
+            "opening_status": "unknown",
+            "confidence": "unknown",
+            "source_ids": [],
+            "query_text": "",
+        },
+    )
+    values["opening_windows"] = _rebuild_dataclass_list(
+        OpeningWindow,
+        values.get("opening_windows"),
+        {"date": "", "target_id": "", "open_time": "", "close_time": "", "last_entry_time": None, "closed_reason": None, "source_ids": []},
+    )
+    values["booking_requirements"] = _rebuild_dataclass_list(
+        BookingRequirement,
+        values.get("booking_requirements"),
+        {"target_id": "", "required": False, "booking_url": None, "booking_note": "", "booking_status": "unknown", "verification": "unknown", "source_ids": []},
+    )
+    values["daily_weather"] = _rebuild_dataclass_list(
+        DailyWeather,
+        values.get("daily_weather"),
+        {"date": "", "day_weather": "", "night_weather": "", "day_temp_c": None, "night_temp_c": None, "rain_probability": None, "wind_level": "", "humidity": "", "source_id": "", "retrieved_at": ""},
+    )
+    values["care_reminders"] = _rebuild_dataclass_list(
+        CareReminder,
+        values.get("care_reminders"),
+        {"date": "", "message": "", "rule": "", "source_ids": []},
+    )
+    values["optimization_diagnostics"] = _rebuild_dataclass_list(
+        OptimizationDiagnostic,
+        values.get("optimization_diagnostics"),
+        {"code": "unknown", "message": "", "severity": "info", "details": {}},
+    )
+    values["schedule_constraints"] = _rebuild_dataclass_list(
+        ScheduleConstraint,
+        values.get("schedule_constraints"),
+        {"constraint_id": "", "constraint_type": "unknown", "target_id": "", "hard": False, "start_at": None, "end_at": None, "status": "unknown", "source_ids": []},
+    )
+    raw_meta = values.get("provider_meta")
+    provider_meta = {}
+    if isinstance(raw_meta, dict):
+        for key, raw_item in raw_meta.items():
+            if isinstance(raw_item, ProviderMeta):
+                provider_meta[str(key)] = raw_item
+            elif isinstance(raw_item, dict):
+                provider_meta[str(key)] = ProviderMeta(
+                    **_field_values(
+                        ProviderMeta,
+                        raw_item,
+                        {
+                            "provider": str(key),
+                            "status": "not_requested",
+                            "retryable": False,
+                            "error_code": "",
+                            "attempts": 0,
+                            "latency_ms": 0,
+                            "retrieved_at": "",
+                            "valid_until": "",
+                        },
+                    )
+                )
+    values["provider_meta"] = provider_meta
     # A malformed/old row should not make a thread impossible to open.
     return TravelPlan(**values)
 

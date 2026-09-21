@@ -13,6 +13,139 @@ TravelIntent = Literal[
     "trip_replan",
 ]
 
+OptimizationObjective = Literal["fastest", "cheapest", "least_walking", "balanced"]
+TravelPace = Literal["relaxed", "normal", "packed"]
+
+
+@dataclass(slots=True)
+class ProviderMeta:
+    """Public diagnostics for one provider call.
+
+    The value is deliberately separate from the provider payload.  This lets
+    the UI explain a partial result without treating an exception string as a
+    travel fact, and keeps retry information available for a bounded retry
+    action.
+    """
+
+    provider: str
+    status: str = "not_requested"  # success|empty|failed|partial|not_configured
+    retryable: bool = False
+    error_code: str = ""
+    attempts: int = 0
+    latency_ms: int = 0
+    retrieved_at: str = ""
+    valid_until: str = ""
+
+
+@dataclass(slots=True)
+class PlaceCandidate:
+    candidate_id: str
+    provider_id: str
+    name: str
+    category: str = ""
+    province: str = ""
+    city: str = ""
+    district: str = ""
+    address: str = ""
+    location: str = ""
+    distance_from_city_center: str = ""
+    opening_status: str = "unknown"
+    confidence: str = "unknown"
+    source_ids: list[str] = field(default_factory=list)
+    query_text: str = ""
+
+
+@dataclass(slots=True)
+class OpeningWindow:
+    date: str
+    target_id: str = ""
+    open_time: str = ""
+    close_time: str = ""
+    last_entry_time: str | None = None
+    closed_reason: str | None = None
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class BookingRequirement:
+    target_id: str = ""
+    required: bool = False
+    booking_url: str | None = None
+    booking_note: str = ""
+    booking_status: str = "unknown"  # unknown|recommended|required|confirmed
+    verification: str = "unknown"  # verified|discovered|unknown
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DailyWeather:
+    date: str
+    day_weather: str = ""
+    night_weather: str = ""
+    day_temp_c: float | None = None
+    night_temp_c: float | None = None
+    rain_probability: float | None = None
+    wind_level: str = ""
+    humidity: str = ""
+    source_id: str = ""
+    retrieved_at: str = ""
+
+
+@dataclass(slots=True)
+class CareReminder:
+    date: str
+    message: str
+    rule: str = ""
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RouteSegment:
+    segment_id: str
+    date: str
+    origin_place_id: str
+    destination_place_id: str
+    mode: str
+    distance_meters: int | None = None
+    duration_minutes: int | None = None
+    estimated_cost: str | None = None
+    buffer_minutes: int = 20
+    walking_minutes: int | None = None
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TransportEdge:
+    origin_city: str
+    destination_city: str
+    mode: str
+    depart_at: str = ""
+    arrive_at: str = ""
+    duration_minutes: int | None = None
+    price: str | None = None
+    transfer_count: int = 0
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ScheduleConstraint:
+    constraint_id: str
+    constraint_type: str
+    target_id: str
+    hard: bool = False
+    start_at: str | None = None
+    end_at: str | None = None
+    status: str = "unknown"
+    source_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class OptimizationDiagnostic:
+    code: str
+    message: str
+    severity: str = "info"
+    details: dict[str, str] = field(default_factory=dict)
+
 
 @dataclass(slots=True)
 class TravelQuery:
@@ -41,6 +174,17 @@ class TravelQuery:
     # scoped adapters are called.
     destination_scope: str = "unknown"  # unknown | city | province | region
     destination_cities: list[str] = field(default_factory=list)
+    objective: OptimizationObjective = "balanced"
+    pace: TravelPace = "normal"
+    max_daily_walking_minutes: int | None = None
+    max_daily_transit_minutes: int | None = None
+    must_visit_places: list[str] = field(default_factory=list)
+    optional_places: list[str] = field(default_factory=list)
+    date_flexibility: bool = False
+    arrival_deadline: str = ""
+    departure_deadline: str = ""
+    meal_preferences: list[str] = field(default_factory=list)
+    resolved_place_candidates: list[PlaceCandidate] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -117,6 +261,13 @@ class PoiRecommendation:
     website_url: str = ""
     freshness: str = "unknown"
     is_placeholder: bool = False
+    provider_id: str = ""
+    province: str = ""
+    city: str = ""
+    district: str = ""
+    location: str = ""
+    opening_windows: list[OpeningWindow] = field(default_factory=list)
+    booking_requirement: BookingRequirement = field(default_factory=BookingRequirement)
 
 
 @dataclass(slots=True)
@@ -208,6 +359,12 @@ class PlanItem:
     # is informational only; it never means a seat was held or a ticket was
     # issued.
     seat_count: int | None = None
+    place_id: str = ""
+    opening_window_id: str = ""
+    booking_requirement_id: str = ""
+    buffer_minutes: int = 0
+    walking_minutes: int | None = None
+    transit_minutes: int | None = None
 
 
 @dataclass(slots=True)
@@ -269,6 +426,21 @@ class TravelPlan:
     # Pagination state for the provider-backed transport list. Keep it at the
     # end so older positional TravelPlan constructors remain compatible.
     transport_pages: list[TransportPage] = field(default_factory=list)
+    # MVP extensions.  All fields are append-only so old positional plan
+    # constructors and snapshots remain readable.
+    route_segments: list[RouteSegment] = field(default_factory=list)
+    optimization_objective: str = "balanced"
+    optimization_score: float | None = None
+    place_candidates: list[PlaceCandidate] = field(default_factory=list)
+    opening_windows: list[OpeningWindow] = field(default_factory=list)
+    booking_requirements: list[BookingRequirement] = field(default_factory=list)
+    daily_weather: list[DailyWeather] = field(default_factory=list)
+    care_reminders: list[CareReminder] = field(default_factory=list)
+    unresolved_places: list[str] = field(default_factory=list)
+    optimization_diagnostics: list[OptimizationDiagnostic] = field(default_factory=list)
+    provider_meta: dict[str, ProviderMeta] = field(default_factory=dict)
+    schedule_constraints: list[ScheduleConstraint] = field(default_factory=list)
+    transport_edges: list[TransportEdge] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -302,6 +474,12 @@ class TravelPlanResponse:
     # can offer a bounded retry action without parsing rendered text.
     retryable: bool = False
     retry_reason: str = ""
+    place_candidates: list[PlaceCandidate] = field(default_factory=list)
+    unresolved_places: list[str] = field(default_factory=list)
+    daily_weather: list[DailyWeather] = field(default_factory=list)
+    care_reminders: list[CareReminder] = field(default_factory=list)
+    provider_meta: dict[str, ProviderMeta] = field(default_factory=dict)
+    risks: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
