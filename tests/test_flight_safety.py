@@ -38,6 +38,28 @@ def test_tuniu_mode_is_explicit_and_does_not_use_demo_data(monkeypatch):
     assert result[0]["is_demo"] is False
 
 
+def test_tuniu_api_key_is_passed_only_through_environment(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("TUNIU_AUTH_TYPE", "apiKey")
+    monkeypatch.setenv("TUNIU_API_KEY", "tn-test-secret")
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps({"successCode": True, "data": []})
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return Completed()
+
+    monkeypatch.setattr(tuniu_flight_adapter.subprocess, "run", fake_run)
+    tuniu_flight_adapter.search_tuniu_flights("北京", "上海", "2026-10-01")
+
+    assert "tn-test-secret" not in " ".join(captured["command"])
+    assert captured["env"]["TUNIU_API_KEY"] == "tn-test-secret"
+
+
 def test_tuniu_provider_can_be_disabled_explicitly(monkeypatch):
     monkeypatch.setenv("FLIGHT_MCP_ENABLED", "false")
     monkeypatch.setenv("FLIGHT_MCP_MODE", "tuniu")
@@ -146,6 +168,7 @@ def test_tuniu_adapter_preserves_partial_rows_as_diagnostics(monkeypatch):
 
 
 def test_tuniu_cli_auth_failure_is_not_treated_as_empty(monkeypatch):
+    monkeypatch.setenv("TUNIU_AUTH_TYPE", "apiKey")
     class Completed:
         returncode = 0
         stdout = json.dumps(
@@ -167,7 +190,7 @@ def test_tuniu_cli_auth_failure_is_not_treated_as_empty(monkeypatch):
         tuniu_flight_adapter.search_tuniu_flights("北京", "上海", "2026-10-01")
 
     assert exc_info.value.failure_kind == "unauthorized"
-    assert str(exc_info.value) == "途牛 CLI 未授权，请先执行 tuniu auth login 或配置 TUNIU_API_KEY。"
+    assert str(exc_info.value) == "途牛 API Key 未配置或无效，请检查 TUNIU_API_KEY。"
 
 
 def test_tuniu_does_not_turn_missing_base_price_into_tax_only_price(monkeypatch):

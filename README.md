@@ -281,7 +281,7 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 ## 航班查询说明
 
 项目使用途牛官方国内机票 MCP 的只读搜索工具
-`searchLowestPriceFlight`，通过官方 `tuniu` CLI 完成 OAuth 或 API Key
+`searchLowestPriceFlight`，通过官方 `tuniu` CLI 使用 API Key
 认证。查询结果会转换为项目统一的 `TransportOption`，保留航班号、航司、
 起降时间/机场、基准价、税费、舱位和途牛返回的剩余座位数。
 
@@ -291,17 +291,16 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 FLIGHT_MCP_ENABLED=true
 FLIGHT_MCP_MODE=tuniu
 TUNIU_CLI_COMMAND=tuniu
-TUNIU_AUTH_TYPE=oauth
+TUNIU_AUTH_TYPE=apiKey
 TUNIU_AUTH_SOURCE=tuniu-cli
+TUNIU_API_KEY=your_tuniu_api_key
 TUNIU_TIMEOUT_SECONDS=30
 ```
 
-安装并授权：
+安装 CLI 并配置 API Key：
 
 ```powershell
 npm install -g tuniu-cli@latest
-tuniu auth login
-tuniu auth status
 tuniu list flight
 ```
 
@@ -311,7 +310,7 @@ tuniu list flight
 tuniu call flight searchLowestPriceFlight -a '{"departureCityName":"北京","arrivalCityName":"上海","departureDate":"2026-10-01"}'
 ```
 
-途牛开放平台文档公布的限制为所有 API Key 共享每分钟 5 次、每天 50 次；
+API Key 只应保存在本机 `.env` 或进程环境变量中，不要提交仓库。途牛开放平台文档公布的限制为所有 API Key 共享每分钟 5 次、每天 50 次；
 文档没有承诺无限免费额度。项目只调用搜索，不会自动调用舱位详情、创建订单、
 支付或取消订单。返回候选也不代表已锁座、出票或可购票保证。
 

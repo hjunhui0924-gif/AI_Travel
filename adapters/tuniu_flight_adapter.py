@@ -53,9 +53,9 @@ class TuniuFlightResults(list[dict[str, Any]]):
 def is_tuniu_configured() -> bool:
     """Return whether a Tuniu credential mechanism is configured.
 
-    OAuth tokens are stored by the CLI and therefore cannot be detected from
-    the environment without running a subprocess.  ``TUNIU_AUTH_TYPE`` is an
-    explicit declaration for that mode; the live call remains authoritative.
+    API Key mode is configured through the environment. OAuth remains
+    technically recognized by the adapter for backward compatibility, but is
+    not selected by the project's default configuration.
     """
 
     auth_type = os.getenv("TUNIU_AUTH_TYPE", "").strip().lower()
@@ -127,7 +127,7 @@ def _error_kind(error_type: str, code: object, message: str) -> str:
         or "auth" in marker
         or "未授权" in marker
         or "授权" in marker
-        or str(code) == "110"
+        or str(code) in {"104", "108", "109", "110", "111", "112"}
     ):
         return "unauthorized"
     if (
@@ -159,7 +159,10 @@ def _raise_cli_error(payload: object, *, stderr: str = "", returncode: int | Non
     message = message or (stderr or "途牛 CLI 调用失败").strip()
     kind = _error_kind(error_type, code, message)
     if kind == "unauthorized":
-        message = "途牛 CLI 未授权，请先执行 tuniu auth login 或配置 TUNIU_API_KEY。"
+        if os.getenv("TUNIU_AUTH_TYPE", "").strip().lower() == "apikey":
+            message = "途牛 API Key 未配置或无效，请检查 TUNIU_API_KEY。"
+        else:
+            message = "途牛 CLI 未授权，请配置 TUNIU_API_KEY 或检查认证配置。"
     elif kind == "rate_limited":
         message = "途牛航班接口已限流，请稍后再试。"
     elif returncode is not None and not message:
@@ -194,6 +197,7 @@ def _unwrap_call_payload(payload: object) -> object:
 
 
 def _call_cli(arguments: dict[str, Any]) -> object:
+    timeout_seconds = _timeout_seconds()
     command = [
         *_cli_tokens(),
         "call",
@@ -203,6 +207,8 @@ def _call_cli(arguments: dict[str, Any]) -> object:
         json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
         "-o",
         "json",
+        "-t",
+        str(timeout_seconds),
     ]
     try:
         completed = subprocess.run(
@@ -211,7 +217,7 @@ def _call_cli(arguments: dict[str, Any]) -> object:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=_timeout_seconds(),
+            timeout=timeout_seconds + 5,
             check=False,
             env=os.environ.copy(),
         )

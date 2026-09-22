@@ -213,8 +213,8 @@ def _flight_query_parameters() -> tuple[str, str, str]:
     query_date = os.getenv("FLIGHT_HEALTH_DATE", "").strip() or (
         DateTime.now(CN_TZ).date() + timedelta(days=7)
     ).isoformat()
-    origin = os.getenv("FLIGHT_HEALTH_ORIGIN", "上海").strip()
-    destination = os.getenv("FLIGHT_HEALTH_DESTINATION", "杭州").strip()
+    origin = os.getenv("FLIGHT_HEALTH_ORIGIN", "北京").strip()
+    destination = os.getenv("FLIGHT_HEALTH_DESTINATION", "上海").strip()
     return query_date, origin, destination
 
 
