@@ -87,6 +87,8 @@ def get_transport_page(
                 url=(
                     "https://kyfw.12306.cn/"
                     if normalized_mode == "rail"
+                    else "https://open.tuniu.com/mcp/docs/apidoc/mcp/flightMCP.html"
+                    if (option.provider or "").lower() == "tuniu"
                     else "https://mcp.variflight.com/"
                     if (option.provider or "").lower() == "variflight"
                     else ""

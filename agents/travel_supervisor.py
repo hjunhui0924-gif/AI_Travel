@@ -525,7 +525,11 @@ def run_travel_supervisor(
         result.adapter_status["flight"] = "success" if options else "empty"
         provider_log("tool", "航班查询完成", f"返回 {len(options)} 条", "completed")
         return _json_result({
-            "provider": "VariFlight/授权航班服务",
+            "provider": (
+                f"{options[0].provider}/授权航班服务"
+                if options and options[0].provider
+                else "Tuniu/途牛国内机票服务"
+            ),
             "mode": "flight",
             "count": len(options),
             "has_more": bool(getattr(provider_result, "has_more", False)),

@@ -824,6 +824,8 @@ def _transport_evidence(options: list[TransportOption]) -> list[Evidence]:
                 url=(
                     "https://kyfw.12306.cn/"
                     if option.mode == "rail"
+                    else "https://open.tuniu.com/mcp/docs/apidoc/mcp/flightMCP.html"
+                    if provider.lower() == "tuniu"
                     else "https://mcp.variflight.com/"
                     if provider.lower() == "variflight"
                     else ""

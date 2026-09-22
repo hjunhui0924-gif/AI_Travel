@@ -56,3 +56,26 @@ def test_health_check_does_not_query_variflight_twice_for_flight_mcp_alias(monke
         "variflight": "success",
         "flight_mcp": "alias",
     }
+
+
+def test_health_check_does_not_query_tuniu_twice_for_flight_mcp_alias(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "tuniu")
+
+    def fake_search(*args):
+        calls.append(args)
+        return [{"flight_no": "MU5101", "seat_count": 9}]
+
+    monkeypatch.setattr(integration_health, "search_flights", fake_search)
+
+    checks = integration_health.run_integration_health_checks(
+        live=True,
+        only={"tuniu", "flight_mcp"},
+    )
+
+    assert len(calls) == 1
+    assert {check.provider: check.status for check in checks} == {
+        "tuniu": "success",
+        "flight_mcp": "alias",
+    }
+    assert checks[0].details["seat_count_known"] == 1

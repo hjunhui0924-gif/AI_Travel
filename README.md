@@ -16,7 +16,7 @@
 ## 主要能力
 
 - 旅行问答工作台：围绕“从哪里出发、什么时候走、到哪里、怎么去”来组织回答
-- 机票查询链路：支持通过 VariFlight、Flight MCP Bridge 接入授权航班数据
+- 机票查询链路：通过途牛官方国内机票 MCP 查询航班候选
 - 高铁查询链路：支持 12306 方向的高铁信息整理
 - 路线规划：支持地点解析、城市内路径建议与周边推荐
 - 天气辅助：支持高德天气查询，为出行建议补充天气上下文
@@ -77,7 +77,7 @@
 - Web search: `Tavily`（可选）
 - Map / Weather: `AMap Web API`（可选）
 - 旅行识别：规则优先，未命中的消息由大模型做旅行范围分类和结构化抽取兜底，不提供通用问答
-- Flight bridge: 本地 bridge / MCP / HTTP 适配（可选）
+- Flight provider: 途牛官方 MCP/CLI 适配（可选）
 - File parsing: `pypdf`, `python-docx`, `openpyxl`, `xlrd`
 
 ## 项目结构
@@ -95,10 +95,9 @@ AI_Agent/
 ├── adapters/
 │   ├── amap_adapter.py
 │   ├── flight_mcp_adapter.py
+│   ├── tuniu_flight_adapter.py
 │   ├── variflight_adapter.py
 │   └── rail_12306_adapter.py
-├── bridges/
-│   └── flight_mcp_bridge.py
 ├── services/
 │   ├── auth_service.py
 │   ├── flight_service.py
@@ -257,20 +256,15 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 
 12306 查询使用持久化站点字典缓存和短时车次缓存；默认单次 HTTP 超时 8 秒、总超时 18 秒，不默认轮询多个备用 endpoint。查询失败或超时后，聊天区会提供有限次数的“重试”按钮，不会无限自动重试。
 
-### 航班 Bridge
+### 航班查询（途牛官方 MCP）
 
 - `FLIGHT_MCP_ENABLED`
 - `FLIGHT_MCP_MODE`
-- `FLIGHT_MCP_COMMAND`
-- `FLIGHT_MCP_TIMEOUT_SECONDS`
-- `FLIGHT_BRIDGE_MODE`
-- `FLIGHT_MCP_HTTP_URL`
-- `VARIFLIGHT_API_KEY`
-- `VARIFLIGHT_API_URL`
-- `VARIFLIGHT_HTTP_TIMEOUT_SECONDS`
-- `VARIFLIGHT_MAX_RETRIES`
-- `VARIFLIGHT_RETRY_BACKOFF_SECONDS`
-- `VARIFLIGHT_CITY_CODE_ALIASES_JSON`
+- `TUNIU_CLI_COMMAND`
+- `TUNIU_AUTH_TYPE`
+- `TUNIU_AUTH_SOURCE`
+- `TUNIU_API_KEY`（无浏览器环境可选）
+- `TUNIU_TIMEOUT_SECONDS`
 
 ### 观测
 
@@ -286,35 +280,40 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 
 ## 航班查询说明
 
-项目当前的航班能力是桥接式的，不是写死在单一接口里。
+项目使用途牛官方国内机票 MCP 的只读搜索工具
+`searchLowestPriceFlight`，通过官方 `tuniu` CLI 完成 OAuth 或 API Key
+认证。查询结果会转换为项目统一的 `TransportOption`，保留航班号、航司、
+起降时间/机场、基准价、税费、舱位和途牛返回的剩余座位数。
 
-支持的接入方式包括：
-
-- Flight MCP 兼容命令/HTTP bridge
-- VariFlight 官方航班 MCP HTTP provider
-- Flight MCP 兼容命令
-- 兼容 HTTP 返回的航班服务
-- 本地演示 dummy 数据（仅测试，默认禁止）
-
-示例配置：
+配置示例：
 
 ```env
 FLIGHT_MCP_ENABLED=true
-FLIGHT_MCP_MODE=variflight
-VARIFLIGHT_API_KEY=your_key
-VARIFLIGHT_API_URL=https://mcp.variflight.com/api/v1/mcp/data
-VARIFLIGHT_HTTP_TIMEOUT_SECONDS=20
-VARIFLIGHT_MAX_RETRIES=1
+FLIGHT_MCP_MODE=tuniu
+TUNIU_CLI_COMMAND=tuniu
+TUNIU_AUTH_TYPE=oauth
+TUNIU_AUTH_SOURCE=tuniu-cli
+TUNIU_TIMEOUT_SECONDS=30
 ```
 
-`FLIGHT_MCP_MODE=variflight` must be explicit; a VariFlight key will not silently
-override an existing command/http provider. Unknown three-letter codes
-are rejected instead of being sent as city codes. Extend the built-in map with
-`VARIFLIGHT_CITY_CODE_ALIASES_JSON`, for example `{"LJG":"LJG"}`.
+安装并授权：
 
-`variflight` 模式通过 VariFlight 的 `getFlightPriceByCities` 接口查询航班方案、价格、舱位和 provider 返回的可售数量；它要求城市/机场能转换为 IATA 城市码。结果仍然只是实时查询候选，不代表已经锁座、出票或自动订票。
+```powershell
+npm install -g tuniu-cli@latest
+tuniu auth login
+tuniu auth status
+tuniu list flight
+```
 
-航班数据源必须是已授权且能稳定返回结构化数据的 VariFlight、Flight MCP、HTTP 服务或命令适配器。项目不再包含携程 H5 爬取或探测代码；携程 H5 已确认受到 `whaleguard`/HTTP 432 风控，不能作为生产航班数据源。
+真实查询示例：
+
+```powershell
+tuniu call flight searchLowestPriceFlight -a '{"departureCityName":"北京","arrivalCityName":"上海","departureDate":"2026-10-01"}'
+```
+
+途牛开放平台文档公布的限制为所有 API Key 共享每分钟 5 次、每天 50 次；
+文档没有承诺无限免费额度。项目只调用搜索，不会自动调用舱位详情、创建订单、
+支付或取消订单。返回候选也不代表已锁座、出票或可购票保证。
 
 ## 外部服务联调
 
@@ -330,11 +329,12 @@ python -m services.integration_health --live
 python -m services.integration_health --live --only amap
 python -m services.integration_health --live --only rail_12306
 python -m services.integration_health --live --only tavily
-python -m services.integration_health --live --only variflight
+python -m services.integration_health --live --only tuniu
+# flight_mcp 是兼容别名；选择 tuniu 时不会重复请求
 python -m services.integration_health --live --only flight_mcp
 ```
 
-高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。航班查询应配置授权的 VariFlight、Flight MCP 或官方/合作方航班 API。
+高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。途牛未授权、CLI 未安装、响应结构变化和限流会分别进入诊断，不会被当成“没有航班”。
 
 旅行计划中的路线预览使用高德路径规划返回的折线数据。后端默认通过高德静态地图服务渲染图片，Web Service key 不会下发到浏览器；静态地图请求异常时会返回基于真实路线折线生成的 SVG 示意图。要在浏览器中启用可缩放、可拖拽的高德 JS 地图，请申请 Web 端（JS API）Key 和安全密钥，并在项目根目录 `.env` 配置 `VITE_AMAP_JS_KEY`、`VITE_AMAP_SECURITY_JS_CODE`，然后重新构建前端。浏览器 Key 必须在高德控制台配置域名白名单；没有这两个变量时仍使用静态地图。
 
@@ -401,7 +401,7 @@ python -m services.integration_health --live --only flight_mcp
 
 ```bash
 python -m pytest -q
-python -m compileall -q agents services adapters bridges app.py tests
+python -m compileall -q agents services adapters app.py tests
 ```
 
 前端检查：

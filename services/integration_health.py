@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from adapters.amap_adapter import plan_route, search_pois, search_pois_around_location
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
+from adapters.tuniu_flight_adapter import is_tuniu_configured
 from adapters.variflight_adapter import is_variflight_configured, search_variflight_flights
 from adapters.rail_12306_adapter import query_left_tickets
 from services.travel_search import _default_searcher
@@ -32,8 +33,8 @@ from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CN_TZ = ZoneInfo("Asia/Shanghai")
 LIVE_OK_STATUSES = {"success", "alias", "not_configured", "not_requested"}
-PROVIDERS = ("amap", "rail_12306", "tavily", "variflight", "flight_mcp")
-DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "variflight")
+PROVIDERS = ("amap", "rail_12306", "tavily", "tuniu", "variflight", "flight_mcp")
+DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "tuniu")
 
 
 def _now_label() -> str:
@@ -45,8 +46,7 @@ def _safe_error(exc: Exception) -> str:
     for name in (
         "AMAP_WEB_API_KEY",
         "TAVILY_API_KEY",
-        "FLIGHT_MCP_HTTP_URL",
-        "FLIGHT_MCP_COMMAND",
+        "TUNIU_API_KEY",
         "VARIFLIGHT_API_KEY",
     ):
         secret = os.getenv(name, "")
@@ -213,8 +213,8 @@ def _flight_query_parameters() -> tuple[str, str, str]:
     query_date = os.getenv("FLIGHT_HEALTH_DATE", "").strip() or (
         DateTime.now(CN_TZ).date() + timedelta(days=7)
     ).isoformat()
-    origin = os.getenv("FLIGHT_HEALTH_ORIGIN", "SHA").strip()
-    destination = os.getenv("FLIGHT_HEALTH_DESTINATION", "HGH").strip()
+    origin = os.getenv("FLIGHT_HEALTH_ORIGIN", "上海").strip()
+    destination = os.getenv("FLIGHT_HEALTH_DESTINATION", "杭州").strip()
     return query_date, origin, destination
 
 
@@ -233,8 +233,34 @@ def _check_flight_mcp() -> tuple[str, str, dict[str, Any]]:
     }
 
 
+def _check_tuniu() -> tuple[str, str, dict[str, Any]]:
+    if os.getenv("FLIGHT_MCP_MODE", "").strip().lower() != "tuniu":
+        return "not_configured", "未选择途牛国内机票 provider。", {}
+    query_date, origin, destination = _flight_query_parameters()
+    options = search_flights(origin, destination, query_date)
+    errors = list(getattr(options, "errors", []) or [])
+    if errors:
+        status = "partial" if options else "failed"
+        message = "途牛返回部分可解析航班，其他行已记录为结构异常。" if options else "途牛航班响应结构无有效行。"
+    else:
+        status = "success" if options else "empty"
+        message = f"途牛返回 {len(options)} 条国内航班候选。" if options else "途牛请求成功但没有航班结果。"
+    return status, message, {
+        "date": query_date,
+        "origin": origin,
+        "destination": destination,
+        "count": len(options),
+        "seat_count_known": sum(item.get("seat_count") is not None for item in options),
+        "errors": errors,
+    }
+
+
 def _flight_mcp_uses_variflight() -> bool:
     return os.getenv("FLIGHT_MCP_MODE", "").strip().lower() == "variflight"
+
+
+def _flight_mcp_uses_tuniu() -> bool:
+    return os.getenv("FLIGHT_MCP_MODE", "").strip().lower() == "tuniu"
 
 
 def _check_variflight() -> tuple[str, str, dict[str, Any]]:
@@ -302,6 +328,14 @@ def run_integration_health_checks(
                 _check_variflight if live else lambda: ("not_requested", "未执行实时 VariFlight 检查。", {}),
             )
         )
+    if "tuniu" in selected:
+        checks.append(
+            _run(
+                "tuniu",
+                is_tuniu_configured() or _flight_mcp_uses_tuniu(),
+                _check_tuniu if live else lambda: ("not_requested", "未执行实时途牛航班检查。", {}),
+            )
+        )
     if "flight_mcp" in selected:
         if "variflight" in selected and _flight_mcp_uses_variflight():
             checks.append(
@@ -317,6 +351,22 @@ def run_integration_health_checks(
                         else "未执行实时 Flight MCP 检查。"
                     ),
                     details={"alias_of": "variflight", "request_skipped": True},
+                )
+            )
+        elif "tuniu" in selected and _flight_mcp_uses_tuniu():
+            checks.append(
+                IntegrationCheck(
+                    provider="flight_mcp",
+                    status=("alias" if is_flight_mcp_enabled() else "not_configured")
+                    if live
+                    else "not_requested",
+                    configured=is_flight_mcp_enabled(),
+                    message=(
+                        "Flight MCP 复用本轮途牛检查，未重复请求。"
+                        if live and is_flight_mcp_enabled()
+                        else "未执行实时 Flight MCP 检查。"
+                    ),
+                    details={"alias_of": "tuniu", "request_skipped": True},
                 )
             )
         else:

@@ -43,6 +43,7 @@ server_*.log
 .mypy_cache/
 .ruff_cache/
 .cache/
+.playwright-cli/
 
 # IDE / OS
 .vscode/
