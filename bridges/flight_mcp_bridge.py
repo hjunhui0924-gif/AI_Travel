@@ -202,6 +202,14 @@ def _search_via_installed_package(origin: str, destination: str, date: str) -> l
     normalized = []
     for item in items:
         normalized.append(_normalize_flight_item(item, origin, destination, "FlightTicketMCP"))
+    transcript = sink.getvalue()
+    if not normalized and any(
+        marker in transcript
+        for marker in ("航班容器未找到", "航班内容加载", "无法找到航班")
+    ):
+        raise FlightBridgeError(
+            "FlightTicketMCP page parser found no flight container; the source page may be blocked or changed"
+        )
     return normalized
 
 

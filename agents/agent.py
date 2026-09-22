@@ -309,7 +309,7 @@ def _resolve_model_settings() -> dict:
     dashscope_key = _env_value("DASHSCOPE_API_KEY")
     if dashscope_key:
         return {
-            "model": _env_value("DASHSCOPE_MODEL") or "qwen3.7-flash",
+            "model": _env_value("DASHSCOPE_MODEL") or "qwen3.8-flash",
             "model_provider": "openai",
             "base_url": _env_value("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
             "api_key": dashscope_key,

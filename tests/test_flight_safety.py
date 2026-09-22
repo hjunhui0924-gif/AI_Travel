@@ -1,5 +1,7 @@
 import pytest
 import subprocess
+import sys
+import types
 
 from adapters import flight_mcp_adapter
 from bridges import flight_mcp_bridge
@@ -30,6 +32,21 @@ def test_auto_bridge_surfaces_provider_failure(monkeypatch):
         flight_mcp_bridge._search_via_auto("SHA", "HGH", "2026-09-02")
 
     assert "package unavailable" in str(exc_info.value)
+
+
+def test_package_bridge_rejects_empty_result_when_page_parser_reports_missing_container(monkeypatch):
+    fake_tools = types.ModuleType("flight_ticket_mcp_server.tools.flight_search_tools")
+    fake_tools.get_airport_code = lambda value: value
+
+    def fake_search(*_args):
+        print("❌ 航班容器未找到")
+        return {"status": "success", "flights": []}
+
+    fake_tools.searchFlightRoutes = fake_search
+    monkeypatch.setitem(sys.modules, "flight_ticket_mcp_server.tools.flight_search_tools", fake_tools)
+
+    with pytest.raises(flight_mcp_bridge.FlightBridgeError, match="page parser found no flight container"):
+        flight_mcp_bridge._search_via_installed_package("SHA", "HGH", "2026-09-29")
 
 
 def test_flight_command_timeout_is_reported_and_process_tree_is_terminated(monkeypatch):

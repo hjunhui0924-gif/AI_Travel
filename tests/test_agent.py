@@ -17,7 +17,7 @@ def test_model_settings_prefer_qwen_when_dashscope_is_configured(monkeypatch):
 
     settings = agent._resolve_model_settings()
 
-    assert settings["model"] == "qwen3.7-flash"
+    assert settings["model"] == "qwen3.8-flash"
     assert settings["model_provider"] == "openai"
     assert settings["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert settings["api_key"] == "test-dashscope-key"
