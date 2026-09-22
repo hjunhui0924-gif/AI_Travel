@@ -1257,7 +1257,6 @@ async def chat(
             assistant_decision_reason = ""
             assistant_retryable = False
             assistant_retry_reason = ""
-            assistant_flight_statuses = []
             assistant_transport_options = []
             assistant_transport_page = None
             travel_plan = None
@@ -1301,8 +1300,6 @@ async def chat(
                     assistant_retryable = True
                 if isinstance(metadata, dict) and isinstance(metadata.get("retry_reason"), str):
                     assistant_retry_reason = metadata["retry_reason"]
-                if isinstance(metadata, dict) and isinstance(metadata.get("flight_statuses"), list):
-                    assistant_flight_statuses = metadata["flight_statuses"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("transport_options"), list):
                     assistant_transport_options = metadata["transport_options"]
                 if isinstance(metadata, dict) and isinstance(metadata.get("transport_page"), dict):
@@ -1485,7 +1482,6 @@ async def chat(
                     "decision_reason": assistant_decision_reason,
                     "retryable": assistant_retryable,
                     "retry_reason": assistant_retry_reason,
-                    "flight_statuses": assistant_flight_statuses,
                     "trip_plan": travel_plan,
                     "transport_options": assistant_transport_options,
                     "transport_page": assistant_transport_page,

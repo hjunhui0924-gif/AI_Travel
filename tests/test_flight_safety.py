@@ -111,17 +111,3 @@ def test_explicit_legacy_flight_mode_wins_over_variflight_credentials(monkeypatc
     monkeypatch.setenv("VARIFLIGHT_API_URL", "https://example.test/mcp")
 
     assert flight_mcp_adapter._flight_mcp_mode() == "package"
-
-
-def test_opensky_mode_uses_live_status_path_without_ticket_options(monkeypatch):
-    monkeypatch.setenv("FLIGHT_MCP_ENABLED", "true")
-    monkeypatch.setenv("FLIGHT_MCP_MODE", "opensky")
-    monkeypatch.setattr(
-        flight_mcp_adapter,
-        "get_flight_statuses",
-        lambda: [{"callsign": "CA123"}],
-    )
-
-    assert flight_mcp_adapter.is_opensky_mode() is True
-    assert flight_mcp_adapter.get_flight_statuses()[0]["callsign"] == "CA123"
-    assert flight_mcp_adapter.search_flights("上海", "杭州", "2026-09-02") == []

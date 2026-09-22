@@ -7,7 +7,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from adapters.flight_mcp_adapter import get_flight_statuses, is_flight_mcp_enabled, is_opensky_mode
+from adapters.flight_mcp_adapter import is_flight_mcp_enabled
 from agents.schemas import (
     CareReminder,
     DailyWeather,
@@ -17,7 +17,6 @@ from agents.schemas import (
     PlanDay,
     PlanItem,
     PlaceCandidate,
-    OpenSkyFlightStatus,
     PoiGroup,
     PoiRecommendation,
     RoutePlan,
@@ -1335,7 +1334,6 @@ def plan_travel(
         flight_requested = should_fetch_transport
     rail_options: list[TransportOption] = []
     flight_options: list[TransportOption] = []
-    flight_statuses: list[OpenSkyFlightStatus] = []
     transport_pages: list[TransportPage] = []
     route_plans: list[RoutePlan] = []
     poi_items: list[PoiRecommendation] = []
@@ -1374,7 +1372,7 @@ def plan_travel(
         if rail_requested and query.origin and query.destination and query.date:
             operations["rail"] = lambda: get_rail_options(query)
         if flight_requested and query.origin and query.destination and query.date:
-            operations["flight"] = get_flight_statuses if is_opensky_mode() else lambda: get_flight_options(query)
+            operations["flight"] = lambda: get_flight_options(query)
         if weather_requested and (query.destination or query.city):
             operations["weather"] = lambda: (
                 get_weather_summary(query.destination or query.city, forecast=True),
@@ -1434,19 +1432,13 @@ def plan_travel(
         flight_task = batch.results.get("flight")
         if flight_task is not None:
             flight_result = flight_task.value
-            if is_opensky_mode():
-                flight_statuses = list(flight_result or []) if isinstance(flight_result, (list, tuple)) else []
-                flight_options = []
-            else:
-                flight_options = list(flight_result or []) if isinstance(flight_result, (list, tuple)) else []
-            if flight_result is not None and not is_opensky_mode():
+            flight_options = list(flight_result or []) if isinstance(flight_result, (list, tuple)) else []
+            if flight_result is not None:
                 transport_pages.append(_transport_page_from_result("flight", flight_result, query))
             flight_status = flight_task.meta.status
             if not is_flight_mcp_enabled() and not flight_options and not flight_task.errors:
                 flight_status = "not_configured"
             adapter_status["flight"] = "partial" if flight_options and flight_task.errors else flight_status
-            if is_opensky_mode() and flight_statuses:
-                adapter_status["flight"] = "success"
         weather_task = batch.results.get("weather")
         if weather_task is not None:
             if isinstance(weather_task.value, tuple):
@@ -1479,7 +1471,6 @@ def plan_travel(
     if supervisor_result is not None and not supervisor_result.fallback_used:
         rail_options = [item for item in supervisor_result.transport_options if item.mode == "rail"]
         flight_options = [item for item in supervisor_result.transport_options if item.mode == "flight"]
-        flight_statuses = list(supervisor_result.flight_statuses)
         transport_pages = list(supervisor_result.transport_pages)
         route_plans = list(supervisor_result.route_plans)
         poi_items = list(supervisor_result.poi_items)
@@ -1727,12 +1718,6 @@ def plan_travel(
         adapter_status["weather"] = "not_requested"
 
     adapter_status["web_search"] = "not_requested" if not include_explore else web_search_status
-    if is_opensky_mode() and (
-        query.travel_mode == "flight"
-        or query.intent in {"flight_query", "transport_compare"}
-        or flight_statuses
-    ):
-        alerts.append("当前使用 OpenSky 实时状态数据；它不提供未来航班票价、余票或购票候选。")
     retryable, retry_reason = _provider_retry_info(adapter_status)
     risks.extend(poi_errors)
     check_cancelled()
@@ -1741,7 +1726,7 @@ def plan_travel(
         risks.append("当前交通列表含演示数据，只用于联调展示，不可用于购票或判断真实班次。")
     if not rail_options and query.travel_mode == "rail":
         alerts.append("当前未获取到高铁实时结果，可能是站点、日期或 12306 查询受限。")
-    if not flight_options and not flight_statuses and query.travel_mode == "flight":
+    if not flight_options and query.travel_mode == "flight":
         if adapter_status.get("flight") == "not_configured":
             alerts.append("航班查询能力尚未启用，本次没有执行真实航班查询。")
         else:
@@ -1769,21 +1754,6 @@ def plan_travel(
                 freshness="current_query",
                 reliability="primary_adapter",
                 supports=["weather_context"],
-            )
-        )
-    if flight_statuses:
-        sources.append(
-            Evidence(
-                evidence_id="opensky_live_status",
-                source_type="flight_status",
-                provider="OpenSky",
-                title="OpenSky 实时航班状态",
-                url="https://opensky-network.org/",
-                snippet=f"当前观测到 {len(flight_statuses)} 架带呼号的飞行器；不含未来票价和余票。",
-                retrieved_at=_now_cn().isoformat(timespec="seconds"),
-                freshness="current_query",
-                reliability="primary_adapter",
-                supports=["live_aircraft_state"],
             )
         )
 
@@ -1827,7 +1797,6 @@ def plan_travel(
                 diagnostics=diagnostics,
                 adapter_status=adapter_status,
                 provider_meta=provider_meta,
-                flight_statuses=flight_statuses,
                 sources=sources,
                 place_candidates=place_candidates,
                 unresolved_places=unresolved_places,
@@ -1859,7 +1828,6 @@ def plan_travel(
             diagnostics=diagnostics,
             adapter_status=adapter_status,
             provider_meta=provider_meta,
-            flight_statuses=flight_statuses,
             sources=sources,
             decision="refuse",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "模型未授权生成旅行计划。"),
@@ -1905,7 +1873,7 @@ def plan_travel(
         has_effective_data = _has_effective_travel_data(
             query, transport_options, route_plans, poi_items, weather_summary
         )
-        if not has_effective_data and not flight_statuses:
+        if not has_effective_data:
             alerts.extend(item for item in poi_errors if item not in alerts)
             alerts.append(NO_PROVIDER_DATA_NOTICE)
         answer = (
@@ -1927,7 +1895,6 @@ def plan_travel(
             diagnostics=diagnostics,
             adapter_status=adapter_status,
             provider_meta=provider_meta,
-            flight_statuses=flight_statuses,
             sources=sources,
             decision="answer",
             decision_reason=(supervisor_result.decision_reason if supervisor_result else "本轮未明确要求生成行程。"),
@@ -1960,7 +1927,6 @@ def plan_travel(
             diagnostics=diagnostics,
             adapter_status=adapter_status,
             provider_meta=provider_meta,
-            flight_statuses=flight_statuses,
             sources=sources,
             decision="answer",
             decision_reason="没有有效 provider 数据。",
@@ -2014,7 +1980,6 @@ def plan_travel(
         retryable=retryable,
         retry_reason=retry_reason,
         provider_meta=provider_meta,
-        flight_statuses=flight_statuses,
         place_candidates=place_candidates,
         unresolved_places=unresolved_places,
         daily_weather=daily_weather,
@@ -2073,20 +2038,6 @@ def _render_detailed_travel_response(response: TravelPlanResponse) -> str:
     if response.clarification:
         lines.extend(["", response.clarification.prompt])
         return "\n".join(lines).strip()
-    if response.flight_statuses:
-        lines.extend([
-            "",
-            "## OpenSky 实时航班状态",
-            "以下是当前空域中被 OpenSky 观测到的飞行器，不代表未来航班、票价、余票或可购票方案。",
-        ])
-        for status in response.flight_statuses[:20]:
-            location = ""
-            if status.latitude is not None and status.longitude is not None:
-                location = f" | 位置 {status.latitude:.3f},{status.longitude:.3f}"
-            state = "地面" if status.on_ground else "空中" if status.on_ground is not None else "状态未知"
-            lines.append(
-                f"- {status.callsign or status.icao24} | {state} | {status.origin_country or '国家未知'}{location}"
-            )
     web_source_ids = {
         source.evidence_id
         for source in response.sources

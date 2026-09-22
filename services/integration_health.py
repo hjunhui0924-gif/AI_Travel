@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 from adapters.amap_adapter import plan_route, search_pois, search_pois_around_location
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
 from adapters.amadeus_adapter import is_amadeus_configured, search_amadeus_flights
-from adapters.opensky_adapter import is_opensky_configured, search_opensky_states
 from adapters.variflight_adapter import is_variflight_configured, search_variflight_flights
 from adapters.rail_12306_adapter import query_left_tickets
 from services.travel_search import _default_searcher
@@ -34,8 +33,8 @@ from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CN_TZ = ZoneInfo("Asia/Shanghai")
 LIVE_OK_STATUSES = {"success", "alias", "not_configured", "not_requested"}
-PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "opensky", "variflight", "flight_mcp")
-DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "opensky", "variflight")
+PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "variflight", "flight_mcp")
+DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "variflight")
 
 
 def _now_label() -> str:
@@ -52,8 +51,6 @@ def _safe_error(exc: Exception) -> str:
         "VARIFLIGHT_API_KEY",
         "AMADEUS_CLIENT_ID",
         "AMADEUS_CLIENT_SECRET",
-        "OPENSKY_CLIENT_ID",
-        "OPENSKY_CLIENT_SECRET",
     ):
         secret = os.getenv(name, "")
         if secret:
@@ -243,10 +240,6 @@ def _flight_mcp_uses_variflight() -> bool:
     return os.getenv("FLIGHT_MCP_MODE", "").strip().lower() == "variflight"
 
 
-def _flight_mcp_uses_opensky() -> bool:
-    return os.getenv("FLIGHT_MCP_MODE", "").strip().lower() == "opensky"
-
-
 def _check_variflight() -> tuple[str, str, dict[str, Any]]:
     if not is_variflight_configured():
         return "not_configured", "未配置 VariFlight API Key 或有效 API URL。", {}
@@ -299,15 +292,6 @@ def _check_amadeus() -> tuple[str, str, dict[str, Any]]:
     }
 
 
-def _check_opensky() -> tuple[str, str, dict[str, Any]]:
-    statuses = search_opensky_states()
-    return "success", f"OpenSky 返回 {len(statuses)} 架带呼号的实时飞行器状态。", {
-        "count": len(statuses),
-        "fare_or_inventory": False,
-        "scope": "China airspace bounding box",
-    }
-
-
 def run_integration_health_checks(
     *, live: bool = False, only: set[str] | None = None
 ) -> list[IntegrationCheck]:
@@ -345,14 +329,6 @@ def run_integration_health_checks(
                 _check_amadeus if live else lambda: ("not_requested", "未执行实时 Amadeus 检查。", {}),
             )
         )
-    if "opensky" in selected:
-        checks.append(
-            _run(
-                "opensky",
-                is_opensky_configured(),
-                _check_opensky if live else lambda: ("not_requested", "未执行实时 OpenSky 检查。", {}),
-            )
-        )
     if "variflight" in selected:
         checks.append(
             _run(
@@ -376,22 +352,6 @@ def run_integration_health_checks(
                         else "未执行实时 Flight MCP 检查。"
                     ),
                     details={"alias_of": "variflight", "request_skipped": True},
-                )
-            )
-        elif _flight_mcp_uses_opensky():
-            checks.append(
-                IntegrationCheck(
-                    provider="flight_mcp",
-                    status=("alias" if is_flight_mcp_enabled() else "not_configured")
-                    if live
-                    else "not_requested",
-                    configured=is_flight_mcp_enabled(),
-                    message=(
-                        "Flight MCP 复用本轮 OpenSky 检查，未重复请求。"
-                        if live and is_flight_mcp_enabled()
-                        else "未执行实时 Flight MCP 检查。"
-                    ),
-                    details={"alias_of": "opensky", "request_skipped": True},
                 )
             )
         else:
