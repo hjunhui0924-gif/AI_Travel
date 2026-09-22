@@ -524,8 +524,17 @@ def _travel_route_kind(
     # option clicks such as “选择 A” contain no travel keyword themselves, so
     # they must reuse the saved pending requirement instead of falling through
     # to the out-of-scope classifier.
-    if pending_query and re.search(r"(?:选择|选)\s*[A-D](?:\b|$)", str(message or ""), re.IGNORECASE):
-        return "context"
+    if pending_query:
+        if re.search(r"(?:选择|选)\s*[A-D](?:\b|$)", str(message or ""), re.IGNORECASE):
+            return "context"
+        candidates = pending_query.get("place_candidates")
+        if isinstance(candidates, list) and any(
+            isinstance(candidate, dict)
+            and str(candidate.get("candidate_id") or "").strip()
+            and str(candidate.get("candidate_id") or "") in str(message or "")
+            for candidate in candidates
+        ):
+            return "context"
     if _looks_like_unclassified_travel_query(message, attachments):
         return "model_fallback"
     return "out_of_scope"

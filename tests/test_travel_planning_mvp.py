@@ -9,6 +9,7 @@ from services.itinerary_optimizer import optimize_itinerary
 from services.provider_orchestrator import run_provider_orchestrator
 from services.travel_finalizer import finalize_travel_response
 from agents import travel_supervisor
+from agents import agent as agent_runtime
 from services.rail_service import RailOptionsResult
 from services.flight_service import FlightOptionsResult
 from services.poi_recommender import PoiRecommendationResult
@@ -109,6 +110,15 @@ def test_supervisor_executes_independent_transport_tools_in_parallel(monkeypatch
     assert result.decision == "answer"
     assert result.adapter_status["rail"] == "empty"
     assert result.adapter_status["flight"] == "empty"
+
+
+def test_place_candidate_id_follow_up_stays_in_travel_context():
+    pending = {
+        "place_candidates": [{"candidate_id": "place_123", "query_text": "西湖"}],
+        "unresolved_places": ["西湖"],
+    }
+
+    assert agent_runtime._travel_route_kind("place_123", [], pending_query=pending) == "context"
 
 
 def test_itinerary_optimizer_returns_route_segments_for_fastest_order():
