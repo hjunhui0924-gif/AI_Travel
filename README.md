@@ -291,7 +291,6 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 支持的接入方式包括：
 
 - 本地 `bridges/flight_mcp_bridge.py`
-- 官方 Amadeus Flight Offers API（推荐）
 - VariFlight 官方航班 MCP HTTP provider
 - Flight MCP 兼容命令
 - 兼容 HTTP 返回的航班服务
@@ -313,18 +312,6 @@ FLIGHT_MCP_MODE=package
 ```
 
 该模式不需要 VariFlight 余额，但不保证长期可用；国内航线建议把它视为免费实验性抓取源，并保留高铁、路线等其他数据源作为计划事实。
-
-官方 API 示例配置：
-
-```env
-FLIGHT_MCP_ENABLED=true
-FLIGHT_MCP_MODE=amadeus
-AMADEUS_CLIENT_ID=your_client_id
-AMADEUS_CLIENT_SECRET=your_client_secret
-AMADEUS_BASE_URL=https://test.api.amadeus.com
-```
-
-Amadeus 测试环境适合验证接口和字段，不等于生产实时库存；生产环境需要切换官方生产 Base URL，并以账号实际返回的国内航线覆盖为准。
 
 示例配置：
 
@@ -360,12 +347,11 @@ python -m services.integration_health --live
 python -m services.integration_health --live --only amap
 python -m services.integration_health --live --only rail_12306
 python -m services.integration_health --live --only tavily
-python -m services.integration_health --live --only amadeus
 python -m services.integration_health --live --only variflight
 python -m services.integration_health --live --only flight_mcp
 ```
 
-高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。航班查询优先配置 Amadeus，或使用授权的 VariFlight、Flight MCP 和其他官方/合作方航班 API。
+高德和 12306 的请求已经有缓存、节流和总超时；外部接口受限时会保留结构化失败状态，不会伪造 POI、车次或航班。航班查询应配置授权的 VariFlight、Flight MCP 或官方/合作方航班 API。
 
 旅行计划中的路线预览使用高德路径规划返回的折线数据。后端默认通过高德静态地图服务渲染图片，Web Service key 不会下发到浏览器；静态地图请求异常时会返回基于真实路线折线生成的 SVG 示意图。要在浏览器中启用可缩放、可拖拽的高德 JS 地图，请申请 Web 端（JS API）Key 和安全密钥，并在项目根目录 `.env` 配置 `VITE_AMAP_JS_KEY`、`VITE_AMAP_SECURITY_JS_CODE`，然后重新构建前端。浏览器 Key 必须在高德控制台配置域名白名单；没有这两个变量时仍使用静态地图。
 

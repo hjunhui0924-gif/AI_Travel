@@ -11,7 +11,6 @@ from adapters.variflight_adapter import (
     is_variflight_configured,
     search_variflight_flights,
 )
-from adapters.amadeus_adapter import is_amadeus_configured, search_amadeus_flights
 
 
 class FlightQueryError(RuntimeError):
@@ -45,8 +44,6 @@ def is_flight_mcp_enabled() -> bool:
         # credentials are valid.  This lets the planner expose
         # ``not_configured`` instead of a misleading provider failure.
         return is_variflight_configured()
-    if mode == "amadeus":
-        return is_amadeus_configured()
     return bool(mode)
 
 
@@ -181,8 +178,6 @@ def search_flights(origin: str, destination: str, date: str) -> list[dict]:
     mode = _flight_mcp_mode()
     if mode == "variflight":
         return search_variflight_flights(origin, destination, date)
-    if mode == "amadeus":
-        return search_amadeus_flights(origin, destination, date)
 
     if mode in {"command", "auto", "package", "http", "dummy"}:
         bridge_mode = "auto" if mode == "command" else mode

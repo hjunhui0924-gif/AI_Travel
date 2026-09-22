@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 
 from adapters.amap_adapter import plan_route, search_pois, search_pois_around_location
 from adapters.flight_mcp_adapter import is_flight_mcp_enabled, search_flights
-from adapters.amadeus_adapter import is_amadeus_configured, search_amadeus_flights
 from adapters.variflight_adapter import is_variflight_configured, search_variflight_flights
 from adapters.rail_12306_adapter import query_left_tickets
 from services.travel_search import _default_searcher
@@ -33,8 +32,8 @@ from utils.weather_utils import geocode_location, get_amap_weather, has_amap_key
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CN_TZ = ZoneInfo("Asia/Shanghai")
 LIVE_OK_STATUSES = {"success", "alias", "not_configured", "not_requested"}
-PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "variflight", "flight_mcp")
-DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "amadeus", "variflight")
+PROVIDERS = ("amap", "rail_12306", "tavily", "variflight", "flight_mcp")
+DEFAULT_PROVIDERS = ("amap", "rail_12306", "tavily", "variflight")
 
 
 def _now_label() -> str:
@@ -49,8 +48,6 @@ def _safe_error(exc: Exception) -> str:
         "FLIGHT_MCP_HTTP_URL",
         "FLIGHT_MCP_COMMAND",
         "VARIFLIGHT_API_KEY",
-        "AMADEUS_CLIENT_ID",
-        "AMADEUS_CLIENT_SECRET",
     ):
         secret = os.getenv(name, "")
         if secret:
@@ -268,30 +265,6 @@ def _check_variflight() -> tuple[str, str, dict[str, Any]]:
     return status, message, details
 
 
-def _check_amadeus() -> tuple[str, str, dict[str, Any]]:
-    if not is_amadeus_configured():
-        return "not_configured", "未配置 AMADEUS_CLIENT_ID/AMADEUS_CLIENT_SECRET。", {}
-    query_date, origin, destination = _flight_query_parameters()
-    options = search_amadeus_flights(origin, destination, query_date)
-    errors = list(getattr(options, "errors", []) or [])
-    if errors and options:
-        status = "partial"
-        message = f"Amadeus 返回 {len(options)} 条航班，另有部分数据未能标准化。"
-    elif errors:
-        status = "failed"
-        message = "Amadeus 返回结果无法标准化。"
-    else:
-        status = "success" if options else "empty"
-        message = f"Amadeus 返回 {len(options)} 条航班候选。" if options else "Amadeus 请求成功但没有航班候选。"
-    return status, message, {
-        "date": query_date,
-        "origin": origin,
-        "destination": destination,
-        "count": len(options),
-        "errors": errors,
-    }
-
-
 def run_integration_health_checks(
     *, live: bool = False, only: set[str] | None = None
 ) -> list[IntegrationCheck]:
@@ -319,14 +292,6 @@ def run_integration_health_checks(
                 "tavily",
                 bool(os.getenv("TAVILY_API_KEY")),
                 _check_tavily if live else lambda: ("not_requested", "未执行实时 Tavily 检查。", {}),
-            )
-        )
-    if "amadeus" in selected:
-        checks.append(
-            _run(
-                "amadeus",
-                is_amadeus_configured(),
-                _check_amadeus if live else lambda: ("not_requested", "未执行实时 Amadeus 检查。", {}),
             )
         )
     if "variflight" in selected:
