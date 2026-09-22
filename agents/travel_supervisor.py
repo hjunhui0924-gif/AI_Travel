@@ -11,15 +11,17 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any
 
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool, tool
 
+from adapters.flight_mcp_adapter import get_flight_statuses, is_opensky_mode
 from agents.schemas import (
     Evidence,
+    OpenSkyFlightStatus,
     PlaceCandidate,
     PoiGroup,
     PoiRecommendation,
@@ -79,6 +81,7 @@ class TravelSupervisorResult:
     query: TravelQuery
     tool_calls: list[SupervisorToolCall] = field(default_factory=list)
     transport_options: list[TransportOption] = field(default_factory=list)
+    flight_statuses: list[OpenSkyFlightStatus] = field(default_factory=list)
     transport_pages: list[TransportPage] = field(default_factory=list)
     route_plans: list[RoutePlan] = field(default_factory=list)
     poi_items: list[PoiRecommendation] = field(default_factory=list)
@@ -106,6 +109,7 @@ class TravelSupervisorResult:
     def has_provider_data(self) -> bool:
         return bool(
             self.transport_options
+            or self.flight_statuses
             or any(len(route.polyline) >= 2 for route in self.route_plans)
             or any(item.source_ids and not item.is_placeholder for item in self.poi_items)
             or self.weather_summary.strip()
@@ -512,13 +516,26 @@ def run_travel_supervisor(
 
     @tool
     def search_flight() -> str:
-        """查询当前出发地到目的地的航班、价格和查询时库存；只在用户需要飞机/航班时调用。"""
+        """查询航班数据；官方/票务 provider 可返回价格候选，OpenSky 模式只返回当前实时飞行器状态，不含未来票价或余票。"""
         if query.intent == "rail_query" or query.travel_mode == "rail":
             raise ValueError("当前需求只允许查询铁路。")
         if not query.origin or not query.destination or not query.date:
             raise ValueError("缺少出发地、目的地或日期，无法查询航班。")
         active_query = query_for_mode("flight")
         provider_log("tool", "查询航班", f"{active_query.origin} → {active_query.destination}", "running")
+        if is_opensky_mode():
+            provider_result = get_flight_statuses()
+            statuses = list(provider_result)
+            collector["flight_statuses"] = provider_result
+            result.adapter_status["flight"] = "success" if statuses else "empty"
+            provider_log("tool", "实时航班状态查询完成", f"返回 {len(statuses)} 架", "completed")
+            return _json_result({
+                "provider": "OpenSky",
+                "mode": "live_status",
+                "count": len(statuses),
+                "fare_or_inventory": False,
+                "statuses": [asdict(item) for item in statuses[:50]],
+            })
         provider_result = get_flight_options(active_query)
         options = list(provider_result)
         collector["flight_result"] = provider_result
@@ -872,6 +889,7 @@ def run_travel_supervisor(
             )
         )
         result.diagnostics.extend(list(getattr(flight_result, "errors", []) or []))
+    result.flight_statuses = list(collector.get("flight_statuses") or [])
     result.route_plans = list(collector.get("route_result") or [])
     result.poi_items = list(collector.get("poi_items") or [])
     result.poi_groups = list(collector.get("poi_groups") or [])

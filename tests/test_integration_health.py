@@ -56,3 +56,18 @@ def test_health_check_does_not_query_variflight_twice_for_flight_mcp_alias(monke
         "variflight": "success",
         "flight_mcp": "alias",
     }
+
+
+def test_live_health_check_reports_opensky_status(monkeypatch):
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "opensky")
+    monkeypatch.setattr(
+        integration_health,
+        "search_opensky_states",
+        lambda: [{"callsign": "CA123"}, {"callsign": "MU456"}],
+    )
+
+    checks = integration_health.run_integration_health_checks(live=True, only={"opensky"})
+
+    assert checks[0].provider == "opensky"
+    assert checks[0].status == "success"
+    assert checks[0].details["count"] == 2

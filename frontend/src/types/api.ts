@@ -114,6 +114,23 @@ export interface TransportOption {
   source_ids: string[];
 }
 
+export interface OpenSkyFlightStatus {
+  icao24: string;
+  callsign: string;
+  origin_country: string;
+  observed_at: string;
+  last_contact_at: string;
+  longitude: number | null;
+  latitude: number | null;
+  baro_altitude_m: number | null;
+  geo_altitude_m: number | null;
+  velocity_mps: number | null;
+  heading_deg: number | null;
+  vertical_rate_mps: number | null;
+  on_ground: boolean | null;
+  source_id: string;
+}
+
 export interface TransportPage {
   mode: "rail" | "flight" | string;
   offset: number;
@@ -416,6 +433,7 @@ export interface DonePayload {
   daily_weather?: DailyWeather[];
   care_reminders?: CareReminder[];
   provider_meta?: Record<string, ProviderMeta>;
+  flight_statuses?: OpenSkyFlightStatus[];
   transport_options?: TransportOption[];
   transport_page?: TransportPage | null;
   attachments: { name: string; modality: string }[];

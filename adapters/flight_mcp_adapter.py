@@ -12,6 +12,7 @@ from adapters.variflight_adapter import (
     search_variflight_flights,
 )
 from adapters.amadeus_adapter import is_amadeus_configured, search_amadeus_flights
+from adapters.opensky_adapter import OpenSkyResults, is_opensky_configured, search_opensky_states
 
 
 class FlightQueryError(RuntimeError):
@@ -38,6 +39,22 @@ def _flight_mcp_mode() -> str:
     return ""
 
 
+def flight_provider_mode() -> str:
+    """Return the explicitly selected flight provider mode."""
+
+    return _flight_mcp_mode()
+
+
+def is_opensky_mode() -> bool:
+    return _flight_mcp_mode() == "opensky"
+
+
+def get_flight_statuses() -> OpenSkyResults:
+    if not is_opensky_mode():
+        return OpenSkyResults()
+    return search_opensky_states()
+
+
 def is_flight_mcp_enabled() -> bool:
     mode = _flight_mcp_mode()
     if mode == "variflight":
@@ -47,6 +64,8 @@ def is_flight_mcp_enabled() -> bool:
         return is_variflight_configured()
     if mode == "amadeus":
         return is_amadeus_configured()
+    if mode == "opensky":
+        return is_opensky_configured()
     return bool(mode)
 
 
@@ -183,6 +202,10 @@ def search_flights(origin: str, destination: str, date: str) -> list[dict]:
         return search_variflight_flights(origin, destination, date)
     if mode == "amadeus":
         return search_amadeus_flights(origin, destination, date)
+    if mode == "opensky":
+        # OpenSky has no future fare/seat offers. Callers that need live
+        # aircraft states must use get_flight_statuses().
+        return []
 
     if mode in {"command", "auto", "package", "http", "dummy"}:
         bridge_mode = "auto" if mode == "command" else mode

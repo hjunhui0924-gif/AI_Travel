@@ -292,6 +292,7 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 
 - 本地 `bridges/flight_mcp_bridge.py`
 - 官方 Amadeus Flight Offers API（推荐）
+- OpenSky 实时飞行器状态（免费/可选）
 - VariFlight 官方航班 MCP HTTP provider
 - Flight MCP 兼容命令
 - 兼容 HTTP 返回的航班服务
@@ -325,6 +326,16 @@ AMADEUS_BASE_URL=https://test.api.amadeus.com
 ```
 
 Amadeus 测试环境适合验证接口和字段，不等于生产实时库存；生产环境需要切换官方生产 Base URL，并以账号实际返回的国内航线覆盖为准。
+
+如果暂时没有票价/库存 API，可启用 OpenSky：
+
+```env
+FLIGHT_MCP_ENABLED=true
+FLIGHT_MCP_MODE=opensky
+OPENSKY_CREDENTIALS_FILE=D:\Website\Downloads\credentials.json
+```
+
+OpenSky 只提供当前空域中的 ADS-B 状态（呼号、位置、高度、速度、航向等），不提供未来航班时刻、票价、舱位或余票。项目会在回复中明确这一限制，不把实时飞行器状态当成可购票候选。
 
 示例配置：
 
@@ -361,6 +372,7 @@ python -m services.integration_health --live --only amap
 python -m services.integration_health --live --only rail_12306
 python -m services.integration_health --live --only tavily
 python -m services.integration_health --live --only amadeus
+python -m services.integration_health --live --only opensky
 python -m services.integration_health --live --only variflight
 python -m services.integration_health --live --only flight_mcp
 ```

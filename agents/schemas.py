@@ -210,6 +210,26 @@ class TransportOption:
 
 
 @dataclass(slots=True)
+class OpenSkyFlightStatus:
+    """A live aircraft state; never represents a future ticket offer."""
+
+    icao24: str
+    callsign: str = ""
+    origin_country: str = ""
+    observed_at: str = ""
+    last_contact_at: str = ""
+    longitude: float | None = None
+    latitude: float | None = None
+    baro_altitude_m: float | None = None
+    geo_altitude_m: float | None = None
+    velocity_mps: float | None = None
+    heading_deg: float | None = None
+    vertical_rate_mps: float | None = None
+    on_ground: bool | None = None
+    source_id: str = ""
+
+
+@dataclass(slots=True)
 class TransportPage:
     """Pagination metadata for provider-backed transport candidates."""
 
@@ -480,6 +500,7 @@ class TravelPlanResponse:
     care_reminders: list[CareReminder] = field(default_factory=list)
     provider_meta: dict[str, ProviderMeta] = field(default_factory=dict)
     risks: list[str] = field(default_factory=list)
+    flight_statuses: list[OpenSkyFlightStatus] = field(default_factory=list)
 
 
 @dataclass(slots=True)

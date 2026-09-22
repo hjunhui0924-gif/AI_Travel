@@ -4,7 +4,8 @@ import time
 
 from langchain.messages import AIMessage
 
-from agents.schemas import PlaceCandidate, PoiRecommendation, RoutePlan, TravelPlan, TravelPlanResponse, TravelQuery
+from agents.schemas import OpenSkyFlightStatus, PlaceCandidate, PoiRecommendation, RoutePlan, TravelPlan, TravelPlanResponse, TravelQuery
+from agents import travel_agent
 from services.itinerary_optimizer import optimize_itinerary
 from services.provider_orchestrator import run_provider_orchestrator
 from services.travel_finalizer import finalize_travel_response
@@ -119,6 +120,37 @@ def test_place_candidate_id_follow_up_stays_in_travel_context():
     }
 
     assert agent_runtime._travel_route_kind("place_123", [], pending_query=pending) == "context"
+
+
+def test_opensky_flight_query_returns_live_status_without_ticket_claims(monkeypatch):
+    monkeypatch.setattr(travel_agent, "is_opensky_mode", lambda: True)
+    monkeypatch.setattr(
+        travel_agent,
+        "get_flight_statuses",
+        lambda: [
+            OpenSkyFlightStatus(
+                icao24="abc123",
+                callsign="CA123",
+                origin_country="China",
+                latitude=39.9,
+                longitude=116.4,
+                on_ground=False,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        travel_agent,
+        "get_flight_options",
+        lambda _query: (_ for _ in ()).throw(AssertionError("OpenSky mode must not request ticket offers")),
+    )
+
+    response = travel_agent.plan_travel("2026-09-02 从上海到杭州查航班", [], search_enabled=False)
+    rendered = travel_agent.render_travel_response(response)
+
+    assert response.trip_plan is None
+    assert len(response.flight_statuses) == 1
+    assert "不提供未来航班票价、余票" in rendered
+    assert not any("未获取到可用航班结果" in alert for alert in response.alerts)
 
 
 def test_itinerary_optimizer_returns_route_segments_for_fastest_order():

@@ -1232,6 +1232,7 @@ def _stream_travel_response(
             "decision_reason": response.decision_reason,
             "retryable": response.retryable,
             "retry_reason": response.retry_reason,
+            "flight_statuses": [asdict(item) for item in response.flight_statuses],
         },
         cancellation_check=cancellation_check,
     )
