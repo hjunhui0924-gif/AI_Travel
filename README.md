@@ -290,28 +290,11 @@ GET /travel/plans/{thread_id}/transport?mode=rail|flight&offset=5&limit=5
 
 支持的接入方式包括：
 
-- 本地 `bridges/flight_mcp_bridge.py`
+- Flight MCP 兼容命令/HTTP bridge
 - VariFlight 官方航班 MCP HTTP provider
 - Flight MCP 兼容命令
 - 兼容 HTTP 返回的航班服务
 - 本地演示 dummy 数据（仅测试，默认禁止）
-
-本地 `flight-ticket-mcp-server` 包可通过 `FLIGHT_MCP_MODE=package` 显式启用，但它依赖浏览器抓取航班网页，不是官方航班 API。若页面被风控、结构变更或无法解析，系统必须显示 provider 失败，不能把空结果解释为“没有航班”。本机实测该模式当前会超时或找不到航班容器，因此不建议作为默认生产数据源。
-
-本机测试安装方式：
-
-```powershell
-python -m pip install "flight-ticket-mcp-server==1.0.1" DrissionPage
-```
-
-然后配置：
-
-```env
-FLIGHT_MCP_ENABLED=true
-FLIGHT_MCP_MODE=package
-```
-
-该模式不需要 VariFlight 余额，但不保证长期可用；国内航线建议把它视为免费实验性抓取源，并保留高铁、路线等其他数据源作为计划事实。
 
 示例配置：
 
@@ -325,7 +308,7 @@ VARIFLIGHT_MAX_RETRIES=1
 ```
 
 `FLIGHT_MCP_MODE=variflight` must be explicit; a VariFlight key will not silently
-override an existing command/package/http provider. Unknown three-letter codes
+override an existing command/http provider. Unknown three-letter codes
 are rejected instead of being sent as city codes. Extend the built-in map with
 `VARIFLIGHT_CITY_CODE_ALIASES_JSON`, for example `{"LJG":"LJG"}`.
 

@@ -33,7 +33,7 @@ def _flight_mcp_mode() -> str:
         return explicit_mode
     enabled = os.getenv("FLIGHT_MCP_ENABLED", "").strip().lower()
     if enabled in {"1", "true", "yes", "on"} and _default_bridge_command():
-        return "auto"
+        return "command"
     return ""
 
 
@@ -63,7 +63,7 @@ def _search_flights_via_command(
     origin: str,
     destination: str,
     date: str,
-    bridge_mode: str = "auto",
+    bridge_mode: str = "http",
 ) -> list[dict]:
     configured_command = os.getenv("FLIGHT_MCP_COMMAND", "").strip()
     command = configured_command or _default_bridge_command()
@@ -179,8 +179,8 @@ def search_flights(origin: str, destination: str, date: str) -> list[dict]:
     if mode == "variflight":
         return search_variflight_flights(origin, destination, date)
 
-    if mode in {"command", "auto", "package", "http", "dummy"}:
-        bridge_mode = "auto" if mode == "command" else mode
+    if mode in {"command", "http", "dummy"}:
+        bridge_mode = "http" if mode == "command" else mode
         return _search_flights_via_command(origin, destination, date, bridge_mode=bridge_mode)
 
     raise FlightQueryError(f"Unsupported FLIGHT_MCP_MODE: {mode}")

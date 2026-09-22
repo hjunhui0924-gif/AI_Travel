@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -35,100 +33,6 @@ def _normalize_city(value: str) -> str:
     return (value or "").strip()
 
 
-def _normalize_flight_no(item: dict) -> str:
-    return (
-        item.get("flight_no")
-        or item.get("flightNumber")
-        or item.get("flight_number")
-        or item.get("航班号")
-        or "Flight"
-    )
-
-
-def _normalize_depart_time(item: dict) -> str:
-    return (
-        item.get("depart_time")
-        or item.get("departure_time")
-        or item.get("takeoff_time")
-        or item.get("出发时间")
-        or ""
-    )
-
-
-def _normalize_arrive_time(item: dict) -> str:
-    return (
-        item.get("arrive_time")
-        or item.get("arrival_time")
-        or item.get("landing_time")
-        or item.get("到达时间")
-        or ""
-    )
-
-
-def _normalize_price(item: dict) -> str:
-    return str(
-        item.get("price")
-        or item.get("lowest_price")
-        or item.get("价格")
-        or item.get("票价")
-        or ""
-    )
-
-
-def _normalize_duration(item: dict) -> str:
-    return item.get("duration") or item.get("飞行时长") or ""
-
-
-def _normalize_summary(item: dict) -> str:
-    return (
-        item.get("summary")
-        or item.get("route")
-        or item.get("formatted_output")
-        or "FlightTicketMCP package result"
-    )
-
-
-def _normalize_provider(item: dict, provider: str) -> str:
-    return item.get("provider") or provider
-
-
-def _normalize_airline(item: dict) -> str:
-    return item.get("airline") or item.get("company") or item.get("航空公司") or ""
-
-
-def _normalize_cabin(item: dict) -> str:
-    return item.get("cabin") or item.get("seat_class") or item.get("舱位") or ""
-
-
-def _normalize_airport(item: dict) -> str:
-    airport_parts = [
-        item.get("airport", ""),
-        item.get("departure_airport", ""),
-        item.get("arrival_airport", ""),
-        item.get("出发机场", ""),
-        item.get("到达机场", ""),
-    ]
-    return " -> ".join([part for part in airport_parts if part])
-
-
-def _normalize_flight_item(item: dict, origin: str, destination: str, provider: str) -> dict:
-    return {
-        "flight_no": _normalize_flight_no(item),
-        "origin": origin,
-        "destination": destination,
-        "depart_time": _normalize_depart_time(item),
-        "arrive_time": _normalize_arrive_time(item),
-        "duration": _normalize_duration(item),
-        "price": _normalize_price(item),
-        "summary": _normalize_summary(item),
-        "provider": _normalize_provider(item, provider),
-        "airline": _normalize_airline(item),
-        "cabin": _normalize_cabin(item),
-        "airport": _normalize_airport(item),
-        "is_demo": bool(item.get("is_demo", False)),
-    }
-
-
 def _dummy_response(origin: str, destination: str, date: str) -> list[dict]:
     return [
         {
@@ -140,7 +44,7 @@ def _dummy_response(origin: str, destination: str, date: str) -> list[dict]:
             "duration": "1h50m",
             "price": "680",
             "summary": "bridge fallback demo flight",
-            "provider": "FlightTicketMCP-bridge-fallback",
+            "provider": "FlightBridge-demo",
             "airline": "China Eastern",
             "cabin": "Economy",
             "is_demo": True,
@@ -175,56 +79,6 @@ def _search_via_http(origin: str, destination: str, date: str) -> list[dict]:
     return []
 
 
-def _search_via_installed_package(origin: str, destination: str, date: str) -> list[dict]:
-    from flight_ticket_mcp_server.tools.flight_search_tools import get_airport_code, searchFlightRoutes
-
-    departure_code = get_airport_code(origin) or origin
-    destination_code = get_airport_code(destination) or destination
-
-    sink = io.StringIO()
-    with redirect_stdout(sink), redirect_stderr(sink):
-        payload = searchFlightRoutes(departure_code, destination_code, date)
-
-    if not isinstance(payload, dict):
-        raise FlightBridgeError("FlightTicketMCP returned a non-object payload")
-    if payload.get("status") != "success":
-        error_code = payload.get("error_code") or "PROVIDER_ERROR"
-        message = payload.get("message") or "FlightTicketMCP returned an error"
-        raise FlightBridgeError(f"{error_code}: {message}")
-
-    items = []
-    for key in ("flights", "items", "results", "data"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            items = [item for item in value if isinstance(item, dict)]
-            break
-
-    normalized = []
-    for item in items:
-        normalized.append(_normalize_flight_item(item, origin, destination, "FlightTicketMCP"))
-    transcript = sink.getvalue()
-    if not normalized and any(
-        marker in transcript
-        for marker in ("航班容器未找到", "航班内容加载", "无法找到航班")
-    ):
-        raise FlightBridgeError(
-            "FlightTicketMCP page parser found no flight container; the source page may be blocked or changed"
-        )
-    return normalized
-
-
-def _search_via_auto(origin: str, destination: str, date: str) -> list[dict]:
-    try:
-        flights = _search_via_installed_package(origin, destination, date)
-    except Exception as exc:
-        raise FlightBridgeError(f"package:{type(exc).__name__}:{exc}") from exc
-
-    if flights:
-        return flights
-    # An empty result is safer than inventing a bookable-looking flight.
-    return []
-
-
 def main() -> int:
     try:
         payload = _read_payload()
@@ -234,15 +88,11 @@ def main() -> int:
         if not origin or not destination or not date:
             raise ValueError("origin, destination, and date are required")
 
-        mode = os.getenv("FLIGHT_BRIDGE_MODE", "auto").strip().lower()
+        mode = os.getenv("FLIGHT_BRIDGE_MODE", "http").strip().lower()
         if mode == "http":
             flights = _search_via_http(origin, destination, date)
-        elif mode == "package":
-            flights = _search_via_installed_package(origin, destination, date)
         elif mode == "variflight":
             flights = search_variflight_flights(origin, destination, date)
-        elif mode == "auto":
-            flights = _search_via_auto(origin, destination, date)
         elif mode == "dummy" and os.getenv("FLIGHT_ALLOW_DEMO_DATA", "").strip().lower() in {"1", "true", "yes", "on"}:
             flights = _dummy_response(origin, destination, date)
         else:

@@ -1,7 +1,5 @@
 import pytest
 import subprocess
-import sys
-import types
 
 from adapters import flight_mcp_adapter
 from bridges import flight_mcp_bridge
@@ -13,40 +11,6 @@ def test_flight_mcp_is_off_without_explicit_configuration(monkeypatch):
 
     assert flight_mcp_adapter.is_flight_mcp_enabled() is False
     assert flight_mcp_adapter.search_flights("上海", "杭州", "2026-09-02") == []
-
-
-def test_auto_bridge_does_not_invent_demo_flight(monkeypatch):
-    monkeypatch.setattr(flight_mcp_bridge, "_search_via_installed_package", lambda *args: [])
-
-    assert flight_mcp_bridge._search_via_auto("SHA", "HGH", "2026-09-02") == []
-
-
-def test_auto_bridge_surfaces_provider_failure(monkeypatch):
-    monkeypatch.setattr(
-        flight_mcp_bridge,
-        "_search_via_installed_package",
-        lambda *args: (_ for _ in ()).throw(RuntimeError("package unavailable")),
-    )
-
-    with pytest.raises(flight_mcp_bridge.FlightBridgeError) as exc_info:
-        flight_mcp_bridge._search_via_auto("SHA", "HGH", "2026-09-02")
-
-    assert "package unavailable" in str(exc_info.value)
-
-
-def test_package_bridge_rejects_empty_result_when_page_parser_reports_missing_container(monkeypatch):
-    fake_tools = types.ModuleType("flight_ticket_mcp_server.tools.flight_search_tools")
-    fake_tools.get_airport_code = lambda value: value
-
-    def fake_search(*_args):
-        print("❌ 航班容器未找到")
-        return {"status": "success", "flights": []}
-
-    fake_tools.searchFlightRoutes = fake_search
-    monkeypatch.setitem(sys.modules, "flight_ticket_mcp_server.tools.flight_search_tools", fake_tools)
-
-    with pytest.raises(flight_mcp_bridge.FlightBridgeError, match="page parser found no flight container"):
-        flight_mcp_bridge._search_via_installed_package("SHA", "HGH", "2026-09-29")
 
 
 def test_flight_command_timeout_is_reported_and_process_tree_is_terminated(monkeypatch):
@@ -106,8 +70,8 @@ def test_variflight_mode_is_not_enabled_without_provider_credentials(monkeypatch
 
 def test_explicit_legacy_flight_mode_wins_over_variflight_credentials(monkeypatch):
     monkeypatch.setenv("FLIGHT_MCP_ENABLED", "true")
-    monkeypatch.setenv("FLIGHT_MCP_MODE", "package")
+    monkeypatch.setenv("FLIGHT_MCP_MODE", "command")
     monkeypatch.setenv("VARIFLIGHT_API_KEY", "test-key")
     monkeypatch.setenv("VARIFLIGHT_API_URL", "https://example.test/mcp")
 
-    assert flight_mcp_adapter._flight_mcp_mode() == "package"
+    assert flight_mcp_adapter._flight_mcp_mode() == "command"
