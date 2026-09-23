@@ -1098,7 +1098,8 @@ def _build_structured_plan(
             )
         )
 
-    for index, poi in enumerate(planned_pois[: min(16, max(4, len(days) * 4))]):
+    poi_limit = len(planned_pois) if query.named_places else min(16, max(4, len(days) * 4))
+    for index, poi in enumerate(planned_pois[:poi_limit]):
         schedule = optimization.schedule.get(poi.provider_id or poi.name) if optimization else None
         scheduled_day = schedule[0] if schedule else ""
         day = next((item for item in days if item.date == scheduled_day), days[index % len(days)])
