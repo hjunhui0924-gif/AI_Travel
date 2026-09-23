@@ -45,6 +45,10 @@ def _parse_distance_meters(value: str) -> int:
     return 10**9
 
 
+def _route_duration_minutes(route: RoutePlan) -> int:
+    return route.duration_minutes if route.duration_minutes is not None else _parse_duration_minutes(route.duration)
+
+
 def _resolve_places(city: str, places: list[str]) -> list[dict]:
     resolved_places = []
     for place in places:
@@ -125,6 +129,23 @@ def get_route_plans(query: TravelQuery) -> RoutePlansResult:
                     origin_location=payload.get("origin_location", start.get("location", "")),
                     destination_location=payload.get("destination_location", end.get("location", "")),
                     polyline=payload.get("polyline", []) if isinstance(payload.get("polyline", []), list) else [],
+                    duration_minutes=(
+                        int(payload["duration_minutes"])
+                        if str(payload.get("duration_minutes", "")).isdigit()
+                        else _parse_duration_minutes(payload.get("duration", ""))
+                    ),
+                    distance_meters=(
+                        int(payload["distance_meters"])
+                        if str(payload.get("distance_meters", "")).isdigit()
+                        else _parse_distance_meters(payload.get("distance", ""))
+                    ),
+                    estimated_cost=(
+                        float(payload["estimated_cost"])
+                        if payload.get("estimated_cost") not in (None, "")
+                        else None
+                    ),
+                    cost_currency=str(payload.get("cost_currency") or ""),
+                    cost_scope=str(payload.get("cost_scope") or ""),
                 )
             )
 
@@ -137,7 +158,7 @@ def get_route_plans(query: TravelQuery) -> RoutePlansResult:
                 usable.append(item)
             if not usable:
                 usable = [item for item in candidates if item.mode != "walking"] or candidates
-            best = min(usable, key=lambda item: _parse_duration_minutes(item.duration))
+            best = min(usable, key=_route_duration_minutes)
             results.append(best)
 
     results.errors = errors

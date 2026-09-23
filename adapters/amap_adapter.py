@@ -270,17 +270,27 @@ def plan_route(origin: str, destination: str, strategy: str = "walking") -> dict
     polyline = _downsample_points(_collect_polyline_points(best))
     distance = best.get("distance", "")
     duration = best.get("duration", "")
+    distance_meters = int(distance) if str(distance).isdigit() else None
+    duration_minutes = max(1, round(int(duration) / 60)) if str(duration).isdigit() else None
     if duration and str(duration).isdigit():
-        minutes = max(1, round(int(duration) / 60))
-        duration = f"{minutes} 分钟"
+        duration = f"{duration_minutes} 分钟"
 
     summary = ""
+    estimated_cost = None
+    cost_currency = ""
+    cost_scope = ""
     if strategy == "transit":
         cost = best.get("cost", "")
         walking_distance = best.get("walking_distance", "")
         parts = []
         if cost:
             parts.append(f"票价 {cost}")
+            try:
+                estimated_cost = float(str(cost).replace(",", ""))
+                cost_currency = "CNY"
+                cost_scope = "route"
+            except ValueError:
+                estimated_cost = None
         if walking_distance:
             parts.append(f"步行 {walking_distance} 米")
         summary = " | ".join(parts)
@@ -296,6 +306,11 @@ def plan_route(origin: str, destination: str, strategy: str = "walking") -> dict
         "distance": f"{distance} 米" if distance and str(distance).isdigit() else str(distance),
         "duration": duration,
         "summary": summary,
+        "duration_minutes": duration_minutes,
+        "distance_meters": distance_meters,
+        "estimated_cost": estimated_cost,
+        "cost_currency": cost_currency,
+        "cost_scope": cost_scope,
         "origin_location": origin_location,
         "destination_location": destination_location,
         "polyline": polyline,

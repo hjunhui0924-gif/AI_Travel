@@ -104,6 +104,8 @@ def test_amap_route_normalizes_step_polylines(monkeypatch):
     assert result is not None
     assert result["origin_location"] == "120.121358,30.222692"
     assert result["destination_location"] == "120.101406,30.240826"
+    assert result["distance_meters"] == 2450
+    assert result["duration_minutes"] == 15
     assert result["polyline"] == [
         [120.121358, 30.222692],
         [120.115, 30.23],

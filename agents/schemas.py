@@ -292,6 +292,13 @@ class RoutePlan:
     origin_location: str = ""
     destination_location: str = ""
     polyline: list[list[float]] = field(default_factory=list)
+    # Numeric route facts are kept separate from display strings. Optimizers
+    # must never infer cost or duration by scraping summary text.
+    duration_minutes: int | None = None
+    distance_meters: int | None = None
+    estimated_cost: float | None = None
+    cost_currency: str = ""
+    cost_scope: str = ""
 
 
 @dataclass(slots=True)

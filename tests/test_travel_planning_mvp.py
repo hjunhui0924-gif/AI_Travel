@@ -238,7 +238,11 @@ def test_itinerary_optimizer_rejects_closed_place_window():
     # A query whose first place can never be entered in the available window.
     places[0].opening_windows = [
         __import__("agents.schemas", fromlist=["OpeningWindow"]).OpeningWindow(
-            date="2026-10-01", open_time="18:00", close_time="18:30", last_entry_time="18:00"
+            date="2026-10-01",
+            open_time="09:00",
+            close_time="18:30",
+            last_entry_time="18:00",
+            closed_reason="closed",
         )
     ]
     routes = [
@@ -251,6 +255,45 @@ def test_itinerary_optimizer_rejects_closed_place_window():
     assert result.ordered_places
     assert any(item.code == "no_feasible_order" for item in result.diagnostics)
     assert result.conflicts
+
+
+def test_itinerary_optimizer_does_not_parse_route_summary_as_cost():
+    places = [
+        PoiRecommendation(name="A", category="景点", provider_id="a", source_ids=["a"]),
+        PoiRecommendation(name="B", category="景点", provider_id="b", source_ids=["b"]),
+    ]
+    result = optimize_itinerary(
+        _query(named_places=["A", "B"]),
+        places,
+        [
+            RoutePlan(
+                mode="transit",
+                origin="A",
+                destination="B",
+                duration="35 分钟",
+                distance="800 米",
+                summary="公交约35分钟，步行800米",
+                duration_minutes=35,
+                distance_meters=800,
+                estimated_cost=None,
+            )
+        ],
+    )
+
+    assert result.route_segments[0].estimated_cost is None
+
+
+def test_itinerary_optimizer_does_not_silently_drop_explicit_places():
+    names = ["A", "B", "C", "D", "E", "F"]
+    places = [
+        PoiRecommendation(name=name, category="景点", provider_id=name.lower(), source_ids=[name.lower()])
+        for name in names
+    ]
+
+    result = optimize_itinerary(_query(named_places=names), places, [])
+
+    assert [item.name for item in result.ordered_places] == names
+    assert any(item.code == "no_feasible_order" for item in result.diagnostics)
 
 
 def test_finalizer_falls_back_when_model_introduces_unknown_date(monkeypatch):

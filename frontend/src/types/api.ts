@@ -136,6 +136,11 @@ export interface RoutePlan {
   origin_location: string;
   destination_location: string;
   polyline: [number, number][];
+  duration_minutes?: number | null;
+  distance_meters?: number | null;
+  estimated_cost?: number | null;
+  cost_currency?: string;
+  cost_scope?: string;
 }
 
 export interface ProviderMeta {

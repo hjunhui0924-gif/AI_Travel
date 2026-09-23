@@ -251,6 +251,11 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
                     "origin_location": "",
                     "destination_location": "",
                     "polyline": [],
+                    "duration_minutes": None,
+                    "distance_meters": None,
+                    "estimated_cost": None,
+                    "cost_currency": "",
+                    "cost_scope": "",
                 },
             )
             normalized_polyline: list[list[float]] = []

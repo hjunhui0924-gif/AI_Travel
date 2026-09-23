@@ -55,10 +55,12 @@ def _distance_meters(value: object) -> int | None:
     return int(match.group(0)) if match else None
 
 
-def _cost_value(value: object) -> float | None:
-    text = str(value or "")
-    match = re.search(r"\d+(?:\.\d+)?", text.replace(",", ""))
-    return float(match.group(0)) if match else None
+def _route_duration(route: RoutePlan) -> int | None:
+    return route.duration_minutes if route.duration_minutes is not None else _duration_minutes(route.duration)
+
+
+def _route_distance(route: RoutePlan) -> int | None:
+    return route.distance_meters if route.distance_meters is not None else _distance_meters(route.distance)
 
 
 def _place_id(place: PoiRecommendation) -> str:
@@ -107,7 +109,11 @@ def _candidate_places(query: TravelQuery, places: list[PoiRecommendation]) -> li
             matches = [item for item in usable if requested in item.name or item.name in requested]
             if matches:
                 ordered.append(matches[0])
-        usable = ordered or usable
+        # Explicit user landmarks are a hard coverage requirement. If one is
+        # missing from verified POI data, keep the verified subset and let the
+        # caller expose a conflict instead of replacing it with a nearby
+        # restaurant or arbitrary recommendation.
+        usable = ordered
     seen: set[str] = set()
     result: list[PoiRecommendation] = []
     for item in usable:
@@ -116,8 +122,6 @@ def _candidate_places(query: TravelQuery, places: list[PoiRecommendation]) -> li
             continue
         seen.add(identifier)
         result.append(item)
-        if len(result) >= MAX_ENUMERATED_PLACES:
-            break
     return result
 
 
@@ -149,16 +153,15 @@ def _score_order(
             missing_edges += 1
             total_time += 10_000
             continue
-        duration = _duration_minutes(route.duration) or 10_000
+        duration = _route_duration(route) or 10_000
         total_time += duration
-        distance = _distance_meters(route.distance) or 0
+        distance = _route_distance(route) or 0
         if route.mode == "walking":
             total_walking += duration
         elif "步行" in route.summary:
             total_walking += max(1, round(distance / 80))
-        price = _cost_value(route.summary)
-        if price is not None:
-            total_cost += price
+        if route.estimated_cost is not None:
+            total_cost += route.estimated_cost
         selected_routes.append(route)
     pace_penalty = max(0, len(order) - 3) * (1 if query.pace == "relaxed" else 0)
     score = (
@@ -202,11 +205,14 @@ def _simulate_schedule(
             if route is None:
                 conflicts.append(f"地点“{previous.name}”与“{place.name}”之间缺少已验证路线。")
                 return False, {}, conflicts
-            transit_minutes = _duration_minutes(route.duration) or 10_000
+            transit_minutes = _route_duration(route) or 10_000
             day_transit[day] += transit_minutes
             cursor += transit_minutes + DEFAULT_BUFFER_MINUTES
         window = _window_for(place, day)
         if window is not None:
+            if window.closed_reason:
+                conflicts.append(f"地点“{place.name}”在 {day} 不可安排：{window.closed_reason}。")
+                return False, {}, conflicts
             open_at = _time_to_minutes(window.open_time, 0)
             close_at = _time_to_minutes(window.close_time, 24 * 60 - 1)
             cursor = max(cursor, open_at)
@@ -239,6 +245,17 @@ def optimize_itinerary(
     routes = list(route_plans or [])
     matrix = _route_matrix(routes)
     diagnostics: list[OptimizationDiagnostic] = []
+    if query.named_places:
+        matched = {item.name for item in candidates}
+        missing = [item for item in query.named_places if item not in matched]
+        if missing:
+            diagnostics.append(
+                OptimizationDiagnostic(
+                    "required_places_missing",
+                    "以下用户指定地点没有通过地图/POI验证，未用其他地点替换：" + "、".join(missing),
+                    "warning",
+                )
+            )
     if len(candidates) > MAX_ENUMERATED_PLACES:
         diagnostics.append(
             OptimizationDiagnostic("beam_search_fallback", "地点超过 5 个，已截取前 5 个候选进行 MVP 排序。", "warning")
@@ -298,7 +315,7 @@ def optimize_itinerary(
         if route is None:
             continue
         day = schedule.get(_place_id(destination), (query.start_date, "", ""))[0]
-        duration = _duration_minutes(route.duration)
+        duration = _route_duration(route)
         segments.append(
             RouteSegment(
                 segment_id="segment_" + sha1(f"{origin.name}|{destination.name}|{day}".encode()).hexdigest()[:12],
@@ -306,9 +323,13 @@ def optimize_itinerary(
                 origin_place_id=_place_id(origin),
                 destination_place_id=_place_id(destination),
                 mode=route.mode,
-                distance_meters=_distance_meters(route.distance),
+                distance_meters=_route_distance(route),
                 duration_minutes=duration,
-                estimated_cost=str(_cost_value(route.summary)) if _cost_value(route.summary) is not None else None,
+                estimated_cost=(
+                    str(route.estimated_cost)
+                    if route.estimated_cost is not None
+                    else None
+                ),
                 buffer_minutes=DEFAULT_BUFFER_MINUTES,
                 walking_minutes=duration if route.mode == "walking" else None,
                 source_ids=[],
