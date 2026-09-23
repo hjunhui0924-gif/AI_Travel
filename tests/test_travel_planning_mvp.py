@@ -13,6 +13,7 @@ from agents import agent as agent_runtime
 from services.rail_service import RailOptionsResult
 from services.flight_service import FlightOptionsResult
 from services.poi_recommender import PoiRecommendationResult
+from services.route_service import RoutePlansResult
 
 
 def _query(**overrides) -> TravelQuery:
@@ -281,6 +282,54 @@ def test_itinerary_optimizer_does_not_parse_route_summary_as_cost():
     )
 
     assert result.route_segments[0].estimated_cost is None
+
+
+def test_itinerary_optimizer_selects_known_cost_alternative_without_name_keys():
+    places = [
+        PoiRecommendation(name="同名地点", category="景点", provider_id="place-a", source_ids=["a"]),
+        PoiRecommendation(name="同名地点", category="景点", provider_id="place-b", source_ids=["b"]),
+    ]
+    result = optimize_itinerary(
+        _query(named_places=[], objective="cheapest"),
+        places,
+        RoutePlansResult(
+            [
+                RoutePlan(
+                    mode="driving",
+                    origin="同名地点",
+                    destination="同名地点",
+                    duration="10 分钟",
+                    origin_place_id="place-a",
+                    destination_place_id="place-b",
+                )
+            ],
+            alternatives={
+                ("place-a", "place-b"): [
+                    RoutePlan(
+                        mode="driving",
+                        origin="同名地点",
+                        destination="同名地点",
+                        duration="10 分钟",
+                        origin_place_id="place-a",
+                        destination_place_id="place-b",
+                    ),
+                    RoutePlan(
+                        mode="transit",
+                        origin="同名地点",
+                        destination="同名地点",
+                        duration="30 分钟",
+                        estimated_cost=2.0,
+                        cost_currency="CNY",
+                        origin_place_id="place-a",
+                        destination_place_id="place-b",
+                    ),
+                ]
+            },
+        ),
+    )
+
+    assert result.route_segments[0].mode == "transit"
+    assert result.route_segments[0].estimated_cost == "2.0"
 
 
 def test_itinerary_optimizer_does_not_silently_drop_explicit_places():

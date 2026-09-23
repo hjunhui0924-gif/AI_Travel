@@ -26,6 +26,7 @@ DEFAULT_VISIT_MINUTES = 90
 class ItineraryOptimizationResult:
     ordered_places: list[PoiRecommendation] = field(default_factory=list)
     route_segments: list[RouteSegment] = field(default_factory=list)
+    selected_route_plans: list[RoutePlan] = field(default_factory=list)
     schedule: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     score: float | None = None
     diagnostics: list[OptimizationDiagnostic] = field(default_factory=list)
@@ -71,12 +72,67 @@ def _route_key(origin: str, destination: str) -> tuple[str, str]:
     return (str(origin or "").strip(), str(destination or "").strip())
 
 
-def _route_matrix(routes: list[RoutePlan]) -> dict[tuple[str, str], RoutePlan]:
-    return {
-        _route_key(route.origin, route.destination): route
-        for route in routes
-        if route.origin and route.destination
-    }
+def _route_endpoint(route: RoutePlan, *, origin: bool) -> str:
+    value = route.origin_place_id if origin else route.destination_place_id
+    return str(value or (route.origin if origin else route.destination) or "").strip()
+
+
+def _route_for(
+    matrix: dict[tuple[str, str], RoutePlan],
+    origin: PoiRecommendation,
+    destination: PoiRecommendation,
+) -> RoutePlan | None:
+    origin_id = _place_id(origin)
+    destination_id = _place_id(destination)
+    return matrix.get(_route_key(origin_id, destination_id)) or matrix.get(
+        _route_key(origin.name, destination.name)
+    )
+
+
+def _select_route_candidate(candidates: list[RoutePlan], query: TravelQuery) -> RoutePlan:
+    def duration(item: RoutePlan) -> int:
+        return _route_duration(item) or 10**9
+
+    def distance(item: RoutePlan) -> int:
+        return _route_distance(item) or 10**9
+
+    if query.objective == "cheapest":
+        known_costs = [item for item in candidates if item.estimated_cost is not None]
+        pool = known_costs or candidates
+        return min(pool, key=lambda item: (item.estimated_cost if item.estimated_cost is not None else float("inf"), duration(item)))
+    if query.objective == "least_walking":
+        return min(
+            candidates,
+            key=lambda item: (
+                0 if item.mode == "walking" else 1,
+                distance(item),
+                duration(item),
+            ),
+        )
+    return min(candidates, key=duration)
+
+
+def _route_matrix(
+    routes: list[RoutePlan],
+    query: TravelQuery,
+    alternatives: dict[tuple[str, str], list[RoutePlan]] | None = None,
+) -> dict[tuple[str, str], RoutePlan]:
+    matrix: dict[tuple[str, str], RoutePlan] = {}
+    for route in routes:
+        if not route.origin or not route.destination:
+            continue
+        matrix[_route_key(_route_endpoint(route, origin=True), _route_endpoint(route, origin=False))] = route
+        # Keep a display-name fallback for legacy route snapshots that do not
+        # carry stable endpoint IDs.
+        matrix.setdefault(_route_key(route.origin, route.destination), route)
+    for edge_key, candidates in (alternatives or {}).items():
+        if not candidates:
+            continue
+        selected = _select_route_candidate(candidates, query)
+        matrix[edge_key] = selected
+        matrix[_route_key(_route_endpoint(selected, origin=True), _route_endpoint(selected, origin=False))] = selected
+        matrix.setdefault(_route_key(selected.origin, selected.destination), selected)
+    return matrix
 
 
 def _time_to_minutes(value: str, default: int) -> int:
@@ -140,15 +196,16 @@ def _score_order(
     order: tuple[PoiRecommendation, ...],
     matrix: dict[tuple[str, str], RoutePlan],
     query: TravelQuery,
-) -> tuple[float, int, int, float, list[RoutePlan]]:
+) -> tuple[float, int, int, float, list[RoutePlan], int]:
     time_weight, walking_weight, cost_weight, pace_weight = _weights(query)
     total_time = 0
     total_walking = 0
     total_cost = 0.0
     missing_edges = 0
     selected_routes: list[RoutePlan] = []
+    unknown_costs = 0
     for origin, destination in zip(order, order[1:]):
-        route = matrix.get(_route_key(origin.name, destination.name))
+        route = _route_for(matrix, origin, destination)
         if route is None:
             missing_edges += 1
             total_time += 10_000
@@ -162,6 +219,8 @@ def _score_order(
             total_walking += max(1, round(distance / 80))
         if route.estimated_cost is not None:
             total_cost += route.estimated_cost
+        else:
+            unknown_costs += 1
         selected_routes.append(route)
     pace_penalty = max(0, len(order) - 3) * (1 if query.pace == "relaxed" else 0)
     score = (
@@ -170,8 +229,9 @@ def _score_order(
         + cost_weight * total_cost
         + pace_weight * pace_penalty
         + missing_edges * 10_000
+        + unknown_costs * (1_000_000 if query.objective == "cheapest" else 0)
     )
-    return score, total_time, total_walking, total_cost, selected_routes
+    return score, total_time, total_walking, total_cost, selected_routes, unknown_costs
 
 
 def _dates(query: TravelQuery) -> list[str]:
@@ -201,7 +261,7 @@ def _simulate_schedule(
         cursor = day_cursors[day]
         previous = order[index - 1] if index and index // 4 == (index - 1) // 4 else None
         if previous is not None:
-            route = matrix.get(_route_key(previous.name, place.name))
+            route = _route_for(matrix, previous, place)
             if route is None:
                 conflicts.append(f"地点“{previous.name}”与“{place.name}”之间缺少已验证路线。")
                 return False, {}, conflicts
@@ -229,12 +289,51 @@ def _simulate_schedule(
     return True, schedule, conflicts
 
 
+def _build_route_segments(
+    order: tuple[PoiRecommendation, ...],
+    matrix: dict[tuple[str, str], RoutePlan],
+    schedule: dict[str, tuple[str, str, str]],
+    query: TravelQuery,
+) -> list[RouteSegment]:
+    segments: list[RouteSegment] = []
+    for origin, destination in zip(order, order[1:]):
+        route = _route_for(matrix, origin, destination)
+        if route is None:
+            continue
+        day = schedule.get(_place_id(destination), (query.start_date, "", ""))[0]
+        duration = _route_duration(route)
+        segments.append(
+            RouteSegment(
+                segment_id="segment_"
+                + sha1(
+                    f"{_place_id(origin)}|{_place_id(destination)}|{day}".encode()
+                ).hexdigest()[:12],
+                date=day,
+                origin_place_id=_place_id(origin),
+                destination_place_id=_place_id(destination),
+                mode=route.mode,
+                distance_meters=_route_distance(route),
+                duration_minutes=duration,
+                estimated_cost=(
+                    str(route.estimated_cost)
+                    if route.estimated_cost is not None
+                    else None
+                ),
+                buffer_minutes=DEFAULT_BUFFER_MINUTES,
+                walking_minutes=duration if route.mode == "walking" else None,
+                source_ids=list(route.source_ids),
+            )
+        )
+    return segments
+
+
 def optimize_itinerary(
     query: TravelQuery,
     places: list[PoiRecommendation],
     route_plans: list[RoutePlan] | None = None,
     *,
     locked_titles: list[str] | None = None,
+    route_alternatives: dict[tuple[str, str], list[RoutePlan]] | None = None,
 ) -> ItineraryOptimizationResult:
     candidates = _candidate_places(query, places)
     if not candidates:
@@ -243,7 +342,9 @@ def optimize_itinerary(
         )
 
     routes = list(route_plans or [])
-    matrix = _route_matrix(routes)
+    if route_alternatives is None:
+        route_alternatives = getattr(route_plans, "alternatives", None)
+    matrix = _route_matrix(routes, query, route_alternatives)
     diagnostics: list[OptimizationDiagnostic] = []
     if query.named_places:
         matched = {item.name for item in candidates}
@@ -258,14 +359,23 @@ def optimize_itinerary(
             )
     if len(candidates) > MAX_ENUMERATED_PLACES:
         diagnostics.append(
-            OptimizationDiagnostic("beam_search_fallback", "地点超过 5 个，已截取前 5 个候选进行 MVP 排序。", "warning")
+            OptimizationDiagnostic(
+                "beam_search_fallback",
+                "地点超过 5 个，未枚举全部顺序；保留所有用户地点并沿用已验证的顺序边。",
+                "warning",
+            )
         )
     locked = [str(item).strip() for item in (locked_titles or []) if str(item).strip()]
     explicit_order_has_edges = all(
-        matrix.get(_route_key(origin.name, destination.name)) is not None
+        _route_for(matrix, origin, destination) is not None
         for origin, destination in zip(candidates, candidates[1:])
     )
-    complete_route_matrix = len(matrix) >= len(candidates) * max(0, len(candidates) - 1)
+    complete_route_matrix = all(
+        _route_for(matrix, origin, destination) is not None
+        for origin in candidates
+        for destination in candidates
+        if origin is not destination
+    )
     if locked and any(item.name in locked for item in candidates):
         permutations = [tuple(candidates)]
         diagnostics.append(
@@ -289,53 +399,59 @@ def optimize_itinerary(
     else:
         permutations = [tuple(candidates)]
 
-    best: tuple[float, tuple[PoiRecommendation, ...], dict[str, tuple[str, str, str]], list[str]] | None = None
+    best: tuple[
+        float,
+        tuple[PoiRecommendation, ...],
+        dict[str, tuple[str, str, str]],
+        list[str],
+        list[RoutePlan],
+        int,
+    ] | None = None
     for order in permutations:
         feasible, schedule, conflicts = _simulate_schedule(order, matrix, query)
         if not feasible:
             continue
-        score, _time, _walking, _cost, _selected = _score_order(order, matrix, query)
+        score, _time, _walking, _cost, selected, unknown_costs = _score_order(order, matrix, query)
         if best is None or score < best[0]:
-            best = (score, order, schedule, conflicts)
+            best = (score, order, schedule, conflicts, selected, unknown_costs)
 
     if best is None:
         diagnostics.append(
             OptimizationDiagnostic("no_feasible_order", "没有同时满足路线或营业时间约束的顺序。", "warning")
         )
+        fallback_order = tuple(candidates)
+        fallback_routes = [
+            _route_for(matrix, origin, destination)
+            for origin, destination in zip(fallback_order, fallback_order[1:])
+        ]
+        fallback_routes = [route for route in fallback_routes if route is not None]
+        if len(fallback_routes) < max(0, len(fallback_order) - 1):
+            diagnostics.append(
+                OptimizationDiagnostic(
+                    "route_matrix_partial",
+                    "路线矩阵存在缺边，仅保留已查询到的真实路线段。",
+                    "warning",
+                )
+            )
         return ItineraryOptimizationResult(
             ordered_places=candidates,
+            route_segments=_build_route_segments(fallback_order, matrix, {}, query),
+            selected_route_plans=fallback_routes,
             diagnostics=diagnostics,
             conflicts=[f"未能安排地点：{item.name}" for item in candidates],
         )
 
-    score, order, schedule, conflicts = best
-    segments: list[RouteSegment] = []
-    for index, (origin, destination) in enumerate(zip(order, order[1:]), start=1):
-        route = matrix.get(_route_key(origin.name, destination.name))
-        if route is None:
-            continue
-        day = schedule.get(_place_id(destination), (query.start_date, "", ""))[0]
-        duration = _route_duration(route)
-        segments.append(
-            RouteSegment(
-                segment_id="segment_" + sha1(f"{origin.name}|{destination.name}|{day}".encode()).hexdigest()[:12],
-                date=day,
-                origin_place_id=_place_id(origin),
-                destination_place_id=_place_id(destination),
-                mode=route.mode,
-                distance_meters=_route_distance(route),
-                duration_minutes=duration,
-                estimated_cost=(
-                    str(route.estimated_cost)
-                    if route.estimated_cost is not None
-                    else None
-                ),
-                buffer_minutes=DEFAULT_BUFFER_MINUTES,
-                walking_minutes=duration if route.mode == "walking" else None,
-                source_ids=[],
+    score, order, schedule, conflicts, selected_routes, unknown_costs = best
+    segments = _build_route_segments(order, matrix, schedule, query)
+    if unknown_costs and query.objective == "cheapest":
+        diagnostics.append(
+            OptimizationDiagnostic(
+                "cost_unknown",
+                "部分路线没有可靠费用，未将未知费用当作 0 元；当前结果不能宣称最低价。",
+                "warning",
             )
         )
-    if not matrix and len(order) > 1:
+    if not complete_route_matrix and len(order) > 1:
         diagnostics.append(
             OptimizationDiagnostic("route_matrix_missing", "路线服务未返回完整矩阵，已保留用户地点顺序，未声称绝对最优。", "warning")
         )
@@ -349,6 +465,7 @@ def optimize_itinerary(
     return ItineraryOptimizationResult(
         ordered_places=list(order),
         route_segments=segments,
+        selected_route_plans=selected_routes,
         schedule=schedule,
         score=score,
         diagnostics=diagnostics,

@@ -480,6 +480,50 @@ def test_generic_city_trip_builds_route_from_verified_poi_recommendations(monkey
     assert response.trip_plan.route_plans[0].polyline
 
 
+def test_explicit_route_endpoints_seed_optimizer_when_poi_enrichment_fails():
+    query = travel_agent.build_travel_query("2026-09-02 去上海玩一天", [])
+    query.destination = "上海"
+    query.city = "上海"
+    query.named_places = ["外滩", "陆家嘴"]
+    supervised = TravelSupervisorResult(
+        query=query,
+        decision="plan",
+        route_plans=[
+            RoutePlan(
+                mode="driving",
+                origin="外滩",
+                destination="陆家嘴",
+                origin_place_id="amap-bund",
+                destination_place_id="amap-lujiazui",
+                origin_address="外滩地址",
+                destination_address="陆家嘴地址",
+                origin_location="121.49,31.24",
+                destination_location="121.50,31.23",
+                polyline=[[121.49, 31.24], [121.50, 31.23]],
+                duration="10 分钟",
+                duration_minutes=10,
+                distance="1000 米",
+                distance_meters=1000,
+                source_ids=["route_explicit"],
+            )
+        ],
+        adapter_status={"route": "success", "poi": "failed"},
+    )
+
+    response = travel_agent.plan_travel(
+        "2026-09-02 去上海玩一天",
+        [],
+        supervisor_result=supervised,
+    )
+
+    assert response.trip_plan is not None
+    assert [(item.origin_place_id, item.destination_place_id) for item in response.trip_plan.route_segments] == [
+        ("amap-bund", "amap-lujiazui")
+    ]
+    assert [item.name for item in response.trip_plan.place_candidates] == []
+    assert {item.title for day in response.trip_plan.days for item in day.items} >= {"外滩", "陆家嘴"}
+
+
 def test_replan_preserves_locked_items_and_reports_date_conflict(monkeypatch):
     monkeypatch.setattr(travel_agent, "recommend_pois", lambda query, **kwargs: ([], [], [], []))
     monkeypatch.setattr(travel_agent, "get_rail_options", lambda query: [])

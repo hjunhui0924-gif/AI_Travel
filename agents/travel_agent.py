@@ -747,6 +747,79 @@ def _route_anchor_names_from_recommendations(
     return names
 
 
+def _explicit_places_from_routes(
+    query: TravelQuery,
+    routes: list[RoutePlan],
+) -> list[PoiRecommendation]:
+    """Materialize user landmarks from map-resolved route endpoints.
+
+    A POI enrichment call can fail after the route provider has already
+    resolved the user's landmarks.  Those endpoint facts are sufficient for
+    deterministic ordering, but they must remain explicitly marked as
+    endpoint-derived rather than being replaced by nearby recommendations.
+    """
+
+    endpoints: list[tuple[str, str, str, str, str, list[str]]] = []
+    seen: set[str] = set()
+    for route in routes:
+        for name, place_id, address, location, source_ids in (
+            (
+                route.origin,
+                route.origin_place_id,
+                route.origin_address,
+                route.origin_location,
+                route.source_ids,
+            ),
+            (
+                route.destination,
+                route.destination_place_id,
+                route.destination_address,
+                route.destination_location,
+                route.source_ids,
+            ),
+        ):
+            identity = str(place_id or name or location).strip()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            endpoints.append((name, place_id, address, location, query.destination or query.city, list(source_ids)))
+
+    result: list[PoiRecommendation] = []
+    used: set[str] = set()
+    for requested in query.named_places:
+        match = next(
+            (
+                endpoint
+                for endpoint in endpoints
+                if endpoint[0] == requested
+                or requested in endpoint[0]
+                or endpoint[0] in requested
+            ),
+            None,
+        )
+        if match is None:
+            continue
+        name, place_id, address, location, city, source_ids = match
+        identity = str(place_id or name).strip()
+        if identity in used:
+            continue
+        used.add(identity)
+        result.append(
+            PoiRecommendation(
+                name=name,
+                category="用户指定地点",
+                address=address,
+                city=city,
+                location=location,
+                provider_id=place_id,
+                source_ids=source_ids,
+                freshness="current_query",
+                summary="已由地图路线端点解析；营业与预约信息仍待确认。",
+            )
+        )
+    return result
+
+
 def _transport_page_from_result(mode: str, result, query: TravelQuery) -> TransportPage:
     high_speed = mode == "rail" and any(
         token in str(query.raw_text or "")
@@ -878,21 +951,25 @@ def _flight_failure_detail(exc: Exception) -> str:
 
 
 def _route_evidence(routes: list[RoutePlan]) -> list[Evidence]:
-    return [
-        Evidence(
-            evidence_id=f"route_{index:03d}",
-            source_type="map_route",
-            provider="Amap",
-            title=f"{route.origin} -> {route.destination}",
-            url="https://www.amap.com/",
-            snippet=f"{route.mode} {route.duration} {route.distance}".strip(),
-            retrieved_at=_now_cn().isoformat(timespec="seconds"),
-            freshness="current_query",
-            reliability="primary_adapter",
-            supports=["route", "duration", "distance"],
+    result = []
+    for index, route in enumerate(routes, start=1):
+        evidence_id = route.source_ids[0] if route.source_ids else f"route_{index:03d}"
+        route.source_ids = [evidence_id]
+        result.append(
+            Evidence(
+                evidence_id=evidence_id,
+                source_type="map_route",
+                provider="Amap",
+                title=f"{route.origin} -> {route.destination}",
+                url="https://www.amap.com/",
+                snippet=f"{route.mode} {route.duration} {route.distance}".strip(),
+                retrieved_at=_now_cn().isoformat(timespec="seconds"),
+                freshness="current_query",
+                reliability="primary_adapter",
+                supports=["route", "duration", "distance"],
+            )
         )
-        for index, route in enumerate(routes, start=1)
-    ]
+    return result
 
 
 def _route_covers_named_places(routes: list[RoutePlan], named_places: list[str]) -> bool:
@@ -907,6 +984,37 @@ def _route_covers_named_places(routes: list[RoutePlan], named_places: list[str])
         if len(route.polyline) >= 2
     }
     return all(pair in pairs for pair in zip(places, places[1:]))
+
+
+def _route_result_diagnostics(route_result) -> list[str]:
+    """Expose bounded-matrix gaps without turning them into fake routes."""
+
+    missing = list(getattr(route_result, "missing_edges", []) or [])
+    reasons = getattr(route_result, "missing_edge_reasons", {}) or {}
+    if not missing:
+        return []
+    labels = []
+    for origin, destination in missing[:8]:
+        reason = reasons.get((origin, destination), "unknown")
+        labels.append(f"{origin}→{destination}（{reason}）")
+    return ["路线矩阵存在未查询到的有向边：" + "、".join(labels) + "。"]
+
+
+def _lookup_routes(query: TravelQuery, *, complete_matrix: bool = False):
+    """Call the route adapter with an explicit matrix request when supported.
+
+    Test doubles and older integrations may still expose the one-argument
+    route seam; those remain compatible for non-production callers.
+    """
+
+    if not complete_matrix:
+        return get_route_plans(query)
+    try:
+        return get_route_plans(query, complete_matrix=True)
+    except TypeError as exc:
+        if "complete_matrix" not in str(exc):
+            raise
+        return get_route_plans(query)
 
 
 def _stable_item_id(item_type: str, title: str, day: str) -> str:
@@ -1032,6 +1140,7 @@ def _build_structured_plan(
             poi_items,
             route_plans,
             locked_titles=locked_titles,
+            route_alternatives=getattr(route_plans, "alternatives", None),
         )
         conflicts.extend(optimization.conflicts)
         if optimization.ordered_places and not any(
@@ -1083,7 +1192,12 @@ def _build_structured_plan(
                     )
                 )
 
-    for index, route in enumerate(route_plans):
+    display_route_plans = (
+        list(optimization.selected_route_plans)
+        if optimization is not None and optimization.selected_route_plans
+        else list(route_plans)
+    )
+    for index, route in enumerate(display_route_plans):
         day = days[min(index, len(days) - 1)]
         day.items.append(
             _new_plan_item(
@@ -1093,7 +1207,13 @@ def _build_structured_plan(
                 detail=f"{route.mode}，约 {route.duration or '时长待补充'}，{route.distance or '距离待补充'}。{route.summary}".strip(),
                 location=route.destination,
                 address=route.destination_address,
-                source_ids=[item.evidence_id for item in sources if item.source_type == "map_route" and item.title == f"{route.origin} -> {route.destination}"],
+                source_ids=list(route.source_ids)
+                or [
+                    item.evidence_id
+                    for item in sources
+                    if item.source_type == "map_route"
+                    and item.title == f"{route.origin} -> {route.destination}"
+                ],
                 confidence="source_backed",
             )
         )
@@ -1268,7 +1388,7 @@ def _build_structured_plan(
         days=days,
         transport_options=list(transport_options),
         transport_pages=list(transport_pages),
-        route_plans=list(route_plans),
+        route_plans=display_route_plans,
         out_of_range_items=out_of_range_items,
         facts=facts,
         constraints=constraints,
@@ -1632,9 +1752,13 @@ def plan_travel(
                     route_query = deepcopy(query)
                     route_query.named_places = route_anchor_names
                     try:
-                        fallback_route_result = get_route_plans(route_query)
-                        route_plans = list(fallback_route_result)
+                        fallback_route_result = _lookup_routes(
+                            route_query,
+                            complete_matrix=bool(query.named_places),
+                        )
+                        route_plans = fallback_route_result
                         fallback_route_errors = list(getattr(fallback_route_result, "errors", []) or [])
+                        diagnostics.extend(_route_result_diagnostics(fallback_route_result))
                         if fallback_route_errors:
                             adapter_status["route"] = "partial" if route_plans else "failed"
                             diagnostics.extend(
@@ -1663,9 +1787,13 @@ def plan_travel(
             diagnostics.append("route blocked until ambiguous places are confirmed")
         else:
             try:
-                route_result = get_route_plans(query)
-                route_plans = list(route_result)
+                route_result = _lookup_routes(
+                    query,
+                    complete_matrix=bool(query.named_places),
+                )
+                route_plans = route_result
                 route_errors = list(getattr(route_result, "errors", []) or [])
+                diagnostics.extend(_route_result_diagnostics(route_result))
                 if route_errors:
                     adapter_status["route"] = "partial" if route_plans else "failed"
                     diagnostics.extend(f"route mode failed: {error}" for error in route_errors)
@@ -1727,9 +1855,10 @@ def plan_travel(
                 route_query = deepcopy(query)
                 route_query.named_places = route_anchor_names
                 try:
-                    fallback_route_result = get_route_plans(route_query)
-                    route_plans = list(fallback_route_result)
+                    fallback_route_result = _lookup_routes(route_query)
+                    route_plans = fallback_route_result
                     fallback_route_errors = list(getattr(fallback_route_result, "errors", []) or [])
+                    diagnostics.extend(_route_result_diagnostics(fallback_route_result))
                     if fallback_route_errors:
                         adapter_status["route"] = "partial" if route_plans else "failed"
                         diagnostics.extend(
@@ -1754,6 +1883,19 @@ def plan_travel(
         web_search_status = "not_requested"
         adapter_status["route"] = "not_requested"
         adapter_status["poi"] = "not_requested"
+
+    if query.named_places and route_plans:
+        route_places = _explicit_places_from_routes(query, route_plans)
+        if route_places:
+            known_ids = {item.provider_id for item in poi_items if item.provider_id}
+            known_names = {item.name for item in poi_items if item.name}
+            poi_items = route_places + [
+                item
+                for item in poi_items
+                if (not item.provider_id or item.provider_id not in known_ids)
+                and item.name not in known_names
+            ]
+            diagnostics.append("POI 补充失败时，已使用路线服务确认的用户地点继续排程。")
 
     weather_requested = _should_include_weather(query)
     if supervisor_result is not None and not supervisor_result.fallback_used:

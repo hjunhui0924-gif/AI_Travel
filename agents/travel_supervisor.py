@@ -298,8 +298,14 @@ def _route_payload(route: RoutePlan) -> dict[str, object]:
         "mode": route.mode,
         "origin": route.origin,
         "destination": route.destination,
+        "origin_place_id": route.origin_place_id,
+        "destination_place_id": route.destination_place_id,
         "duration": route.duration,
+        "duration_minutes": route.duration_minutes,
         "distance": route.distance,
+        "distance_meters": route.distance_meters,
+        "estimated_cost": route.estimated_cost,
+        "cost_currency": route.cost_currency,
         "summary": route.summary,
     }
 

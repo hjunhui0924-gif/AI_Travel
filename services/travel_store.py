@@ -256,6 +256,10 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
                     "estimated_cost": None,
                     "cost_currency": "",
                     "cost_scope": "",
+                    "origin_place_id": "",
+                    "destination_place_id": "",
+                    "source_ids": [],
+                    "departure_bucket": "",
                 },
             )
             normalized_polyline: list[list[float]] = []
@@ -274,6 +278,7 @@ def _rebuild_plan(payload: dict[str, Any]) -> TravelPlan:
                     ):
                         normalized_polyline.append([round(longitude, 6), round(latitude, 6)])
             route_values["polyline"] = normalized_polyline
+            route_values["source_ids"] = _list_value(route_values.get("source_ids"))
             route_plans.append(RoutePlan(**route_values))
 
     facts = []

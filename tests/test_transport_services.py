@@ -1,6 +1,17 @@
-from agents.schemas import Evidence, TransportPage, TransportOption, TransportQueryPage, TravelPlan, TravelQuery
+from concurrent.futures import ThreadPoolExecutor
+from time import sleep
+
+from agents.schemas import Evidence, PlaceCandidate, TransportPage, TransportOption, TransportQueryPage, TravelPlan, TravelQuery
 from adapters.variflight_adapter import VariFlightResults
+import pytest
 from services import flight_service, rail_service, route_service, transport_service
+
+
+@pytest.fixture(autouse=True)
+def _reset_route_cache():
+    route_service.clear_route_cache()
+    yield
+    route_service.clear_route_cache()
 
 
 def _query() -> TravelQuery:
@@ -189,6 +200,159 @@ def test_route_service_keeps_geometry_for_map_preview(monkeypatch):
     assert results[0].origin_location == "120,30"
     assert results[0].destination_location == "120.1,30.1"
     assert results[0].polyline == [[120.0, 30.0], [120.1, 30.1]]
+
+
+def test_route_service_builds_bounded_directed_matrix(monkeypatch):
+    places = [
+        {"name": "A", "formatted_address": "A", "location": "120,30"},
+        {"name": "B", "formatted_address": "B", "location": "120.1,30.1"},
+        {"name": "C", "formatted_address": "C", "location": "120.2,30.2"},
+    ]
+    monkeypatch.setattr(
+        route_service,
+        "_build_segments",
+        lambda query, **kwargs: [
+            (origin, destination)
+            for origin in places
+            for destination in places
+            if origin is not destination
+        ],
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_plan_route(origin, destination, *, strategy):
+        calls.append((origin, destination, strategy))
+        return {
+            "origin": origin,
+            "destination": destination,
+            "duration": "10 分钟",
+            "duration_minutes": 10,
+            "distance": "1000 米",
+            "distance_meters": 1000,
+            "summary": strategy,
+            "polyline": [[120.0, 30.0], [120.1, 30.1]],
+        }
+
+    monkeypatch.setattr(route_service, "plan_route", fake_plan_route)
+    query = _query()
+    query.named_places = ["A", "B", "C"]
+    result = route_service.get_route_plans(query, complete_matrix=True)
+
+    assert result.complete is True
+    assert result.attempted_requests == 18
+    assert len(result) == 6
+    assert len(calls) == 18
+    assert {(item.origin, item.destination) for item in result} == {
+        ("A", "B"), ("A", "C"), ("B", "A"),
+        ("B", "C"), ("C", "A"), ("C", "B"),
+    }
+
+
+def test_route_service_uses_confirmed_place_identity_without_regeocoding(monkeypatch):
+    query = _query()
+    query.named_places = ["万象城", "西湖"]
+    query.resolved_place_candidates = [
+        PlaceCandidate(
+            candidate_id="candidate-wx",
+            provider_id="amap-wx",
+            name="万象城",
+            city="杭州",
+            address="已确认地址",
+            location="120.10,30.20",
+            query_text="万象城",
+        ),
+        PlaceCandidate(
+            candidate_id="candidate-xh",
+            provider_id="amap-xh",
+            name="西湖",
+            city="杭州",
+            address="已确认地址2",
+            location="120.11,30.21",
+            query_text="西湖",
+        ),
+    ]
+    monkeypatch.setattr(
+        route_service,
+        "resolve_place_in_city",
+        lambda *args: (_ for _ in ()).throw(AssertionError("confirmed place must not be re-geocoded")),
+    )
+    monkeypatch.setattr(
+        route_service,
+        "plan_route",
+        lambda origin, destination, *, strategy: {
+            "duration": "10 分钟",
+            "distance": "1000 米",
+            "duration_minutes": 10,
+            "distance_meters": 1000,
+            "origin_location": origin,
+            "destination_location": destination,
+            "polyline": [[120.10, 30.20], [120.11, 30.21]],
+        },
+    )
+
+    result = route_service.get_route_plans(query, max_requests=1)
+
+    assert result[0].origin_place_id == "amap-wx"
+    assert result[0].destination_place_id == "amap-xh"
+    assert result[0].origin_location == "120.10,30.20"
+
+
+def test_route_service_budget_prioritizes_adjacent_chain_and_exposes_missing_edge(monkeypatch):
+    places = [
+        {"name": "A", "location": "120,30"},
+        {"name": "B", "location": "120.1,30.1"},
+        {"name": "C", "location": "120.2,30.2"},
+    ]
+    monkeypatch.setattr(
+        route_service,
+        "_build_segments",
+        lambda query, **kwargs: [(places[0], places[1]), (places[1], places[2]), (places[0], places[2])],
+    )
+    monkeypatch.setenv("ROUTE_MATRIX_MODES", "transit,driving")
+    monkeypatch.setattr(
+        route_service,
+        "plan_route",
+        lambda origin, destination, *, strategy: {
+            "duration": "10 分钟",
+            "distance": "1000 米",
+            "duration_minutes": 10,
+            "distance_meters": 1000,
+        },
+    )
+
+    query = _query()
+    query.named_places = ["A", "B", "C"]
+    result = route_service.get_route_plans(query, complete_matrix=True, max_requests=2)
+
+    assert [(item.origin, item.destination) for item in result] == [("A", "B"), ("B", "C")]
+    assert result.missing_edges == [("A", "C")]
+    assert result.missing_edge_reasons[("A", "C")] == "budget_exhausted"
+    assert "route_matrix_budget:2/6" in result.errors
+
+
+def test_route_service_coalesces_same_cache_key_across_concurrent_calls(monkeypatch):
+    places = [
+        {"name": "A", "location": "121,31"},
+        {"name": "B", "location": "121.1,31.1"},
+    ]
+    monkeypatch.setattr(route_service, "_build_segments", lambda query: [(places[0], places[1])])
+    calls = 0
+
+    def fake_plan_route(origin, destination, *, strategy):
+        nonlocal calls
+        calls += 1
+        sleep(0.04)
+        return {"duration": "10 分钟", "distance": "1000 米", "duration_minutes": 10, "distance_meters": 1000}
+
+    monkeypatch.setattr(route_service, "plan_route", fake_plan_route)
+    query = _query()
+    query.named_places = ["A", "B"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = list(pool.map(lambda _: route_service.get_route_plans(query), range(2)))
+
+    assert calls == 3
+    assert first or second
+    assert first.cache_hits + first.coalesced_requests + second.cache_hits + second.coalesced_requests >= 1
 
 
 def test_high_speed_query_filters_regular_trains_and_has_no_fake_price(monkeypatch):

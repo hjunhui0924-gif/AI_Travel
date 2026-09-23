@@ -141,6 +141,10 @@ export interface RoutePlan {
   estimated_cost?: number | null;
   cost_currency?: string;
   cost_scope?: string;
+  origin_place_id?: string;
+  destination_place_id?: string;
+  source_ids?: string[];
+  departure_bucket?: string;
 }
 
 export interface ProviderMeta {

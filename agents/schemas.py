@@ -299,6 +299,12 @@ class RoutePlan:
     estimated_cost: float | None = None
     cost_currency: str = ""
     cost_scope: str = ""
+    # Stable provider-backed endpoint identities.  Older snapshots may omit
+    # them, so consumers must fall back to the display names when absent.
+    origin_place_id: str = ""
+    destination_place_id: str = ""
+    source_ids: list[str] = field(default_factory=list)
+    departure_bucket: str = ""
 
 
 @dataclass(slots=True)
