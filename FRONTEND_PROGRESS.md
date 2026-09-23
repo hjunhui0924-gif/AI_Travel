@@ -177,7 +177,7 @@ frontend/
 
 - 发送失败或 provider 超时会在消息中显示结构化“重试本轮”按钮，最多 2 次手动重试；重试复用原始问题和当前请求附件，不自动无限循环。
 - `/chat` 的 `done.retryable/retry_reason` 与历史消息契约已同步；前端请求增加 45 秒客户端总等待保护，超时会保留已有文本并提供重试。
-- Qwen3.7 Flash 已作为 DashScope 默认模型；明确交通查询跳过多轮 Supervisor，等待期间仍显示“查询旅行数据”工作摘要。
+- 当时的 Qwen3.7 Flash 已作为 DashScope 默认模型；当前 DashScope 默认模型为 `qwen3.8-flash`。明确交通查询跳过多轮 Supervisor，等待期间仍显示“查询旅行数据”工作摘要。
 
 ## 28. 可解释推理轨迹（2026-09-06）
 
@@ -217,3 +217,10 @@ frontend/
 - 涉及文件：`frontend/src/styles/interaction-pass.css`（玻璃段更新至 12px 档）、`frontend/src/styles/main.css`（activity-reveal 过渡重写）、`frontend/src/components/MessageItem.vue`（外层包裹）。
 - 验证：沙盒 5 档 A/B（16/12/10/8/6px）目测后定档 12px，随后清理沙盒副本（本地零残留）；当前 `npm run typecheck` 通过，`npm run build`（写入 `static/`）通过——CSS 108.90 kB（gzip 19.26 kB）、JS 244.09 kB（gzip 87.16 kB）；当前 `static/index.html` 实际引用 `index-uYCWfioC.css` / `index-kJ31gYrl.js`，并包含 `blur(12px)`、`grid-template-rows: 0fr`、`activity-reveal-outer`。
 - 备注：更透档位（10/8/6px，含底色 alpha 递减）已在沙盒验证全谱可用；助手正文直接压在玻璃上，透度越高可读性越低，12px 为当前平衡点。
+
+## 32. 路线矩阵与计划地图一致性（2026-09-23）
+
+- `RouteMap.vue` 和 `ItineraryTab.vue` 继续只消费后端结构化 `route_plans`、`route_segments` 和 `polyline`，不从聊天 Markdown 或 `detail` 文本猜测路线。路线段和地图折线来自优化器同一批最终选中的路线边。
+- `RoutePlan` 前端类型同步支持 `origin_place_id`、`destination_place_id`、`source_ids` 和 `departure_bucket`，旧计划缺少这些字段时仍按可选字段兼容读取。
+- 真实浏览器回归覆盖上海“外滩、豫园、陆家嘴”三地点：计划保留三个用户指定地点，面板显示 2 个相邻路线段；高德交互地图显示真实底图、两条折线、起终点和路线图例；Chrome Console 无 error。
+- 本轮只验证路线与计划展示闭环，不宣称前端已完成营业预约、天气日期覆盖、跨城市交通时刻等后续范围；provider 部分成功时前端以状态/诊断展示缺边，不补画虚假线路。

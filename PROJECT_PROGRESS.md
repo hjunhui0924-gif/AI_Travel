@@ -433,7 +433,7 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 
 ## 29. Qwen 与 12306 查询降延迟（2026-09-06）
 
-- 未设置通用 `LLM_*` 配置时，DashScope 优先于 DeepSeek；当前模型配置为 `qwen3.7-flash`，默认关闭 Qwen3 Flash 隐藏思考 token，模型请求超时默认 15 秒且不做 SDK 内部重试。
+- 未设置通用 `LLM_*` 配置时，DashScope 优先于 DeepSeek；本阶段记录的历史默认模型为 `qwen3.7-flash`，默认关闭 Qwen3 Flash 隐藏思考 token，模型请求超时默认 15 秒且不做 SDK 内部重试。当前默认模型以 `.env.example` 和 README 为准，为 `qwen3.8-flash`。
 - 明确的铁路、航班和交通比较请求直接进入确定性 provider 路由，跳过不必要的多轮 Supervisor 工具决策；Supervisor 在其他旅行规划场景仍负责工具选择，Qwen 返回普通文本时保留已验证工具结果并采用安全默认动作，避免重复查询。
 - 12306 站点字典增加本地持久缓存（默认 24 小时），车次原始响应增加 20 秒短缓存；默认单次 HTTP 超时 8 秒、总超时 18 秒，备用 endpoint 默认不重试，可通过 `RAIL_MAX_RETRIES` 显式开启最多 2 次备用尝试。
 - provider 失败/超时通过结构化 `retryable` 字段传给前端；前端显示“重试”按钮，最多允许 2 次手动重试，并复用原始请求与附件。
@@ -461,3 +461,14 @@ AI_Agent 的定位是“懒人旅行规划 Agent”：用户只需要用自然�
 - 同期前端液态玻璃主消息容器定档为 12px blur，并将工作进展展开/收起改为基于真实内容高度的 `grid-template-rows` 动画；详细视觉参数和构建产物记录见 `FRONTEND_PROGRESS.md`。
 - 本阶段边界：不展示 Qwen 隐藏思维 token、系统提示词、工具参数、密钥或未经筛选的内部推理文本。
 - 最终验证：`python -m pytest -q` 为 **167 passed**、1 个既有 Starlette `PendingDeprecationWarning`；`compileall`、前端 `npm run typecheck`、`npm run build`、`git diff --check` 均通过；新增同步编排事件桥单测确认 activity 会在操作结束前发出，真实浏览器验证高铁查询工作进展按 SSE 事件顺序逐条出现、展开区独立滚动且生产页面无控制台错误。
+
+## 33. 有界有向路线矩阵与路线事实闭环（2026-09-23）
+
+- 路线服务新增有界有向矩阵：对最多 5 个已确认地点按 `origin → destination → mode` 查询，默认允许 `transit`、`driving`、`walking`，默认最多 60 次外部尝试、最多 3 个并发 worker；先保证用户顺序相邻边，再补充其他有向边。A→B 与 B→A 不共享结果。
+- 路线结果新增稳定端点身份、出发日期桶、来源 ID 和结构化数值事实：`origin_place_id`、`destination_place_id`、`duration_minutes`、`distance_meters`、`estimated_cost`、`cost_currency`。确认过的地点直接使用其 provider ID/坐标，不再重新按名称选取同名 POI。
+- 路线缓存为进程内成功结果 TTL 缓存，默认 10 分钟、最多 256 条；缓存键包含坐标版本、城市、端点坐标、方式和出发日期桶。相同请求并发时合并等待；失败和空结果不长期缓存。缓存不代表高德提供实时路况，静态时长仍是估计值。
+- `RoutePlansResult` 保留 `complete`、`attempted_requests`、`missing_edges`、缺边原因、模式备选和缓存诊断。预算不足或 provider 无结果时只返回真实可用边和 `partial` 诊断，不编造路线几何；优化器从同一批最终选中的边生成 `route_plans`、`route_segments` 和前端 polyline。
+- 优化器支持在已有模式备选中按速度、费用或少步行目标选择；未知费用不会当作 0 元，也不会据此宣称“最低价”。已确认地点超过枚举上限时不静默删除，而是保留地点并明确未全局枚举的诊断。营业窗口中的 `closed_reason` 仍会阻止该地点排程。
+- 真实链路验收：Chrome 通过 Vite `5173` + FastAPI `8001` 访问本地页面，使用当前 DashScope 配置的 `qwen3.8-flash`，输入“帮我规划上海一日游，必须去外滩、豫园、陆家嘴”；三个用户地点均进入计划，最终生成 2 条路线段，地图底图、折线、图例和 `route_segments` 一致，浏览器 Console 无 error，失败请求中没有非预期业务请求失败。
+- 本阶段提交：`13b8ba3 feat: add bounded route matrix`。本次验证：`python -m pytest -q` 为 **192 passed**、1 个既有 Starlette `PendingDeprecationWarning`；`compileall`、前端 `npm run typecheck`、`npm run build` 和 `git diff --check` 均通过。
+- 边界：本阶段不等同于 R5～R11 全部完成。官方营业/预约事实闭环、日期覆盖天气、统一取消/幂等执行器、Finalizer 事实保护、单机备份恢复和跨城市时刻搜索仍按实施方案标记为后续任务或外部条件。

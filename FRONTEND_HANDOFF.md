@@ -287,7 +287,9 @@ data: {
 
 `calendar_truncated=true` 时，`end_date` 仍是真实请求结束日期，`days` 只投影当前前 31 天；使用 `projection_end_date` 和 `projected_days`，不要从 `risks` 文本推断。
 
-`route_plans` 是已通过地点解析的路线预览数据。每个路线包含 `mode`、`origin`、`destination`、`duration`、`distance`、`origin_location`、`destination_location` 和 `polyline`（经度/纬度点数组）。用户未指定景点时，后端会从已通过地图验证的城市景点推荐中选择路线锚点；不会从未经验证的回答文本生成路线。前端不要从 `detail` 或回答文本解析路线；`RouteMap.vue` 在配置 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SECURITY_JS_CODE` 时优先加载高德 JS API 2.0，支持缩放、拖拽、路线自动适配和起终点标记；没有浏览器端 Key 时调用 `GET /travel/plans/{thread_id}/map`（可选 `?version=n`）读取服务端静态地图。没有路线几何时接口返回 404；静态地图请求异常时接口返回基于真实折线的 SVG 示意图，并带 `X-Route-Map-Fallback: true` 响应头。浏览器端 Key 必须限制高德控制台域名白名单，服务端 Web Service Key 不得写入 `VITE_*` 变量。
+`route_plans` 是已通过地点解析的路线预览数据。每个路线包含 `mode`、`origin`、`destination`、`duration`、`distance`、`origin_location`、`destination_location`、`polyline`（经度/纬度点数组），以及可选的 `origin_place_id`、`destination_place_id`、`source_ids`、`departure_bucket`、`duration_minutes`、`distance_meters`、`estimated_cost`、`cost_currency` 和 `cost_scope`。缺少新增字段的旧计划必须继续可读。用户未指定景点时，后端会从已通过地图验证的城市景点推荐中选择路线锚点；不会从未经验证的回答文本生成路线。前端不要从 `detail` 或回答文本解析路线；`RouteMap.vue` 在配置 `VITE_AMAP_JS_KEY` 和 `VITE_AMAP_SECURITY_JS_CODE` 时优先加载高德 JS API 2.0，支持缩放、拖拽、路线自动适配和起终点标记；没有浏览器端 Key 时调用 `GET /travel/plans/{thread_id}/map`（可选 `?version=n`）读取服务端静态地图。没有路线几何时接口返回 404；静态地图请求异常时接口返回基于真实折线的 SVG 示意图，并带 `X-Route-Map-Fallback: true` 响应头。浏览器端 Key 必须限制高德控制台域名白名单，服务端 Web Service Key 不得写入 `VITE_*` 变量。
+
+有明确地点的路线查询可能返回有界有向矩阵的部分结果。前端应把 `route_segments` 作为最终排程边，把 `route_plans` 作为地图预览边；缺边、预算截断和 provider 失败由计划状态/诊断展示，不能根据地点名称自行补画路线，也不能把缓存命中或静态时长显示为实时路况。
 
 ### `TravelPlan.transport_pages`
 
