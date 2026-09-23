@@ -61,6 +61,7 @@ GENERIC_PLACE_PHRASES = {
     "慢一点",
     "慢慢玩",
     "不赶景点",
+    "本帮菜",
 }
 
 LEADING_CONTEXT_WORDS = [
@@ -78,6 +79,10 @@ LEADING_CONTEXT_WORDS = [
     "想去",
     "游览",
     "游玩",
+    "安排",
+    "想吃",
+    "想尝",
+    "品尝",
 ]
 
 
@@ -99,6 +104,15 @@ def _clean_value(value: str) -> str:
 
 
 def _append_place(places: list[str], value: str) -> None:
+    # A sentence-level matcher can capture an explicit list together with a
+    # trailing preference clause, for example "外滩、豫园和陆家嘴，安排本帮菜".
+    # Split that list before normalizing each candidate so food preferences do
+    # not become fake route anchors.
+    parts = re.split(r"[、,，;；]|以及|还有|和|及|与", str(value or ""))
+    if len(parts) > 1:
+        for part in parts:
+            _append_place(places, part)
+        return
     cleaned = _clean_value(value)
     if not cleaned or cleaned in places or cleaned in GENERIC_PLACE_PHRASES:
         return

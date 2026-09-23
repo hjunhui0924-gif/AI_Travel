@@ -244,11 +244,29 @@ def optimize_itinerary(
             OptimizationDiagnostic("beam_search_fallback", "地点超过 5 个，已截取前 5 个候选进行 MVP 排序。", "warning")
         )
     locked = [str(item).strip() for item in (locked_titles or []) if str(item).strip()]
+    explicit_order_has_edges = all(
+        matrix.get(_route_key(origin.name, destination.name)) is not None
+        for origin, destination in zip(candidates, candidates[1:])
+    )
+    complete_route_matrix = len(matrix) >= len(candidates) * max(0, len(candidates) - 1)
     if locked and any(item.name in locked for item in candidates):
         permutations = [tuple(candidates)]
         diagnostics.append(
             OptimizationDiagnostic("locked_order_preserved", "检测到已锁定地点，保留当前顺序。", "info")
         )
+    elif query.named_places and explicit_order_has_edges and not complete_route_matrix:
+        # A route provider may return only the user's requested adjacent
+        # segments. Preserve that verified order instead of enumerating
+        # permutations that require edges we never queried.
+        permutations = [tuple(candidates)]
+        if len(candidates) > 2:
+            diagnostics.append(
+                OptimizationDiagnostic(
+                    "route_matrix_partial",
+                    "路线数据只覆盖用户指定顺序，已保留该顺序，未声称全局最优。",
+                    "warning",
+                )
+            )
     elif len(candidates) <= MAX_ENUMERATED_PLACES:
         permutations = list(itertools.permutations(candidates))
     else:

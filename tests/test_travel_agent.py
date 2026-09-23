@@ -2,6 +2,7 @@ from agents import travel_agent
 from adapters.variflight_adapter import VariFlightError
 from agents.schemas import (
     Evidence,
+    ClarificationRequest,
     PlanDay,
     PlanItem,
     PoiRecommendation,
@@ -53,6 +54,60 @@ def test_explicit_place_list_is_split_into_route_anchors():
     assert query.named_places[:3] == ["西湖", "灵隐寺", "河坊街"]
 
 
+def test_explicit_place_list_stops_before_following_preference_clause():
+    query = travel_agent.build_travel_query(
+        "2026-10-01 从北京到上海玩三天，坐飞机，想去外滩、豫园和陆家嘴，安排本帮菜。",
+        [],
+    )
+
+    assert query.named_places == ["外滩", "豫园", "陆家嘴"]
+
+
+def test_confirming_one_place_preserves_other_requested_landmarks():
+    query = travel_agent.prepare_travel_query(
+        "2026-10-01 从北京到上海玩三天，坐飞机，想去外滩、豫园和陆家嘴，安排本帮菜。\n用户补充：place_outer",
+        [],
+        extraction_hint={
+            "confirmed_place": {
+                "candidate_id": "place_outer",
+                "provider_id": "place_outer",
+                "name": "外滩",
+                "query_text": "外滩",
+                "city": "上海",
+            },
+            "unresolved_places": ["外滩", "豫园", "陆家嘴"],
+        },
+    )
+
+    assert query.named_places == ["外滩", "豫园", "陆家嘴"]
+
+
+def test_place_confirmation_hint_accumulates_previous_confirmations():
+    query = travel_agent.prepare_travel_query(
+        "2026-10-01 从北京到上海玩三天，想去外滩、豫园和陆家嘴。",
+        [],
+        extraction_hint={
+            "confirmed_place": {
+                "candidate_id": "garden",
+                "provider_id": "garden",
+                "name": "上海豫园",
+                "query_text": "豫园",
+            },
+            "resolved_place_candidates": [
+                {
+                    "candidate_id": "bund",
+                    "provider_id": "bund",
+                    "name": "外滩",
+                    "query_text": "外滩",
+                }
+            ],
+            "unresolved_places": ["豫园", "陆家嘴"],
+        },
+    )
+
+    assert [item.name for item in query.resolved_place_candidates] == ["外滩", "上海豫园"]
+
+
 def test_province_trip_asks_for_city_route_before_calling_external_adapters(monkeypatch):
     calls: list[str] = []
 
@@ -87,11 +142,50 @@ def test_clarification_response_renders_choices_without_a_placeholder_plan():
     rendered = travel_agent.render_travel_response(response)
 
     assert response.trip_plan is None
-    assert "江苏范围比较大" in rendered
+    assert response.summary in rendered
+    assert "江苏范围比较大" not in rendered
     assert response.clarification is not None
     assert response.clarification.options[0].label == "南京 + 扬州"
     assert response.clarification.options[1].label == "苏州 + 无锡"
     assert "出发地待定" not in rendered
+
+
+def test_place_clarification_prompt_is_owned_by_the_structured_card():
+    response = TravelPlanResponse(
+        intent="trip_plan",
+        summary="请先确认具体地点，再继续计算路线和营业时间。",
+        clarification=ClarificationRequest(
+            code="place_ambiguous",
+            prompt="“外滩”有多个候选，请确认你要去哪个地点：",
+        ),
+    )
+
+    rendered = travel_agent.render_travel_response(response)
+
+    assert response.summary in rendered
+    assert response.clarification.prompt not in rendered
+
+
+def test_route_coverage_requires_every_explicit_adjacent_pair():
+    routes = [
+        RoutePlan(
+            mode="driving",
+            origin="外滩",
+            destination="豫园",
+            polyline=[[121.49, 31.23], [121.50, 31.22]],
+        ),
+    ]
+
+    assert travel_agent._route_covers_named_places(routes, ["外滩", "豫园", "陆家嘴"]) is False
+    routes.append(
+        RoutePlan(
+            mode="driving",
+            origin="豫园",
+            destination="陆家嘴",
+            polyline=[[121.50, 31.22], [121.51, 31.24]],
+        )
+    )
+    assert travel_agent._route_covers_named_places(routes, ["外滩", "豫园", "陆家嘴"]) is True
 
 
 def test_completed_plan_response_is_a_compact_summary_not_a_raw_data_dump():

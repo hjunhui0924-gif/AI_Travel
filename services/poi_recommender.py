@@ -376,9 +376,28 @@ def build_poi_groups(
             except Exception as exc:
                 map_failed = True
                 errors.append(f"景点 POI 查询失败：{type(exc).__name__}")
-        has_map_items = has_map_items or bool(food_items or leisure_items)
-
         items: list[PoiRecommendation] = []
+        anchor_poi: PoiRecommendation | None = None
+        # Explicit user landmarks must themselves become optimizer inputs.
+        # Nearby restaurants/attractions are supplementary recommendations and
+        # must never be the only POIs retained for a requested landmark.
+        if (
+            place
+            and resolved
+            and resolved.get("provider_id")
+            and resolved.get("location")
+            and place not in unresolved_places
+        ):
+            anchor_poi, anchor_source = _to_poi(
+                resolved,
+                str(resolved.get("category") or "地点"),
+                city,
+                prefix="用户指定地点",
+            )
+            items.append(anchor_poi)
+            evidence.append(anchor_source)
+
+        has_map_items = has_map_items or bool(food_items or leisure_items or anchor_poi)
         for item in _sort_by_travel_fit(food_items, query.preferences)[:3]:
             poi, source = _to_poi(item, "附近餐饮", city, prefix=f"围绕 {anchor_name} 推荐")
             items.append(poi)

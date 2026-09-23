@@ -954,8 +954,14 @@ def _stream_travel_response(
     confirmed_place = _confirmed_place_hint(message, pending_query)
     confirmation_hint = None
     if confirmed_place:
+        previous_resolved = (pending_query or {}).get("resolved_place_candidates")
+        resolved_place_candidates = [
+            item for item in (previous_resolved or []) if isinstance(item, dict)
+        ]
+        resolved_place_candidates.append(confirmed_place)
         confirmation_hint = {
             "confirmed_place": confirmed_place,
+            "resolved_place_candidates": resolved_place_candidates,
             "unresolved_places": list((pending_query or {}).get("unresolved_places") or []),
         }
     supervisor_result: TravelSupervisorResult | None = None

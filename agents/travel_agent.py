@@ -421,6 +421,27 @@ def _hint_list(hint: dict | None, key: str) -> list[str]:
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
+def _place_candidate_from_hint(value: object) -> PlaceCandidate | None:
+    if not isinstance(value, dict) or not str(value.get("name") or "").strip():
+        return None
+    return PlaceCandidate(
+        candidate_id=str(value.get("candidate_id") or value.get("provider_id") or ""),
+        provider_id=str(value.get("provider_id") or ""),
+        name=str(value.get("name") or ""),
+        category=str(value.get("category") or ""),
+        province=str(value.get("province") or ""),
+        city=str(value.get("city") or ""),
+        district=str(value.get("district") or ""),
+        address=str(value.get("address") or ""),
+        location=str(value.get("location") or ""),
+        distance_from_city_center=str(value.get("distance_from_city_center") or ""),
+        opening_status=str(value.get("opening_status") or "unknown"),
+        confidence="confirmed",
+        source_ids=list(value.get("source_ids") or []),
+        query_text=str(value.get("query_text") or ""),
+    )
+
+
 def build_travel_query(
     message: str,
     attachments: list[dict],
@@ -444,33 +465,29 @@ def build_travel_query(
     attachment_notes = extract_attachment_notes(attachments)
     named_places = extract_named_places(attachments, message=message)
     confirmed_place = (extraction_hint or {}).get("confirmed_place")
+    confirmed_candidates: list[PlaceCandidate] = []
+    for value in (extraction_hint or {}).get("resolved_place_candidates", []):
+        candidate = _place_candidate_from_hint(value)
+        if candidate is not None:
+            confirmed_candidates.append(candidate)
     if isinstance(confirmed_place, dict) and str(confirmed_place.get("name") or "").strip():
-        unresolved = set(_hint_list(extraction_hint, "unresolved_places"))
+        confirmed_name = str(confirmed_place["name"]).strip()
+        confirmed_query_text = str(confirmed_place.get("query_text") or "").strip()
         named_places = [
-            str(confirmed_place["name"]).strip(),
-            *[
-                place
-                for place in named_places
-                if place not in unresolved
-                and not any(marker in place for marker in (*unresolved, "用户补充", "选择"))
-            ],
+            confirmed_name
+            if place in {confirmed_name, confirmed_query_text}
+            else place
+            for place in named_places
+            if not any(marker in place for marker in ("用户补充", "选择"))
         ]
-        confirmed_candidate = PlaceCandidate(
-            candidate_id=str(confirmed_place.get("candidate_id") or confirmed_place.get("provider_id") or ""),
-            provider_id=str(confirmed_place.get("provider_id") or ""),
-            name=str(confirmed_place.get("name") or ""),
-            category=str(confirmed_place.get("category") or ""),
-            province=str(confirmed_place.get("province") or ""),
-            city=str(confirmed_place.get("city") or ""),
-            district=str(confirmed_place.get("district") or ""),
-            address=str(confirmed_place.get("address") or ""),
-            location=str(confirmed_place.get("location") or ""),
-            distance_from_city_center=str(confirmed_place.get("distance_from_city_center") or ""),
-            opening_status=str(confirmed_place.get("opening_status") or "unknown"),
-            confidence="confirmed",
-            source_ids=list(confirmed_place.get("source_ids") or []),
-            query_text=str(confirmed_place.get("query_text") or ""),
-        )
+        if confirmed_name not in named_places:
+            named_places.insert(0, confirmed_name)
+        confirmed_candidate = _place_candidate_from_hint(confirmed_place)
+        if confirmed_candidate is not None and not any(
+            item.candidate_id == confirmed_candidate.candidate_id
+            for item in confirmed_candidates
+        ):
+            confirmed_candidates.append(confirmed_candidate)
     else:
         confirmed_candidate = None
     named_places = list(dict.fromkeys([*named_places, *_hint_list(extraction_hint, "named_places")]))[:6]
@@ -569,7 +586,7 @@ def build_travel_query(
         meal_preferences=[item for item in preferences if item in {"美食", "咖啡"}],
         arrival_deadline=(f"{int(arrival_match.group(1)):02d}:{arrival_match.group(2)}" if arrival_match else ""),
         departure_deadline=(f"{int(departure_match.group(1)):02d}:{departure_match.group(2)}" if departure_match else ""),
-        resolved_place_candidates=[confirmed_candidate] if confirmed_candidate else [],
+        resolved_place_candidates=confirmed_candidates,
     )
     query.date_is_assumed = date_is_assumed
     return query
@@ -876,6 +893,20 @@ def _route_evidence(routes: list[RoutePlan]) -> list[Evidence]:
         )
         for index, route in enumerate(routes, start=1)
     ]
+
+
+def _route_covers_named_places(routes: list[RoutePlan], named_places: list[str]) -> bool:
+    """Return whether verified geometry covers every explicit adjacent pair."""
+
+    places = list(dict.fromkeys(item.strip() for item in named_places if item.strip()))
+    if len(places) < 2:
+        return True
+    pairs = {
+        (route.origin.strip(), route.destination.strip())
+        for route in routes
+        if len(route.polyline) >= 2
+    }
+    return all(pair in pairs for pair in zip(places, places[1:]))
 
 
 def _stable_item_id(item_type: str, title: str, day: str) -> str:
@@ -1586,14 +1617,38 @@ def plan_travel(
     if supervisor_result is not None and not supervisor_result.fallback_used:
         if include_explore:
             has_route_geometry = any(len(route.polyline) >= 2 for route in route_plans)
-            if not has_route_geometry and not query.named_places:
+            explicit_route_incomplete = bool(query.named_places) and not _route_covers_named_places(
+                route_plans,
+                query.named_places,
+            )
+            if (not has_route_geometry and not query.named_places) or (
+                explicit_route_incomplete and not unresolved_places
+            ):
                 route_anchor_names = _route_anchor_names_from_recommendations(poi_items)
+                if query.named_places:
+                    route_anchor_names = list(dict.fromkeys(query.named_places))
                 if len(route_anchor_names) >= 2:
                     route_query = deepcopy(query)
                     route_query.named_places = route_anchor_names
-                    # A model-led run may choose POI without choosing a route.
-                    # Do not silently make another provider call here; the
-                    # supervisor owns tool selection for this turn.
+                    try:
+                        fallback_route_result = get_route_plans(route_query)
+                        route_plans = list(fallback_route_result)
+                        fallback_route_errors = list(getattr(fallback_route_result, "errors", []) or [])
+                        if fallback_route_errors:
+                            adapter_status["route"] = "partial" if route_plans else "failed"
+                            diagnostics.extend(
+                                f"route mode failed: {error}" for error in fallback_route_errors
+                            )
+                        else:
+                            adapter_status["route"] = "success" if route_plans else "empty"
+                        diagnostics.append(
+                            "已按用户明确地点补齐路线，未采用模型选择的部分路线。"
+                            if query.named_places
+                            else "已按已验证 POI 补充路线锚点。"
+                        )
+                    except Exception as exc:
+                        adapter_status["route"] = "failed"
+                        diagnostics.append(f"route fallback failed: {type(exc).__name__}")
             web_search_status = adapter_status.get("web_search", "not_requested")
         else:
             route_plans = []
@@ -2038,7 +2093,6 @@ def render_travel_response(response: TravelPlanResponse) -> str:
 def _render_detailed_travel_response(response: TravelPlanResponse) -> str:
     lines = [response.summary]
     if response.clarification:
-        lines.extend(["", response.clarification.prompt])
         return "\n".join(lines).strip()
     web_source_ids = {
         source.evidence_id

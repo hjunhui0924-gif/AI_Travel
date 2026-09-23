@@ -144,6 +144,26 @@ def test_itinerary_optimizer_returns_route_segments_for_fastest_order():
     assert result.score is not None
 
 
+def test_itinerary_optimizer_keeps_explicit_order_with_adjacent_route_data():
+    places = [
+        PoiRecommendation(name="A", category="景点", provider_id="a", source_ids=["a"]),
+        PoiRecommendation(name="B", category="景点", provider_id="b", source_ids=["b"]),
+        PoiRecommendation(name="C", category="景点", provider_id="c", source_ids=["c"]),
+    ]
+    routes = [
+        RoutePlan(mode="driving", origin="A", destination="B", duration="10 分钟", distance="1000 米"),
+        RoutePlan(mode="driving", origin="B", destination="C", duration="20 分钟", distance="2000 米"),
+    ]
+
+    result = optimize_itinerary(_query(named_places=["A", "B", "C"]), places, routes)
+
+    assert [item.name for item in result.ordered_places] == ["A", "B", "C"]
+    assert [(item.origin_place_id, item.destination_place_id) for item in result.route_segments] == [
+        ("a", "b"),
+        ("b", "c"),
+    ]
+
+
 def test_ambiguous_place_blocks_route_lookup_until_confirmation(monkeypatch):
     candidate_a = PlaceCandidate(
         candidate_id="a",

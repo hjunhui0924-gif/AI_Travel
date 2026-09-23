@@ -585,7 +585,18 @@ def run_travel_supervisor(
             raise ValueError("存在同名地点候选，必须先完成地点确认。")
         if mode not in {"driving", "walking", "transit"}:
             raise ValueError("路线方式只能是 driving、walking 或 transit。")
-        active_places = _validate_route_places(places, query, collector.get("poi_items", []))
+        # Explicit user landmarks are authoritative. The model may choose the
+        # transport mode, but it must not replace a requested landmark with a
+        # nearby recommendation (for example, a restaurant returned by POI
+        # search). Generic city trips still allow the model to choose verified
+        # POI anchors.
+        active_places = (
+            list(dict.fromkeys(item for item in query.named_places if item.strip()))
+            if query.named_places
+            else _validate_route_places(places, query, collector.get("poi_items", []))
+        )
+        if len(active_places) < 2:
+            raise ValueError("路线至少需要 2 个已确认地点。")
         active_query = deepcopy(query)
         active_query.city = city
         active_query.destination = city
