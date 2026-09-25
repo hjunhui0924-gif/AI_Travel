@@ -3,6 +3,10 @@
 一个基于 `FastAPI + LangChain + LangGraph` 的“懒人旅行规划 Agent”。
 用户只需描述大致出发时间、目的地和偏好，Agent 会整理交通、天气、路线、周边地点和每日行程，并将计划保存为可修改、可重规划的结构化数据。
 
+> 当前状态：可运行的本地 MVP。完整旅行规划依赖外部模型和地图服务；没有配置密钥时仍可启动页面、查看前端界面和验证安全降级，但不会伪造路线、POI、车次或航班结果。
+
+![AI Travel Agent 工作台](docs/assets/workspace.png)
+
 ## 当前定位
 
 这个项目适合以下场景：
@@ -36,6 +40,18 @@
 - 游客模式：未登录时可直接使用；游客会话按最近活动滑动保留 7 天，过期后由后台清理
 - 计划能力：小日历按需加载、日期清单、版本预览、锁定项、冲突检测、Markdown/JSON 导出和只读分享
 - 句子级来源：联网搜索回答可将句子与网页来源关联，前端支持来源侧栏查看
+
+## 项目截图
+
+截图来自本地浏览器回归场景，展示真实页面结构和 provider 返回结果。截图中的地点与路线仅用于演示界面，不代表固定的实时数据。
+
+| 工作台 | 结构化澄清 |
+| --- | --- |
+| ![旅行规划工作台](docs/assets/workspace.png) | ![目的地范围澄清](docs/assets/clarification.png) |
+
+| 行程计划与路线地图 | 路线地图详情 |
+| --- | --- |
+| ![行程计划面板](docs/assets/plan-panel.png) | ![高德路线地图](docs/assets/route-map.png) |
 
 ## 登录与历史记录隔离
 
@@ -80,6 +96,27 @@
 - Flight provider: 途牛官方 MCP/CLI 适配（可选）
 - File parsing: `pypdf`, `python-docx`, `openpyxl`, `xlrd`
 
+## 技术架构
+
+```mermaid
+flowchart LR
+    Browser[浏览器 Vue3 工作台] -->|SSE / REST| API[FastAPI API]
+    API --> Auth[鉴权与会话隔离]
+    API --> Workflow[旅行规划 Workflow]
+    Workflow --> Supervisor[Travel Supervisor]
+    Supervisor --> LLM[DashScope Qwen3.8 Flash]
+    Workflow --> Orchestrator[Provider 编排与失败隔离]
+    Orchestrator --> AMap[高德 POI / 路线 / 天气]
+    Orchestrator --> Rail[12306 铁路查询]
+    Orchestrator --> Tuniu[途牛国内航班查询]
+    Workflow --> Optimizer[路线矩阵与行程优化器]
+    Workflow --> Store[(SQLite 计划与历史)]
+    Optimizer --> Plan[TravelPlan / RouteSegment]
+    Plan --> Browser
+```
+
+核心数据链路是：用户输入 → 需求结构化 → 必要条件澄清 → provider 查询 → 事实校验 → 路线矩阵与排程 → SSE/计划面板。外部 provider 失败时保留结构化诊断，未知事实不会被模型补写成确定结果。
+
 ## 项目结构
 
 ```text
@@ -118,6 +155,13 @@ AI_Agent/
 ```
 
 ## 快速开始
+
+### 0. 获取代码
+
+```bash
+git clone https://github.com/hjunhui0924-gif/AI_Travel.git
+cd AI_Travel
+```
 
 ### 1. 安装依赖
 
@@ -166,6 +210,24 @@ http://127.0.0.1:5173
 旅行 Agent 后端默认运行在 `http://127.0.0.1:8001`。如需修改端口，可通过 `AI_AGENT_PORT` 设置，并同步更新 `frontend/vite.config.ts` 中的代理目标。
 
 如果只验证 FastAPI 提供的构建产物，先在 `frontend/` 执行 `npm run build`，再运行 `python app.py` 并访问 `http://127.0.0.1:8001`。
+
+## Demo 演示
+
+### 启动后的最小体验
+
+1. 打开 `http://127.0.0.1:5173`。
+2. 输入：`帮我规划上海一日游，必须去外滩、豫园、陆家嘴`。
+3. 查看工作进展，必要时完成地点澄清。
+4. 打开“行程计划”，查看结构化行程、路线段和高德地图。
+
+一次真实浏览器回归中，三个用户指定地点均进入计划，最终生成 2 条相邻路线段；地图折线、路线图例和 `route_segments` 保持一致。完整链路需要配置 `DASHSCOPE_API_KEY` 和 `AMAP_WEB_API_KEY`；途牛航班查询是可选 provider。
+
+### 配置与能力边界
+
+- `DASHSCOPE_MODEL` 默认使用 `qwen3.8-flash`。
+- `AMAP_WEB_API_KEY` 用于服务端地点、路线和天气查询；`VITE_AMAP_JS_KEY` 与 `VITE_AMAP_SECURITY_JS_CODE` 只用于浏览器交互地图。
+- `TUNIU_API_KEY` 只应放在本机 `.env` 或进程环境变量中，航班结果仅代表查询时的候选，不代表锁座或出票。
+- 未配置真实 provider 时，应用可以启动并展示无数据/失败诊断，但不会生成虚构路线、价格、余票或营业信息。
 
 ## 用户输入与响应流程
 
@@ -293,7 +355,7 @@ FLIGHT_MCP_MODE=tuniu
 TUNIU_CLI_COMMAND=tuniu
 TUNIU_AUTH_TYPE=apiKey
 TUNIU_AUTH_SOURCE=tuniu-cli
-TUNIU_API_KEY=your_tuniu_api_key
+TUNIU_API_KEY=
 TUNIU_TIMEOUT_SECONDS=30
 ```
 
@@ -387,6 +449,16 @@ python -m services.integration_health --live --only flight_mcp
 - 项目当前使用本地 SQLite 与本地缓存目录，适合单机开发和演示
 - `.env` 中如果放了真实密钥，不应提交到公开仓库
 - 当前不实现自动订票、支付、锁座或订单提交；航班/车次结果只是查询时的候选信息
+
+## GitHub 发布检查
+
+本仓库提交内容遵循以下约束：
+
+- `.env`、数据库、上传文件、浏览器 profile、测试截图临时目录和 Python/Node 缓存不进入仓库。
+- `.env.example` 只保留变量名和占位值，不包含真实密钥。
+- `docs/assets/` 只保留 README 所需的公开项目截图。
+- `static/` 保留当前 FastAPI 生产入口需要的前端构建文件；`node_modules/`、临时构建目录和历史 hash 产物不提交。
+- 推送前执行敏感信息扫描，并确认 `git status` 没有待提交的本地数据文件。
 
 ## 后续建议
 

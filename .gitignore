@@ -14,6 +14,9 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 .vite/
+# Stale local Vite bundle kept out of the repository after the current entry changed.
+static/assets/index-kJ31gYrl.js
+static/assets/index-C_ZYu4PC.js
 
 # Local agent/workbench state
 .workbuddy/

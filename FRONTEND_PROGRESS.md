@@ -215,7 +215,7 @@ frontend/
 - 液态玻璃定档 12px：主消息容器 blur 26→16→12px（另：顶部栏 7、紧凑胶囊 9、输入框 7、行程浮层 8），保留上缘高光带 / 亮描边 / 发丝内辉光，底色 alpha 微调维持正文可读性。范围明确为“只改玻璃自身参数，不改全屏照片叠层亮度”——不做全屏高亮（沙盒曾尝试全屏提亮方案，已否决）。
 - 工作进展展开/收起动画重写：原 `max-height: 0 ⇄ 1200px` 为梯形时序（列表实际高约 250px，展开前 ~46ms 猛弹、其余停顿，收起时最后骤缩），导致下方正文让位/复位生硬。现于 `MessageItem.vue` 为活动列表增加 `.activity-reveal-outer` 包裹层，`main.css` 改用 `grid-template-rows: 0fr ⇄ 1fr` 做高度动画（精确跟随真实内容、全程匀速），配 opacity 过渡；行内 `.activity-feed` 保留 `min-height: 0` 与独立滚动/自动跟随（与 §30 行为兼容）。
 - 涉及文件：`frontend/src/styles/interaction-pass.css`（玻璃段更新至 12px 档）、`frontend/src/styles/main.css`（activity-reveal 过渡重写）、`frontend/src/components/MessageItem.vue`（外层包裹）。
-- 验证：沙盒 5 档 A/B（16/12/10/8/6px）目测后定档 12px，随后清理沙盒副本（本地零残留）；当前 `npm run typecheck` 通过，`npm run build`（写入 `static/`）通过——CSS 108.90 kB（gzip 19.26 kB）、JS 244.09 kB（gzip 87.16 kB）；当前 `static/index.html` 实际引用 `index-uYCWfioC.css` / `index-kJ31gYrl.js`，并包含 `blur(12px)`、`grid-template-rows: 0fr`、`activity-reveal-outer`。
+- 验证：沙盒 5 档 A/B（16/12/10/8/6px）目测后定档 12px，随后清理沙盒副本（本地零残留）；当前 `npm run typecheck` 通过，`npm run build`（写入 `static/`）通过——CSS 108.90 kB（gzip 19.26 kB）、JS 248.29 kB（gzip 88.42 kB）；当前 `static/index.html` 实际引用 `index-uYCWfioC.css` / `index-B0sW1xYW.js`，并包含 `blur(12px)`、`grid-template-rows: 0fr`、`activity-reveal-outer`。
 - 备注：更透档位（10/8/6px，含底色 alpha 递减）已在沙盒验证全谱可用；助手正文直接压在玻璃上，透度越高可读性越低，12px 为当前平衡点。
 
 ## 32. 路线矩阵与计划地图一致性（2026-09-23）
